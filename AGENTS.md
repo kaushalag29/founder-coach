@@ -17,6 +17,7 @@ knowledge, and is growing into a founder-coach served over MCP.
 ## Commands
 
 - Setup: `uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"` (what CI installs; with less, suites skip tests). Everything: `".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"`
+- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the six suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
 - Tests: `for s in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
 - CLI reference: `ytbrain --help` and `README.md`.
 - Plugin: edit `plugin/skills/*/SKILL.md`, never `founder_coach/playbooks/*.md` or `founder_coach/product.json` (generated); `python scripts/assemble_plugin.py --pack data/pack --check` builds `dist/plugin`. `plugin/` is a template: load `dist/plugin`, not `plugin/`.

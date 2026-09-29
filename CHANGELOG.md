@@ -5,6 +5,11 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
 
 ## 2026-09-28 (the coach answers first; search budget)
 
+- **`sh scripts/check.sh` runs the CI checks locally before a push:** secret scan, the six suites (a skipped
+  test fails), generated files fresh, and `claude plugin validate`. Offline, free, no `.env`.
+  `docs/release.md` shows how to run it as a git pre-commit hook (`--no-verify` skips it). CI actions moved to current versions
+  (`checkout@v7`, `setup-node@v7`, `setup-uv@v9.0.0`).
+
 - **One `.env` configures founder-coach too.** `founder-coach` reads its `FOUNDER_COACH_*` lines
   (never other keys) from:
   1. `$FOUNDER_COACH_ENV_FILE`;

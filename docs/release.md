@@ -30,11 +30,18 @@ Claude Code clones it with the tester's own git credentials.
 
    `.gitignore` keeps out `.env`, `data/` (1.1 GB, rebuildable), `dist/`, `.venv/`,
    `sources.yaml` and caches. `eval/` (the benchmark, 4 MB) is tracked on purpose.
-3. Block secrets before every commit (optional, recommended):
+3. Run the CI checks on every `git commit` (recommended). `scripts/check.sh` scans for secrets, runs the six
+   offline suites, checks the generated files are fresh and validates the plugin. It takes a couple of minutes,
+   needs no key and makes no model calls; a failure stops the commit. Install it once per clone:
 
    ```bash
-   printf '#!/bin/sh\nexec python3 scripts/check_secrets.py\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+   printf '#!/bin/sh\nexec sh scripts/check.sh\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
    ```
+
+   `git commit --no-verify` skips it for a quick WIP commit. If a couple of minutes per commit is too slow, name
+   the file `pre-push` instead: the same checks then run before each push. The GitHub workflow stays as the
+   backstop: it runs from a clean checkout on Python 3.11 and 3.13, so it also catches a file you forgot to commit
+   or something that only works with your `.env`, cache or models.
 4. The marketplace clone, next to this folder:
 
    ```bash
