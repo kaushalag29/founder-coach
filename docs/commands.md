@@ -95,7 +95,7 @@ nothing changes and every default applies.
 ## M3b: plugin, skills and hook
 
 ```bash
-python scripts/assemble_plugin.py --pack data/pack --check     # -> dist/plugin
+python scripts/assemble_plugin.py --pack data/pack --check [--zip]   # -> dist/plugin; --zip adds the Cowork upload file
 claude plugin validate dist/plugin --strict
 ytbrain claude -- --plugin-dir dist/plugin      # your Claude plan on Haiku (--openrouter: paid per token)
 #   then in the session: /founder-coach:setup, /founder-coach:ask <question>,

@@ -229,6 +229,27 @@ def test_assembler_builds_swaps_and_keeps_the_previous_build():
         assert not [p for p in out.parent.iterdir() if p.name.startswith(".plugin.building")]
 
 
+def test_zip_packages_the_shipped_plugin_for_cowork():
+    import zipfile
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, pack = _fake_repo(tmp), _fake_pack(tmp)
+        (pack / "embed-cache.db").write_bytes(b"build-only cache")
+        out = tmp / "dist" / "plugin"
+        A.assemble(repo, pack, out)
+        (out / "founder_coach" / "stray.pyc").write_bytes(b"0")
+        (out / ".DS_Store").write_bytes(b"0")
+        z = A.zip_plugin(out)
+        m = json.loads((out / ".claude-plugin" / "plugin.json").read_text())
+        assert z == (tmp / "dist" / f"{m['name']}-{m['version']}.plugin").resolve()
+        names = zipfile.ZipFile(z).namelist()
+        for need in (".claude-plugin/plugin.json", ".mcp.json", "skills/setup/SKILL.md", "pack/knowledge.sqlite", "BUILD_ID"):
+            assert need in names, need
+        assert not [n for n in names if n.endswith((".pyc", ".DS_Store")) or "embed-cache" in n or n.startswith("evals/")]
+        assert zipfile.ZipFile(z).testzip() is None
+        assert A.zip_plugin(out) == z, "re-zipping overwrites the same file"
+
+
 def test_assembler_refuses_a_missing_pack_and_a_failed_check_without_touching_the_last_build():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)

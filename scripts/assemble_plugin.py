@@ -1,6 +1,6 @@
 """Assemble the installable plugin: plugin/ + founder_coach/ + the Knowledge pack -> dist/plugin.
 
-    python scripts/assemble_plugin.py --pack PATH [--out dist/plugin] [--check]
+    python scripts/assemble_plugin.py --pack PATH [--out dist/plugin] [--check] [--zip]
 
 Steps, each safe to re-run:
 1. Regenerate founder_coach/product.json from product.toml (the product's name, ADR-0012) and
@@ -14,6 +14,8 @@ plugin/ is a template (its files say `{{id}}` where the product id goes), so loa
 assembled dist/plugin in Claude Code, not plugin/ itself.
 With --check, import the assembled runtime and open the assembled pack before swapping,
 so a broken build never replaces a working one.
+
+With --zip, also write dist/<id>-<version>.plugin: the one file to upload in Cowork (Customize > Plugins).
 
 Local test:  claude plugin validate dist/plugin --strict && claude --plugin-dir dist/plugin
 """
@@ -30,6 +32,7 @@ import subprocess
 import sys
 import tomllib
 import json
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -284,6 +287,22 @@ def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals:
     return {"out": str(out), "build_id": stamp, "regenerated": regenerated, "id": prod["id"]}
 
 
+def zip_plugin(out: Path) -> Path:
+    """Package an assembled plugin as <id>-<version>.plugin next to it (a zip with .claude-plugin/ at its root),
+    the file Cowork's Plugins page uploads. Written in place, so a mounted folder that forbids renames works too."""
+    out = out.resolve()
+    manifest = json.loads((out / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    target = out.parent / f"{manifest['name']}-{manifest['version']}.plugin"
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(out):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+            for name in sorted(files):
+                if name not in (".DS_Store",) and not name.endswith(".pyc"):
+                    f = Path(root) / name
+                    z.write(f, f.relative_to(out).as_posix())
+    return target
+
+
 def _pack_env_name(root: Path = ROOT) -> str:
     return load_product(root)["id"].upper().replace("-", "_") + "_PACK"
 
@@ -302,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true", help="import the runtime and verify the pack before swapping in")
     ap.add_argument("--with-evals", action="store_true",
                     help="include plugin/evals/ (for `claude plugin eval`); use a separate --out, e.g. dist/plugin-eval")
+    ap.add_argument("--zip", action="store_true",
+                    help="also write dist/<id>-<version>.plugin, the file Cowork's Plugins page uploads")
     args = ap.parse_args(argv)
     if args.pack is None:
         print(f"assemble: pass --pack PATH (or set {env_pack})", file=sys.stderr)
@@ -315,6 +336,8 @@ def main(argv: list[str] | None = None) -> int:
     q = shlex.quote(res["out"])                # paths with spaces must survive a copy-paste
     print(f"assemble: {res['out']} (build {res['build_id']}){regen}\n"
           f"  next: claude plugin validate {q} --strict && claude --plugin-dir {q}")
+    if args.zip:
+        print(f"  cowork: {shlex.quote(str(zip_plugin(Path(res['out']))))} (upload in Customize > Plugins)")
     return 0
 
 

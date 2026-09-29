@@ -45,7 +45,8 @@ This repository holds both halves:
 ```
 
 Then `/founder-coach:ask <question>`, `/founder-coach:weekly-focus`, `/founder-coach:check-in`,
-and `/founder-coach:feedback <what was wrong>` when an answer misses.
+and `/founder-coach:feedback <what was wrong>` when an answer misses. Installing uv and Claude Code, and
+using Cowork instead: [Use the coach](#use-the-coach-claude-code-and-cowork).
 
 **Developers:**
 
@@ -59,6 +60,53 @@ for s in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_
 Building the corpus needs an LLM key and YouTube access ([Install from scratch](#install-from-scratch)).
 Building and releasing the plugin: [The coach plugin](#the-coach-plugin-m3b) and
 [docs/release.md](docs/release.md).
+
+## Use the coach (Claude Code and Cowork)
+
+You need `uv` (the plugin's server starts through `uvx`), Claude Code with a paid Claude account (Pro, Max, Team or
+Enterprise), and, for the marketplace install, read access to the private marketplace repo. The coach itself needs no
+API key and no `.env`.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh    # uv
+curl -fsSL https://claude.ai/install.sh | bash     # Claude Code (or: brew install --cask claude-code)
+claude                                             # first run: sign in in the browser; check with `claude --version`
+```
+
+**Claude Code**
+
+```
+/plugin marketplace add kaushalag29/founder-coach-marketplace
+/plugin install founder-coach@founder-coach-marketplace
+/founder-coach:setup
+```
+
+`git` must reach GitHub without a prompt ([docs/release.md](docs/release.md)). Update with
+`/plugin marketplace update founder-coach-marketplace`. Developers load a local build instead:
+`ytbrain claude -- --plugin-dir dist/plugin`.
+
+**Cowork** (the Claude desktop app)
+
+1. Build the file: `python scripts/assemble_plugin.py --pack data/pack --check --zip` writes
+   `dist/founder-coach-<version>.plugin`.
+2. **Customize → Plugins**, upload that file. (Adding the marketplace repo there is the other route; whether Cowork
+   can read a private repo is unconfirmed.) An installed plugin belongs to your account, so every Cowork project has it.
+   To update, bump the version, remove the old plugin, upload the new file.
+3. In a project, run `/founder-coach:setup`.
+
+Cowork is confirmed for setup and saving the profile and Goal. Not yet confirmed: that a second project sees the same
+saved profile (run `/founder-coach:status` there) and that the session-start nudge appears
+([docs/m3-status.md](docs/m3-status.md)).
+
+**First run and everyday use**
+
+- `/founder-coach:setup` is a short interview: company, customer, Stage, one Goal, Check-in day. The search models
+  (about 0.2 GB, once) download in the background, so there is nothing to run; search uses keywords until they finish.
+  What it saves lives in `~/.founder-coach/` (`FOUNDER.md` is readable) and never leaves the machine.
+- After that, just talk. `coach`, `ask`, `weekly-focus` and `check-in` load on their own for startup questions, plans
+  and weekly reviews; a multi-part question is split and each part searched, with cited talks. Only `setup`, `status`,
+  `export`, `feedback` and `forget` need typing. `/founder-coach:status` shows what is saved, what is due and whether
+  semantic search is ready.
 
 ## Documentation
 
@@ -81,7 +129,7 @@ Building and releasing the plugin: [The coach plugin](#the-coach-plugin-m3b) and
 ## Contents
 
 - Pipeline: [Tested setup](#tested-setup) · [Responsible use](#responsible-use) · [Prerequisites](#prerequisites) · [Install from scratch](#install-from-scratch) · [Configure an LLM backend](#configure-an-llm-backend-env) · [Configure sources](#configure-sources-sourcesyaml) · [Run the pipeline](#run-the-pipeline)
-- Coach: [The Knowledge pack](#the-knowledge-pack-what-the-coach-plugin-ships) · [The coach plugin](#the-coach-plugin-m3b) · [The coach runtime](#the-coach-runtime-founder-coach-m3a)
+- Coach: [Use the coach](#use-the-coach-claude-code-and-cowork) · [The Knowledge pack](#the-knowledge-pack-what-the-coach-plugin-ships) · [The coach plugin](#the-coach-plugin-m3b) · [The coach runtime](#the-coach-runtime-founder-coach-m3a)
 - Operating it: [Choosing and switching models](#choosing-and-switching-models) · [Parallelism, rate limits and retries](#parallelism-rate-limits-and-retries) · [Interrupting and resuming](#interrupting-and-resuming) · [Quality checks](#quality-checks) · [Output format](#output-format) · [Scheduling](#scheduling-macos-launchd) · [Configuration reference](#configuration-reference) · [Troubleshooting](#troubleshooting)
 - Project: [Layout and design decisions](#project-layout-and-design-decisions) · [Tests and CI](#tests-and-ci) · [Roadmap](#roadmap) · [Contributing](#contributing) · [Security and privacy](#security-and-privacy) · [License](#license) · [Disclaimer](#disclaimer) · [Changelog](#changelog)
 
@@ -148,6 +196,7 @@ Prices and free-tier limits are as of September 2026 — check your provider.
 | Python **3.11+** | Language features used throughout | `python3 --version` |
 | [uv](https://docs.astral.sh/uv/) | Creates the virtualenv, installs dependencies, can install Python itself | `uv --version` |
 | git | To clone the repo | `git --version` |
+| [Claude Code](https://code.claude.com/docs/en/setup) + a paid Claude account | Runs the coach plugin; developers also run the plugin evals with it | `claude --version` ([install](#use-the-coach-claude-code-and-cowork)) |
 | [Deno](https://deno.com) (or Node ≥ 20) | yt-dlp needs a JavaScript runtime for full YouTube support | `deno --version` |
 | Docker *(optional)* | Easiest way to run the PO-token server; Deno works too | `docker --version` |
 | An LLM backend | For the `extract` stage only — one of LM Studio, Ollama, OpenRouter, NVIDIA NIM or any OpenAI-compatible API | see below |

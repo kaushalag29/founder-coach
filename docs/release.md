@@ -89,6 +89,8 @@ They need read access to `founder-coach-marketplace` (add them as collaborators 
 /founder-coach:setup
 ```
 
+Cowork testers upload the `.plugin` file from `assemble_plugin.py --zip` instead (README, "Use the coach").
+
 Updates: `/plugin` → Marketplaces → founder-coach-marketplace → **Enable auto-update**, or
 `/plugin marketplace update founder-coach-marketplace`. Feedback: `/founder-coach:feedback`
 saves locally; `founder-coach feedback export` (the skill can run it) writes the file to send, and

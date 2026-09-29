@@ -5,6 +5,10 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
 
 ## 2026-09-28 (the coach answers first; search budget)
 
+- **`assemble_plugin.py --zip`** writes `dist/<id>-<version>.plugin`, the file Cowork's Plugins page uploads. The
+  README gained "Use the coach": installing uv and Claude Code, the Claude Code and Cowork steps, first run.
+  The setup skill no longer asks the Founder to run the model download (the server does it in the background).
+
 - **`sh scripts/check.sh` runs the CI checks locally before a push:** secret scan, the six suites (a skipped
   test fails), generated files fresh, and `claude plugin validate`. Offline, free, no `.env`.
   `docs/release.md` shows how to run it as a git pre-commit hook (`--no-verify` skips it). CI actions moved to current versions
