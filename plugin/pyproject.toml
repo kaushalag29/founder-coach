@@ -1,0 +1,33 @@
+# The runtime a founder installs. `uvx --from <plugin folder>` builds it from this file;
+# scripts/assemble_plugin.py copies founder_coach/ next to it and stamps BUILD_ID.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "{{id}}"
+version = "0.1.0"
+description = "{{display_name}}: an MCP server with a Y Combinator Knowledge pack and a private local founder store"
+requires-python = ">=3.11"
+license = { text = "{{license}}" }
+# Runtime only: no torch, no yt-dlp (ADR-0010). test_plugin.py checks every import in
+# founder_coach/ is covered here.
+dependencies = [
+    "mcp>=2.2.0,<3",
+    "pydantic>=2.9",
+    "numpy>=1.26",
+    "fastembed>=0.8",        # the ONNX embedder and reranker; brings tokenizers and huggingface-hub
+    "onnxruntime>=1.18",     # imported directly (execution providers); fastembed also needs it
+    "tzdata",                # IANA time zones where the OS has none (Windows)
+]
+
+[project.scripts]
+"{{id}}" = "founder_coach.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["founder_coach"]
+
+[tool.uv]
+# uv reuses a built local package until one of these changes. BUILD_ID is rewritten on
+# every assemble, so a rebuilt plugin always reinstalls; code globs are a second net.
+cache-keys = [{ file = "pyproject.toml" }, { file = "BUILD_ID" }, { file = "founder_coach/**/*.py" }]

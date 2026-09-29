@@ -1,0 +1,37 @@
+# Copy to sources.yaml (git-ignored) and edit, or let `ytbrain discover` build it:
+#   cp sources.example.yaml sources.yaml
+#   ytbrain discover --method ytdlp --channel @SomeChannel
+#
+# Two Source types (ADR-0013):
+#   YouTube playlists: a PLAYLIST id (PL... or a channel's uploads UU...), never a channel id
+#     (UC...). Specific playlists win over a `fallback: true` catch-all.
+#   Websites: `type: website` and a `url`; everything else is optional and worked out from the
+#     pages themselves (docs/web-sources-plan.md). Needs: uv pip install -e ".[web]", and for
+#     JavaScript sites: playwright install chromium
+# `enabled: false` on any entry stops fetching it (its Documents stay until `ytbrain drop --source ID`).
+defaults:                              # applied to every source unless it overrides them
+  sub_langs: en,en-orig,en-US,en-GB    # exact English tracks (en.* also pulls machine translations)
+  sub_format: srt/best
+  sleep_requests: 5                    # seconds between yt-dlp requests; >= 5 avoids most YouTube 429s
+sources:
+- id: how_to_start_a_startup_2014      # stable slug, unique
+  name: How to Start a Startup (CS183B, 2014)
+  kind: playlist
+  playlist_id: PL11qn6zM2Y3bMZdChxEqHKaCaKUjwItGL
+  fallback: false
+# - id: channel_uploads                # optional catch-all: every upload of a channel
+#   name: Channel uploads
+#   kind: playlist
+#   playlist_id: UUxxxxxxxxxxxxxxxxxxxxxx
+#   fallback: true
+- type: website                        # crawled politely: robots.txt, 1 request/s per host, no login
+  url: https://paulgraham.com/articles.html
+  depth: 1                             # link hops from the start page (default 3)
+  render: auto                         # auto (browser only when a page's text is thin) | always | never
+  enabled: true
+  author: Paul Graham                  # optional: the speaker when a page names no author
+#   id and name default from the URL; a name you write is the series (else the site's own name);
+#   max_pages (default 10000 per run)
+# - type: website
+#   url: https://www.ycombinator.com/library
+#   render: always                     # a JavaScript site

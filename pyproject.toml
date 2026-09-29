@@ -1,0 +1,42 @@
+[project]
+name = "ytbrain"
+version = "0.1.0"
+description = "YouTube playlists and websites -> clean transcripts -> verified, cited knowledge -> Knowledge pack -> MCP founder-coach runtime"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = [
+  "yt-dlp[default]>=2026.8.19",   # [default] brings yt-dlp-ejs (YouTube JS challenges)
+  "pyyaml>=6.0",
+  "pydantic>=2.9",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Each extra is independently installable so the core pipeline stays dependency-light.
+extract = ["langextract>=1.7.0", "ollama>=0.4"]
+index   = ["lancedb>=0.39.0", "sentence-transformers>=3.0"]
+graph   = ["duckdb>=1.1", "networkx>=3.3"]
+serve   = ["mcp>=2.2.0,<3", "tzdata", "numpy>=1.26"]   # the founder_coach MCP server (+ "pack" for semantic search)
+asr     = ["faster-whisper>=1.0"]
+eval    = ["lancedb>=0.39.0", "sentence-transformers>=3.0", "fastembed>=0.8"]   # index + pack; metrics are stdlib
+# The Knowledge pack and its ONNX query models (no torch): `ytbrain pack build`,
+# `search --pack`, `eval run --config pack`, and the coach runtime (founder_coach)
+pack    = ["fastembed>=0.8", "numpy>=1.26"]
+dev     = ["pytest>=8.0", "ruff>=0.6"]
+# Website Sources (docs/web-sources-plan.md): main-text extraction and, for JavaScript sites,
+# a headless browser (then run once: playwright install chromium)
+web     = ["trafilatura>=2.2", "playwright>=1.55"]
+# yt-dlp plugin that supplies YouTube PO tokens; also needs a provider server or
+# script-mode checkout (README: "Optional: a PO-token provider")
+pot     = ["bgutil-ytdlp-pot-provider~=2.0"]   # 2.x, matching the server checkout (branch 2.0.0)
+
+[project.scripts]
+ytbrain = "ytbrain.cli:main"
+founder-coach = "founder_coach.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ytbrain*", "founder_coach*"]
+
+[tool.setuptools.package-data]
+founder_coach = ["playbooks/*.md", "product.json"]
+ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl"]

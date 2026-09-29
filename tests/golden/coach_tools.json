@@ -1,0 +1,1314 @@
+[
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": true
+  },
+  "description": "Search Verified advice, takeaways and talk summaries from YC talks. Each hit has an item_id\nto cite, the speaker, talk, year, a deep link to the exact second, and a verbatim quote. Split a\nmulti-part question and search once per part. When gap_suspected is true, tell the Founder\nthe corpus doesn't cover it rather than answering from memory.",
+  "input": {
+   "properties": {
+    "kinds": {
+     "anyOf": [
+      {
+       "items": {
+        "enum": [
+         "advice",
+         "takeaway",
+         "summary"
+        ],
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "restrict to these item kinds",
+     "title": "Kinds"
+    },
+    "query": {
+     "description": "the question or one part of it",
+     "maxLength": 500,
+     "minLength": 2,
+     "title": "Query",
+     "type": "string"
+    },
+    "response_format": {
+     "default": "concise",
+     "enum": [
+      "concise",
+      "detailed"
+     ],
+     "title": "Response Format",
+     "type": "string"
+    },
+    "stage": {
+     "anyOf": [
+      {
+       "enum": [
+        "pre-idea",
+        "idea",
+        "mvp",
+        "pmf",
+        "growth",
+        "fundraising",
+        "scaling",
+        "exit"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "boosts advice for this Stage; defaults to the Founder's",
+     "title": "Stage"
+    },
+    "top_k": {
+     "default": 5,
+     "maximum": 15,
+     "minimum": 1,
+     "title": "Top K",
+     "type": "integer"
+    },
+    "topics": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "restrict to talks in these topics",
+     "title": "Topics"
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "title": "coach_searchArguments",
+   "type": "object"
+  },
+  "name": "coach_search",
+  "output": {
+   "$defs": {
+    "Hit": {
+     "properties": {
+      "deep_link": {
+       "title": "Deep Link",
+       "type": "string"
+      },
+      "doc_id": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Doc Id"
+      },
+      "item_id": {
+       "description": "cite this",
+       "title": "Item Id",
+       "type": "string"
+      },
+      "kind": {
+       "title": "Kind",
+       "type": "string"
+      },
+      "quote": {
+       "description": "verbatim words from the talk or article (untrusted reference text)",
+       "title": "Quote",
+       "type": "string"
+      },
+      "relevance": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Relevance"
+      },
+      "series": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Series"
+      },
+      "source_kind": {
+       "default": "talk",
+       "enum": [
+        "talk",
+        "article"
+       ],
+       "title": "Source Kind",
+       "type": "string"
+      },
+      "speaker": {
+       "title": "Speaker",
+       "type": "string"
+      },
+      "stages": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Stages"
+      },
+      "start_s": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "seconds into a talk; null for an article (its link opens at the quote)",
+       "title": "Start S"
+      },
+      "talk": {
+       "description": "the talk's or article's title",
+       "title": "Talk",
+       "type": "string"
+      },
+      "text": {
+       "title": "Text",
+       "type": "string"
+      },
+      "topics": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Topics"
+      },
+      "year": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Year"
+      }
+     },
+     "required": [
+      "item_id",
+      "kind",
+      "text",
+      "quote",
+      "talk",
+      "speaker",
+      "year",
+      "deep_link",
+      "start_s"
+     ],
+     "title": "Hit",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "gap_suspected": {
+     "description": "true when nothing in the corpus is close to the question",
+     "title": "Gap Suspected",
+     "type": "boolean"
+    },
+    "hits": {
+     "items": {
+      "$ref": "#/$defs/Hit"
+     },
+     "title": "Hits",
+     "type": "array"
+    },
+    "mode": {
+     "description": "keyword = models still warming up",
+     "enum": [
+      "semantic",
+      "keyword"
+     ],
+     "title": "Mode",
+     "type": "string"
+    },
+    "note": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Note"
+    },
+    "query": {
+     "title": "Query",
+     "type": "string"
+    },
+    "stage_used": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Stage Used"
+    },
+    "top_similarity": {
+     "anyOf": [
+      {
+       "type": "number"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "description": "cosine similarity of the closest item (semantic mode)",
+     "title": "Top Similarity"
+    }
+   },
+   "required": [
+    "query",
+    "mode",
+    "stage_used",
+    "hits",
+    "top_similarity",
+    "gap_suspected"
+   ],
+   "title": "SearchOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": true
+  },
+  "description": "Read one talk: its summary and every Verified advice item and takeaway, each with its\nquote and deep link, in talk order. Use it to check a citation or to see the context of a hit.",
+  "input": {
+   "properties": {
+    "ref": {
+     "description": "an item_id from coach_search, or a talk's doc_id",
+     "maxLength": 200,
+     "minLength": 3,
+     "title": "Ref",
+     "type": "string"
+    }
+   },
+   "required": [
+    "ref"
+   ],
+   "title": "coach_readArguments",
+   "type": "object"
+  },
+  "name": "coach_read",
+  "output": {
+   "$defs": {
+    "ReadItem": {
+     "properties": {
+      "deep_link": {
+       "title": "Deep Link",
+       "type": "string"
+      },
+      "item_id": {
+       "title": "Item Id",
+       "type": "string"
+      },
+      "kind": {
+       "title": "Kind",
+       "type": "string"
+      },
+      "quote": {
+       "title": "Quote",
+       "type": "string"
+      },
+      "start_s": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Start S"
+      },
+      "text": {
+       "title": "Text",
+       "type": "string"
+      }
+     },
+     "required": [
+      "item_id",
+      "kind",
+      "text",
+      "quote",
+      "deep_link",
+      "start_s"
+     ],
+     "title": "ReadItem",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "deep_link": {
+     "title": "Deep Link",
+     "type": "string"
+    },
+    "doc_id": {
+     "title": "Doc Id",
+     "type": "string"
+    },
+    "items": {
+     "items": {
+      "$ref": "#/$defs/ReadItem"
+     },
+     "title": "Items",
+     "type": "array"
+    },
+    "series": {
+     "title": "Series",
+     "type": "string"
+    },
+    "speaker": {
+     "title": "Speaker",
+     "type": "string"
+    },
+    "summary": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Summary"
+    },
+    "talk": {
+     "title": "Talk",
+     "type": "string"
+    },
+    "year": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Year"
+    }
+   },
+   "required": [
+    "doc_id",
+    "talk",
+    "speaker",
+    "year",
+    "series",
+    "deep_link",
+    "summary",
+    "items"
+   ],
+   "title": "ReadOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": true
+  },
+  "description": "Start here: today's date and ISO week, the Founder profile (stale facts flagged), active Goals,\nthis week's and overdue Commitments, the last Check-in, recent Decisions, and what's due (Nudges).\nRecord ids here are what coach_update takes.",
+  "input": {
+   "properties": {
+    "response_format": {
+     "default": "concise",
+     "enum": [
+      "concise",
+      "detailed"
+     ],
+     "title": "Response Format",
+     "type": "string"
+    }
+   },
+   "title": "coach_get_contextArguments",
+   "type": "object"
+  },
+  "name": "coach_get_context",
+  "output": {
+   "properties": {
+    "goals": {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "title": "Goals",
+     "type": "array"
+    },
+    "last_checkin": {
+     "anyOf": [
+      {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Last Checkin"
+    },
+    "nudges": {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "title": "Nudges",
+     "type": "array"
+    },
+    "overdue": {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "title": "Overdue",
+     "type": "array"
+    },
+    "profile": {
+     "additionalProperties": true,
+     "title": "Profile",
+     "type": "object"
+    },
+    "recent_decisions": {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "title": "Recent Decisions",
+     "type": "array"
+    },
+    "this_week": {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "title": "This Week",
+     "type": "array"
+    },
+    "timezone": {
+     "title": "Timezone",
+     "type": "string"
+    },
+    "today": {
+     "title": "Today",
+     "type": "string"
+    },
+    "week": {
+     "title": "Week",
+     "type": "string"
+    },
+    "week_starts": {
+     "title": "Week Starts",
+     "type": "string"
+    }
+   },
+   "required": [
+    "today",
+    "week",
+    "week_starts",
+    "timezone",
+    "profile",
+    "goals",
+    "this_week",
+    "overdue",
+    "last_checkin",
+    "recent_decisions",
+    "nudges"
+   ],
+   "title": "ContextOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": false
+  },
+  "description": "Set or confirm Founder profile facts. A changed value keeps the old one in history; re-stating\nan unchanged value confirms it (profile facts go stale after 30 days). Call only after the\nFounder has approved the exact values.",
+  "input": {
+   "properties": {
+    "changes": {
+     "additionalProperties": true,
+     "description": "field -> value. Fields: company (company name); one_liner (what the company does, in one sentence); customer (who the customer is); stage (one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit); team_size (number of people working on the company); key_metrics (the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}); timezone (IANA time zone, e.g. Asia/Kolkata); checkin_day (preferred Check-in day: mon, tue, wed, thu, fri, sat, sun)",
+     "title": "Changes",
+     "type": "object"
+    },
+    "request_id": {
+     "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
+     "maxLength": 100,
+     "minLength": 1,
+     "title": "Request Id",
+     "type": "string"
+    }
+   },
+   "required": [
+    "changes",
+    "request_id"
+   ],
+   "title": "coach_update_profileArguments",
+   "type": "object"
+  },
+  "name": "coach_update_profile",
+  "output": {
+   "properties": {
+    "confirmed": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Confirmed",
+     "type": "array"
+    },
+    "profile": {
+     "additionalProperties": true,
+     "title": "Profile",
+     "type": "object"
+    },
+    "replayed": {
+     "default": false,
+     "title": "Replayed",
+     "type": "boolean"
+    },
+    "updated": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Updated",
+     "type": "array"
+    }
+   },
+   "required": [
+    "updated",
+    "confirmed",
+    "profile"
+   ],
+   "title": "ProfileOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": false
+  },
+  "description": "Save one new record. kind \"commitments\" takes 1-3 if-then plans with measurable outcomes (the\nweek's Focus). Citations must be item_ids returned by coach_search or coach_read. Warnings flag\nmore than 3 open Commitments or Goals. Call only after the Founder has approved the exact text.",
+  "input": {
+   "$defs": {
+    "CheckinIn": {
+     "properties": {
+      "blockers": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Blockers",
+       "type": "array"
+      },
+      "kind": {
+       "const": "checkin",
+       "title": "Kind",
+       "type": "string"
+      },
+      "summary": {
+       "title": "Summary",
+       "type": "string"
+      },
+      "wins": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Wins",
+       "type": "array"
+      }
+     },
+     "required": [
+      "kind",
+      "summary"
+     ],
+     "title": "CheckinIn",
+     "type": "object"
+    },
+    "CommitmentIn": {
+     "properties": {
+      "action": {
+       "description": "what the Founder will do",
+       "title": "Action",
+       "type": "string"
+      },
+      "citations": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Citations",
+       "type": "array"
+      },
+      "cue": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "the 'if/when' of the if-then plan, e.g. 'Monday 9am'",
+       "title": "Cue"
+      },
+      "goal_id": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Goal Id"
+      },
+      "outcome": {
+       "description": "measurable result, e.g. '5 calls booked'",
+       "title": "Outcome",
+       "type": "string"
+      }
+     },
+     "required": [
+      "action",
+      "outcome"
+     ],
+     "title": "CommitmentIn",
+     "type": "object"
+    },
+    "CommitmentsIn": {
+     "properties": {
+      "items": {
+       "items": {
+        "$ref": "#/$defs/CommitmentIn"
+       },
+       "maxItems": 3,
+       "minItems": 1,
+       "title": "Items",
+       "type": "array"
+      },
+      "kind": {
+       "const": "commitments",
+       "title": "Kind",
+       "type": "string"
+      },
+      "week": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "ISO week like 2026-W40; default this week",
+       "title": "Week"
+      }
+     },
+     "required": [
+      "kind",
+      "items"
+     ],
+     "title": "CommitmentsIn",
+     "type": "object"
+    },
+    "DecisionIn": {
+     "properties": {
+      "citations": {
+       "items": {
+        "type": "string"
+       },
+       "title": "Citations",
+       "type": "array"
+      },
+      "kind": {
+       "const": "decision",
+       "title": "Kind",
+       "type": "string"
+      },
+      "reasoning": {
+       "title": "Reasoning",
+       "type": "string"
+      },
+      "revisit_on": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "YYYY-MM-DD to look at it again",
+       "title": "Revisit On"
+      },
+      "text": {
+       "title": "Text",
+       "type": "string"
+      }
+     },
+     "required": [
+      "kind",
+      "text",
+      "reasoning"
+     ],
+     "title": "DecisionIn",
+     "type": "object"
+    },
+    "GoalIn": {
+     "properties": {
+      "citations": {
+       "description": "item_ids from coach_search/coach_read",
+       "items": {
+        "type": "string"
+       },
+       "title": "Citations",
+       "type": "array"
+      },
+      "kind": {
+       "const": "goal",
+       "title": "Kind",
+       "type": "string"
+      },
+      "measure": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "how progress is measured",
+       "title": "Measure"
+      },
+      "target_date": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "YYYY-MM-DD",
+       "title": "Target Date"
+      },
+      "text": {
+       "description": "the outcome, e.g. '10 paying design partners'",
+       "title": "Text",
+       "type": "string"
+      }
+     },
+     "required": [
+      "kind",
+      "text"
+     ],
+     "title": "GoalIn",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "entry": {
+     "discriminator": {
+      "mapping": {
+       "checkin": "#/$defs/CheckinIn",
+       "commitments": "#/$defs/CommitmentsIn",
+       "decision": "#/$defs/DecisionIn",
+       "goal": "#/$defs/GoalIn"
+      },
+      "propertyName": "kind"
+     },
+     "oneOf": [
+      {
+       "$ref": "#/$defs/GoalIn"
+      },
+      {
+       "$ref": "#/$defs/CommitmentsIn"
+      },
+      {
+       "$ref": "#/$defs/DecisionIn"
+      },
+      {
+       "$ref": "#/$defs/CheckinIn"
+      }
+     ],
+     "title": "Entry"
+    },
+    "request_id": {
+     "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
+     "maxLength": 100,
+     "minLength": 1,
+     "title": "Request Id",
+     "type": "string"
+    }
+   },
+   "required": [
+    "entry",
+    "request_id"
+   ],
+   "title": "coach_recordArguments",
+   "type": "object"
+  },
+  "name": "coach_record",
+  "output": {
+   "properties": {
+    "ids": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Ids",
+     "type": "array"
+    },
+    "replayed": {
+     "default": false,
+     "title": "Replayed",
+     "type": "boolean"
+    },
+    "warnings": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Warnings",
+     "type": "array"
+    }
+   },
+   "required": [
+    "ids",
+    "warnings"
+   ],
+   "title": "RecordOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": false
+  },
+  "description": "Close or correct a Goal, Commitment, Decision or Check-in. Every change is logged with its\nbefore/after. Call only after the Founder has approved it.",
+  "input": {
+   "properties": {
+    "changes": {
+     "anyOf": [
+      {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "fields to correct, e.g. {\"outcome\": \"3 calls\"}",
+     "title": "Changes"
+    },
+    "id": {
+     "description": "a record id from coach_get_context, e.g. c-1a2b",
+     "title": "Id",
+     "type": "string"
+    },
+    "note": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "the evidence, e.g. 'shipped pricing page, 3 calls booked'",
+     "title": "Note"
+    },
+    "request_id": {
+     "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
+     "maxLength": 100,
+     "minLength": 1,
+     "title": "Request Id",
+     "type": "string"
+    },
+    "status": {
+     "anyOf": [
+      {
+       "enum": [
+        "active",
+        "met",
+        "dropped",
+        "open",
+        "done",
+        "carried"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "Goals: active/met/dropped. Commitments: open/done/dropped/carried (carried opens a linked copy in the next week)",
+     "title": "Status"
+    }
+   },
+   "required": [
+    "id",
+    "request_id"
+   ],
+   "title": "coach_updateArguments",
+   "type": "object"
+  },
+  "name": "coach_update",
+  "output": {
+   "properties": {
+    "after": {
+     "additionalProperties": true,
+     "title": "After",
+     "type": "object"
+    },
+    "before": {
+     "additionalProperties": true,
+     "title": "Before",
+     "type": "object"
+    },
+    "carried_weeks": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Carried Weeks"
+    },
+    "id": {
+     "title": "Id",
+     "type": "string"
+    },
+    "new_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "New Id"
+    },
+    "replayed": {
+     "default": false,
+     "title": "Replayed",
+     "type": "boolean"
+    },
+    "warnings": {
+     "items": {
+      "type": "string"
+     },
+     "title": "Warnings",
+     "type": "array"
+    }
+   },
+   "required": [
+    "id",
+    "before",
+    "after"
+   ],
+   "title": "UpdateOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": true
+  },
+  "description": "What the knowledge covers (talks, years, series), whether semantic search is ready, and where\nthe Founder's data lives. Use it to state Gaps honestly.",
+  "input": {
+   "properties": {},
+   "title": "coach_corpus_statusArguments",
+   "type": "object"
+  },
+  "name": "coach_corpus_status",
+  "output": {
+   "properties": {
+    "gap_similarity": {
+     "title": "Gap Similarity",
+     "type": "number"
+    },
+    "gap_threshold_provisional": {
+     "title": "Gap Threshold Provisional",
+     "type": "boolean"
+    },
+    "models": {
+     "additionalProperties": true,
+     "title": "Models",
+     "type": "object"
+    },
+    "pack": {
+     "anyOf": [
+      {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Pack"
+    },
+    "pack_error": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Pack Error"
+    },
+    "pack_path": {
+     "title": "Pack Path",
+     "type": "string"
+    },
+    "search_mode": {
+     "title": "Search Mode",
+     "type": "string"
+    },
+    "store": {
+     "additionalProperties": true,
+     "title": "Store",
+     "type": "object"
+    },
+    "version": {
+     "title": "Version",
+     "type": "string"
+    }
+   },
+   "required": [
+    "version",
+    "pack",
+    "pack_path",
+    "pack_error",
+    "search_mode",
+    "models",
+    "gap_similarity",
+    "gap_threshold_provisional",
+    "store"
+   ],
+   "title": "StatusOut",
+   "type": "object"
+  }
+ },
+ {
+  "annotations": {
+   "destructive_hint": false,
+   "idempotent_hint": true,
+   "open_world_hint": false,
+   "read_only_hint": false
+  },
+  "description": "Save the Founder's report that an answer or a saved record was wrong, so the maintainers\ncan turn it into an eval case. It stays on this machine until the Founder exports and sends\nit. Show the Founder the exact record first and call only after they say yes.",
+  "input": {
+   "$defs": {
+    "FeedbackIn": {
+     "properties": {
+      "answer": {
+       "description": "the coach's answer (or the saved record) the Feedback is about, verbatim; up to 20000 characters, so trim to the part in question",
+       "title": "Answer",
+       "type": "string"
+      },
+      "category": {
+       "description": "wrong_citation: a cited quote doesn't say what the answer claims; missed_gap: the coach answered where it should have said the talks don't cover it; weak_advice: the advice was generic, wrong for the Stage, or agreed with a weak plan; wrong_memory: the coach saved, recalled or updated something about the Founder wrongly; other: anything else",
+       "enum": [
+        "wrong_citation",
+        "missed_gap",
+        "weak_advice",
+        "wrong_memory",
+        "other"
+       ],
+       "title": "Category",
+       "type": "string"
+      },
+      "cited": {
+       "description": "item_ids the answer cited",
+       "items": {
+        "type": "string"
+       },
+       "title": "Cited",
+       "type": "array"
+      },
+      "expected": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "what the Founder expected instead, if they said",
+       "title": "Expected"
+      },
+      "note": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "what the Founder says was wrong, in their words",
+       "title": "Note"
+      },
+      "question": {
+       "description": "what the Founder asked or did, verbatim",
+       "title": "Question",
+       "type": "string"
+      },
+      "searches": {
+       "description": "the queries sent to coach_search for it",
+       "items": {
+        "type": "string"
+       },
+       "title": "Searches",
+       "type": "array"
+      }
+     },
+     "required": [
+      "category",
+      "question",
+      "answer"
+     ],
+     "title": "FeedbackIn",
+     "type": "object"
+    }
+   },
+   "properties": {
+    "feedback": {
+     "$ref": "#/$defs/FeedbackIn"
+    },
+    "request_id": {
+     "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
+     "maxLength": 100,
+     "minLength": 1,
+     "title": "Request Id",
+     "type": "string"
+    }
+   },
+   "required": [
+    "feedback",
+    "request_id"
+   ],
+   "title": "coach_feedbackArguments",
+   "type": "object"
+  },
+  "name": "coach_feedback",
+  "output": {
+   "properties": {
+    "category": {
+     "title": "Category",
+     "type": "string"
+    },
+    "id": {
+     "title": "Id",
+     "type": "string"
+    },
+    "replayed": {
+     "default": false,
+     "title": "Replayed",
+     "type": "boolean"
+    },
+    "saved_at": {
+     "title": "Saved At",
+     "type": "string"
+    }
+   },
+   "required": [
+    "id",
+    "saved_at",
+    "category"
+   ],
+   "title": "FeedbackOut",
+   "type": "object"
+  }
+ }
+]

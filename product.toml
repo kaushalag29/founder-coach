@@ -1,0 +1,22 @@
+# The product's identity: the one place its name lives (ADR-0012).
+# scripts/assemble_plugin.py writes these into everything that ships (plugin.json, .mcp.json,
+# hooks.json, the plugin's pyproject.toml, the skills; scripts/release.py writes marketplace.json) and into
+# founder_coach/product.json, which the runtime reads. To rename: edit `id`, run the
+# assembler, run the tests. A changed `id` changes the install id, the slash-command prefix,
+# the CLI, the Founder's data folder (~/.<id>) and the settings prefix (<ID>_*), so testers
+# reinstall and move their data folder once.
+
+[product]
+id = "founder-coach"                   # lowercase letters, digits and hyphens
+display_name = "Founder Coach"
+# What search engines, the plugin browser and GitHub show. "YC" and "Y Combinator" go here,
+# never in the id or display name.
+description = "An AI startup coach personalized to your company: cited advice from Y Combinator talks for your Stage, a weekly Focus of up to three Commitments, and Check-ins that remember what you decided. Runs locally; your data stays on this machine."
+keywords = ["startup", "founder", "ai-coach", "y-combinator", "fundraising", "angel-investors", "mcp", "claude-code-plugin"]
+author = "Kaushal"
+license = "BUSL-1.1"
+
+[repos]
+owner = "kaushalag29"                  # GitHub user that owns both private repos
+dev = "founder-coach"                  # this repo: pipeline, runtime, plugin source, evals
+marketplace = "founder-coach-marketplace"   # what beta testers add: marketplace.json + the built plugin

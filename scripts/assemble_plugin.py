@@ -1,0 +1,322 @@
+"""Assemble the installable plugin: plugin/ + founder_coach/ + the Knowledge pack -> dist/plugin.
+
+    python scripts/assemble_plugin.py --pack PATH [--out dist/plugin] [--check]
+
+Steps, each safe to re-run:
+1. Regenerate founder_coach/product.json from product.toml (the product's name, ADR-0012) and
+   founder_coach/playbooks/*.md (the MCP prompts) from the skills, the single source.
+2. Build the plugin in a temporary folder next to --out: plugin files with the product's
+   {{placeholders}} filled in, the runtime package (no caches), the pack, and a BUILD_ID stamp
+   so uv reinstalls the runtime.
+3. Swap it into place: the previous build is kept as <out>.previous until the new one is in.
+
+plugin/ is a template (its files say `{{id}}` where the product id goes), so load the
+assembled dist/plugin in Claude Code, not plugin/ itself.
+With --check, import the assembled runtime and open the assembled pack before swapping,
+so a broken build never replaces a working one.
+
+Local test:  claude plugin validate dist/plugin --strict && claude --plugin-dir dist/plugin
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PROMPT_SKILLS = ("ask", "weekly-focus", "check-in", "setup")   # the MCP prompts the server serves
+# = founder_coach.pack's names; not imported, so the assembler runs without the runtime's dependencies
+PACK_FILE, MANIFEST_FILE = "knowledge.sqlite", "pack.json"
+IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", ".pytest_cache")
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
+RENDERED = {".md", ".json", ".toml", ".yaml", ".yml", ".txt"}   # plugin files that may hold {{placeholders}}
+PRODUCT_FIELDS = ("id", "display_name", "description", "author", "license")
+DERIVED_FIELDS = ("env_prefix",)          # {{env_prefix}}: the runtime's environment variables, e.g. ACME_COACH_
+
+
+def env_prefix(pid: str) -> str:
+    """The same prefix founder_coach.product.ENV_PREFIX derives from the id."""
+    return pid.upper().replace("-", "_") + "_"
+
+
+class AssembleError(RuntimeError):
+    pass
+
+
+# ---- the product's identity (product.toml, ADR-0012) ---------------------------------------
+
+def load_product(root: Path = ROOT) -> dict:
+    """product.toml's [product] table, checked: the one place the product's name lives."""
+    path = root / "product.toml"
+    if not path.exists():
+        raise AssembleError(f"missing {path}: it names the product (ADR-0012)")
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise AssembleError(f"{path} is not valid TOML: {e}") from None
+    prod = dict(data.get("product") or {})
+    prod["repos"] = dict(data.get("repos") or {})
+    missing = [f for f in PRODUCT_FIELDS if not isinstance(prod.get(f), str) or not prod[f].strip()]
+    if missing:
+        raise AssembleError(f"{path}: [product] needs {', '.join(missing)}")
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", prod["id"]):
+        raise AssembleError(f"{path}: id {prod['id']!r} must be lowercase letters, digits and hyphens "
+                            "(it becomes the install id, the CLI and ~/.<id>)")
+    if not isinstance(prod.get("keywords", []), list) or not all(isinstance(k, str) for k in prod.get("keywords", [])):
+        raise AssembleError(f"{path}: keywords must be a list of strings")
+    prod.setdefault("keywords", [])
+    return prod
+
+
+def product_json(prod: dict) -> str:
+    """What founder_coach/product.json holds: only what the runtime needs."""
+    return json.dumps({"_generated": "from product.toml by scripts/assemble_plugin.py; edit product.toml",
+                       "display_name": prod["display_name"], "id": prod["id"]}, indent=2) + "\n"
+
+
+def sync_product_json(root: Path, prod: dict) -> bool:
+    dest = root / "founder_coach" / "product.json"
+    new = product_json(prod)
+    if dest.exists() and dest.read_text(encoding="utf-8") == new:
+        return False
+    tmp = dest.with_suffix(".json.tmp")
+    tmp.write_text(new, encoding="utf-8")
+    os.replace(tmp, dest)
+    return True
+
+
+def render(text: str, prod: dict, where: str = "text", quote: bool = False) -> str:
+    """Fill {{field}} placeholders from product.toml. quote=True escapes values for a JSON or
+    TOML string. An unknown placeholder is an error, never shipped."""
+    def one(m: re.Match) -> str:
+        key = m.group(1)
+        if key not in PRODUCT_FIELDS + DERIVED_FIELDS:
+            raise AssembleError(f"{where}: unknown placeholder {{{{{key}}}}} "
+                                f"(known: {', '.join(PRODUCT_FIELDS + DERIVED_FIELDS)})")
+        v = env_prefix(prod["id"]) if key == "env_prefix" else prod[key]
+        return json.dumps(v)[1:-1] if quote else v
+    return PLACEHOLDER.sub(one, text)
+
+
+def render_tree(build: Path, prod: dict, skip: tuple[str, ...] = ("founder_coach", "pack")) -> int:
+    """Fill the placeholders in every text file of an assembled plugin (not the runtime or pack)."""
+    n = 0
+    for p in sorted(build.rglob("*")):
+        rel = p.relative_to(build)
+        if not p.is_file() or p.suffix not in RENDERED or rel.parts[0] in skip:
+            continue
+        text = p.read_text(encoding="utf-8")
+        if "{{" not in text:
+            continue
+        if rel.as_posix() == ".claude-plugin/plugin.json":     # keywords is a list, not a string
+            m = json.loads(text)
+            if m.get("keywords") == ["{{keywords}}"]:
+                m["keywords"] = prod["keywords"]
+            text = json.dumps(m, indent=2, ensure_ascii=False) + "\n"
+        p.write_text(render(text, prod, str(rel), quote=p.suffix in (".json", ".toml")), encoding="utf-8")
+        n += 1
+    return n
+
+
+# ---- skills -> MCP prompt text -------------------------------------------------------------
+
+def split_skill(text: str) -> tuple[dict[str, str], str]:
+    """Frontmatter (flat `key: value` lines only, which is all the skills use) and body."""
+    m = FRONTMATTER.match(text)
+    if not m:
+        raise AssembleError("SKILL.md must start with a --- frontmatter block")
+    meta: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        if line.strip():
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip().strip('"')
+    return meta, text[m.end():].lstrip("\n")
+
+
+def prompt_text(skill_body: str, prod: dict | None = None) -> str:
+    """A skill body rewritten for hosts that have MCP prompts but no skills: no Claude Code
+    substitutions, the contract pointed at the server instructions, the product id filled in."""
+    prod = prod or load_product()
+    t = skill_body
+    t = t.replace("the coaching contract of the coach skill", "the coaching contract in the server instructions")
+    t = t.replace("the coach skill's stages reference", "the Stage list in coach_update_profile")
+    t = re.sub(r'uvx --from "\$\{CLAUDE_SKILL_DIR\}/\.\./\.\." \{\{id\}\}', "{{id}}", t)
+    t = t.replace("$ARGUMENTS", "{arguments}")
+    t = re.sub(r"/\{\{id\}\}:([a-z-]+)", r"the \1 prompt", t)
+    t = render(t, prod, "prompt text")
+    left = re.search(r"\$\{[^}]*\}", t)
+    if left:
+        raise AssembleError(f"unsubstituted host variable left in prompt text: {left.group(0)}")
+    return t
+
+
+def generate_playbooks(root: Path, prod: dict | None = None) -> list[Path]:
+    prod = prod or load_product(root)
+    out_dir = root / "founder_coach" / "playbooks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name in PROMPT_SKILLS:
+        src = root / "plugin" / "skills" / name / "SKILL.md"
+        if not src.exists():
+            raise AssembleError(f"missing skill {src}")
+        _, body = split_skill(src.read_text(encoding="utf-8"))
+        header = f"<!-- generated from plugin/skills/{name}/SKILL.md by scripts/assemble_plugin.py; edit the skill -->\n"
+        dest = out_dir / f"{name}.md"
+        new = header + prompt_text(body, prod)
+        if not dest.exists() or dest.read_text(encoding="utf-8") != new:
+            tmp = dest.with_suffix(".md.tmp")
+            tmp.write_text(new, encoding="utf-8")
+            os.replace(tmp, dest)
+            written.append(dest)
+    return written
+
+
+# ---- build ---------------------------------------------------------------------------------
+
+def _tree_hash(*paths: Path) -> str:
+    h = hashlib.sha256()
+    for base in paths:
+        files = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file()
+                                                   and "__pycache__" not in p.parts and p.suffix != ".pyc")
+        for p in files:
+            h.update(str(p.relative_to(base.parent)).encode())
+            h.update(p.read_bytes() if p.stat().st_size < 50_000_000 else str(p.stat().st_mtime_ns).encode())
+    return h.hexdigest()[:12]
+
+
+def _copy_pack(pack: Path, dest: Path) -> None:
+    """Only the pack file and its manifest: a pack folder from `ytbrain pack build` also holds
+    the (large, build-only) embedding cache, which must not ship."""
+    src = pack / PACK_FILE if pack.is_dir() else pack
+    manifest = src.with_name(MANIFEST_FILE)
+    for need in (src, manifest):
+        if not need.exists():
+            raise AssembleError(f"missing {need}: pass the folder `ytbrain pack build` wrote "
+                                f"({PACK_FILE} + {MANIFEST_FILE})")
+    dest.mkdir(parents=True)
+    shutil.copy2(src, dest / PACK_FILE)
+    shutil.copy2(manifest, dest / MANIFEST_FILE)
+
+
+def _check(build: Path) -> None:
+    code = ("import sys; sys.path.insert(0, sys.argv[1]);"
+            "from founder_coach.pack import PackStore, find_pack;"
+            "p = PackStore(find_pack(sys.argv[1] + '/pack'), verify=True);"
+            "print('pack ok:', p.count(), 'items')")
+    # -B: importing the runtime from the build must not leave __pycache__ in what ships
+    try:
+        r = subprocess.run([sys.executable, "-B", "-c", code, str(build)], capture_output=True, text=True,
+                           timeout=300, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    except subprocess.TimeoutExpired:
+        raise AssembleError("the assembled plugin's check took over 5 minutes (a very slow disk?); "
+                            "the previous build is untouched") from None
+    if r.returncode != 0:
+        raise AssembleError(f"the assembled plugin failed its check:\n{(r.stderr or r.stdout).strip()[-2000:]}")
+
+
+def tools_list_from_golden(golden: Path) -> dict:
+    """The server's tool schemas (the tests' snapshot) as a tools/list response, for the eval
+    suite's mocked server: the model then sees the real tools, descriptions and hints."""
+    camel = lambda k: re.sub(r"_([a-z])", lambda m: m.group(1).upper(), k)
+    tools = []
+    for t in json.loads(golden.read_text()):
+        tool = {"name": t["name"], "description": t["description"], "inputSchema": t["input"]}
+        if t.get("output"):
+            tool["outputSchema"] = t["output"]
+        if t.get("annotations"):
+            tool["annotations"] = {camel(k): v for k, v in t["annotations"].items() if v is not None}
+        tools.append(tool)
+    return {"tools": tools}
+
+
+def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals: bool = False) -> dict:
+    root, out = root.resolve(), out.resolve()
+    if not pack.exists():
+        raise AssembleError(f"no Knowledge pack at {pack}; build it with `ytbrain pack build` or pass --pack")
+    for need in ("plugin/.claude-plugin/plugin.json", "plugin/pyproject.toml", "founder_coach/__init__.py"):
+        if not (root / need).exists():
+            raise AssembleError(f"missing {need} under {root}")
+    prod = load_product(root)
+    regenerated = (["product.json"] if sync_product_json(root, prod) else []) + \
+        [p.name for p in generate_playbooks(root, prod)]
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    build = out.with_name(f".{out.name}.building-{os.getpid()}")
+    if build.exists():
+        shutil.rmtree(build)
+    try:
+        # plugin/evals/ (the `claude plugin eval` suite) never ships to Founders; --with-evals
+        # builds a separate copy to run it against
+        ignore = IGNORE if with_evals else shutil.ignore_patterns(
+            "__pycache__", "*.pyc", ".DS_Store", ".pytest_cache", "evals")
+        shutil.copytree(root / "plugin", build, ignore=ignore)
+        golden = root / "tests" / "golden" / "coach_tools.json"
+        if with_evals and golden.exists() and (build / "evals").is_dir():
+            mocks = build / "evals" / "mocks" / "coach"
+            mocks.mkdir(parents=True, exist_ok=True)
+            (mocks / "_tools.json").write_text(json.dumps(tools_list_from_golden(golden), indent=1) + "\n")
+        render_tree(build, prod)
+        shutil.copytree(root / "founder_coach", build / "founder_coach", ignore=IGNORE)
+        _copy_pack(pack, build / "pack")
+        stamp = f"{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{_tree_hash(root / 'product.toml', root / 'plugin', root / 'founder_coach')}"
+        (build / "BUILD_ID").write_text(stamp + "\n", encoding="utf-8")
+        if check:
+            _check(build)
+        previous = out.with_name(out.name + ".previous")
+        if previous.exists():
+            shutil.rmtree(previous)
+        if out.exists():
+            os.replace(out, previous)
+        os.replace(build, out)
+    finally:
+        if build.exists():
+            shutil.rmtree(build, ignore_errors=True)
+    return {"out": str(out), "build_id": stamp, "regenerated": regenerated, "id": prod["id"]}
+
+
+def _pack_env_name(root: Path = ROOT) -> str:
+    return load_product(root)["id"].upper().replace("-", "_") + "_PACK"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    try:
+        env_pack = _pack_env_name()
+    except AssembleError as e:
+        print(f"assemble: {e}", file=sys.stderr)
+        return 2
+    ap.add_argument("--pack", type=Path, default=Path(os.environ[env_pack]) if os.environ.get(env_pack) else None,
+                    help=f"the Knowledge pack (file or folder) from `ytbrain pack build` (default: ${env_pack})")
+    ap.add_argument("--out", type=Path, default=ROOT / "dist" / "plugin")
+    ap.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    ap.add_argument("--check", action="store_true", help="import the runtime and verify the pack before swapping in")
+    ap.add_argument("--with-evals", action="store_true",
+                    help="include plugin/evals/ (for `claude plugin eval`); use a separate --out, e.g. dist/plugin-eval")
+    args = ap.parse_args(argv)
+    if args.pack is None:
+        print(f"assemble: pass --pack PATH (or set {env_pack})", file=sys.stderr)
+        return 2
+    try:
+        res = assemble(args.root, args.pack, args.out, check=args.check, with_evals=args.with_evals)
+    except AssembleError as e:
+        print(f"assemble: {e}", file=sys.stderr)
+        return 2
+    regen = f"; regenerated {', '.join(res['regenerated'])}" if res["regenerated"] else ""
+    q = shlex.quote(res["out"])                # paths with spaces must survive a copy-paste
+    print(f"assemble: {res['out']} (build {res['build_id']}){regen}\n"
+          f"  next: claude plugin validate {q} --strict && claude --plugin-dir {q}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,82 @@
+# Every push and pull request: the six offline suites, a secret scan, and an assembled
+# plugin checked by Claude Code's own validator. No paid calls, no model downloads, no .env.
+# Private repo on GitHub Free: 2,000 Linux minutes a month; a run takes a few minutes.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      REQUIRE_ALL_TESTS: "1"          # a test that would skip for a missing dependency fails instead
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Keep pipeline data outside the checkout
+        run: echo "YTBRAIN_ROOT=$RUNNER_TEMP/ytbrain-data" >> "$GITHUB_ENV"
+
+      - name: Secret scan
+        run: python3 scripts/check_secrets.py
+
+      - uses: astral-sh/setup-uv@v9.0.0   # v8+ publish no moving major tag, so pin the full version
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      - name: Install (pipeline core + coach runtime + pack reader + web Sources + LanceDB for the index tests)
+        run: |
+          uv venv
+          uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"   # web: trafilatura + playwright (no browser needed: tests fake it)
+
+      - name: Test suites (REQUIRE_ALL_TESTS turns a skip into a failure)
+        run: |
+          set -o pipefail
+          for suite in core eval pack coach plugin web; do
+            echo "::group::test_$suite"
+            uv run --no-sync python tests/test_$suite.py 2>&1 | tee "$RUNNER_TEMP/test_$suite.log"
+            echo "::endgroup::"
+            if grep -q "(skipped" "$RUNNER_TEMP/test_$suite.log"; then
+              echo "::error::test_$suite skipped tests: a dependency is missing in CI"; exit 1
+            fi
+          done
+
+      - name: Assemble a plugin from a test pack
+        run: |
+          uv run --no-sync python - <<'PY'
+          import sys; sys.path.insert(0, "tests")
+          from pathlib import Path
+          from test_pack import HashEmbed, _build
+          _build(Path("dist/ci-pack"), emb=HashEmbed())
+          PY
+          uv run --no-sync python scripts/assemble_plugin.py --pack dist/ci-pack --out dist/plugin --check
+          git diff --exit-code -- founder_coach/product.json founder_coach/playbooks \
+            || { echo "::error::generated files are stale: run scripts/assemble_plugin.py and commit"; exit 1; }
+
+      - uses: actions/setup-node@v7
+        if: matrix.python == '3.13'
+        with:
+          node-version: "22"
+
+      - name: Claude Code's plugin validator
+        if: matrix.python == '3.13'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin validate dist/plugin --strict

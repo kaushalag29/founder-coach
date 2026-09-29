@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx --from \"${CLAUDE_PLUGIN_ROOT}\" {{id}} hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

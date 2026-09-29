@@ -1,0 +1,112 @@
+# ytbrain .gitignore — what is NOT part of the repository (github.com/kaushalag29/founder-coach, private).
+# Tracked on purpose (README "What's in git"): code (ytbrain/, founder_coach/ incl. the generated
+# product.json and playbooks/, scripts/, ops/), tests/ (incl. golden/), plugin/ (the template),
+# eval/ (the released benchmark), docs/ (ADRs, plans, research, archive), the top-level docs
+# (README, CHANGELOG, SECURITY, LICENSE, AGENTS, CLAUDE, CONTEXT), templates (.env.example,
+# sources.example.yaml), product.toml, pyproject.toml, .github/, and uv.lock / .python-version if added.
+
+# ---------------------------------------------------------------------------
+# Secrets — never commit. Copy .env.example to .env and fill it in.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+.pypirc
+credentials.json
+token.json
+client_secret*.json
+
+# ---------------------------------------------------------------------------
+# Pipeline data — everything ytbrain downloads or generates: captions (the
+# uploaders' content), transcripts, records, pages, the LanceDB index, the
+# manifest database, lock file and run log. Rebuild with `ytbrain run`.
+# Set YTBRAIN_ROOT to keep it outside the repo.
+# ---------------------------------------------------------------------------
+data/
+/manifest.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+# partial files from interrupted downloads/writes, and leftovers of applying patches
+*.orig
+*.rej
+*.part
+*.ytdl
+*.tmp
+
+# ---------------------------------------------------------------------------
+# Personal configuration and private founder data
+# ---------------------------------------------------------------------------
+# your playlist list — the tracked template is sources.example.yaml
+/sources.yaml
+# The Founder's data (store, Feedback, usage log) lives in ~/.<product id> (ADR-0012). These
+# catch it if FOUNDER_COACH_HOME or an --out folder ever points inside the repo. Keep the
+# patterns specific: a bare `feedback/` would also hide plugin/skills/feedback/.
+.ytbrain/
+.founder-coach/
+founder.db
+founder.db-*
+FOUNDER.md
+founder-export.json
+feedback-*.jsonl
+usage.jsonl*
+before-restore-*/
+# copies of the plan docs made for the Project; the files in docs/ are the ones to keep
+docs/ytbrain-docs/
+# a half-finished build of scripts/assemble_plugin.py (normally inside dist/)
+.plugin.building-*
+# eval: the benchmark in eval/ is tracked; run results live in data/eval/ (ignored)
+eval/private/
+# local Claude / agent settings (shared settings.json may be committed)
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+
+# ---------------------------------------------------------------------------
+# Python / uv
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+.tox/
+.nox/
+*.whl
+node_modules/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*~

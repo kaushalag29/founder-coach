@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "coach": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "{{id}}", "serve", "--pack", "${CLAUDE_PLUGIN_ROOT}/pack"]
+    }
+  }
+}

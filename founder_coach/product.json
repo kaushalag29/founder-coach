@@ -1,0 +1,5 @@
+{
+  "_generated": "from product.toml by scripts/assemble_plugin.py; edit product.toml",
+  "display_name": "Founder Coach",
+  "id": "founder-coach"
+}

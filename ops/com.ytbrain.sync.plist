@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd, NOT cron. This is the detail that decides whether the pipeline
+  actually runs: a cron job scheduled while the Mac is asleep simply never
+  fires, so on a laptop that is closed most nights cron would silently do
+  nothing for weeks. launchd runs a missed StartCalendarInterval job on wake.
+
+  Install:
+    cp ops/com.ytbrain.sync.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.ytbrain.sync.plist
+  Check:   launchctl list | grep ytbrain
+  Logs:    tail -f <REPO>/data/run.log
+  Remove:  launchctl unload ~/Library/LaunchAgents/com.ytbrain.sync.plist
+
+  Edit the three ABSOLUTE paths below — launchd does not expand ~ or inherit
+  your shell PATH, which is the other classic reason these jobs quietly fail.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ytbrain.sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/ytbrain/.venv/bin/python</string>
+    <string>-m</string><string>ytbrain.cli</string>
+    <string>run</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/ABSOLUTE/PATH/TO/ytbrain</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- daily at 03:15; the weekly --reconcile pass is a second plist -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>15</integer></dict>
+
+  <!-- false: do not fire on every login; the lockfile guards overlap anyway -->
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/ytbrain/data/run.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/ytbrain/data/run.log</string>
+
+  <!-- yt-dlp is polite and slow by design; do not let launchd throttle it -->
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+</dict>
+</plist>
