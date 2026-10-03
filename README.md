@@ -54,7 +54,7 @@ using Cowork instead: [Use the coach](#use-the-coach-claude-code-and-cowork).
 git clone git@github.com:kaushalag29/founder-coach.git && cd founder-coach
 uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"   # as CI; everything: ".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"
-for s in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
+for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
 ```
 
 Building the corpus needs an LLM key and YouTube access ([Install from scratch](#install-from-scratch)).
@@ -88,7 +88,8 @@ claude                                             # first run: sign in in the b
 **Cowork** (the Claude desktop app)
 
 1. Build the file: `python scripts/assemble_plugin.py --pack data/pack --check --zip` writes
-   `dist/founder-coach-<version>.plugin`.
+   `dist/founder-coach-<version>.plugin` (`-private.plugin` when the pack holds your Books: keep that one to your
+   own account).
 2. **Customize → Plugins**, upload that file. (Adding the marketplace repo there is the other route; whether Cowork
    can read a private repo is unconfirmed.) An installed plugin belongs to your account, so every Cowork project has it.
    To update, bump the version, remove the old plugin, upload the new file.
@@ -113,11 +114,12 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 | Doc | What's in it |
 |---|---|
 | [CONTEXT.md](CONTEXT.md) | The glossary: Advice, Evidence, Verified, Stage, Commitment, Check-in, Feedback… |
-| [docs/adr/](docs/adr/) | Architecture decisions (13), e.g. [retrieval, not generation](docs/adr/0002-mcp-server-retrieves-host-agent-generates.md), [only Verified knowledge](docs/adr/0004-only-verified-knowledge-reaches-the-coach.md), [one product id](docs/adr/0012-vertical-founder-coach-with-a-build-time-product-id.md) |
+| [docs/adr/](docs/adr/) | Architecture decisions (14), e.g. [retrieval, not generation](docs/adr/0002-mcp-server-retrieves-host-agent-generates.md), [only Verified knowledge](docs/adr/0004-only-verified-knowledge-reaches-the-coach.md), [one product id](docs/adr/0012-vertical-founder-coach-with-a-build-time-product-id.md) |
 | [docs/phase3-plan.md](docs/phase3-plan.md) | The coach: v1 scope, quality gates, MCP surface, skills, store (§11 is the implementation spec) |
 | [docs/phase2-plan.md](docs/phase2-plan.md) | Milestones M0–M6 and the pipeline design |
 | [docs/eval-spec.md](docs/eval-spec.md) | The retrieval benchmark (Tuning and Holdout sets, judges, metrics) |
 | [docs/commands.md](docs/commands.md) | Every command, by phase |
+| [docs/ops.md](docs/ops.md) | `ytbrain ops`: the whole loop in one resumable command |
 | [docs/release.md](docs/release.md) | Repos, CI, beta releases, what testers do, renaming |
 | [docs/m3-status.md](docs/m3-status.md) | Where the coach work stands and what's next |
 | [docs/research/](docs/research/) | Research behind upcoming work, e.g. [the web crawler](docs/research/web-crawler.md) |
@@ -224,7 +226,7 @@ uv pip install -e ".[dev]"
 #    everything we use: extraction extras, Knowledge index + search (LanceDB,
 #    sentence-transformers, PyTorch), the PO-token yt-dlp plugin, and the coach
 #    runtime with the pack reader
-uv pip install -e ".[extract,dev,index,pot,serve,pack,web]"
+uv pip install -e ".[extract,dev,index,pot,serve,pack,web,pdf]"
 brew install deno                    # JavaScript runtime for yt-dlp
 playwright install chromium          # the headless browser for JavaScript websites (web extra)
 
@@ -234,7 +236,7 @@ cp .env.example .env          # then fill in, see "Configure an LLM backend"
 
 # 6. Check it works
 ytbrain --help
-for s in core eval pack coach plugin web; do python tests/test_$s.py || break; done   # no network needed
+for s in core eval pack coach plugin web books; do python tests/test_$s.py || break; done   # no network needed
 ```
 
 Every new terminal needs `source .venv/bin/activate` before `ytbrain` is on your PATH.
@@ -582,6 +584,53 @@ design: [ADR-0013](docs/adr/0013-sources-plug-in-through-adapters.md)):
 
 ---
 
+### Books (PDF)
+
+Books are the third Source type ([ADR-0014](docs/adr/0014-books-are-private-chapters-parsed-with-docling.md),
+[plan](docs/books-plan.md)): one PDF per Book, one Document per Chapter, text only, parsed with PDFium (no
+model, no download, about a second per book). Use copies you own. Books are a **Private Source**: indexed
+for your own use and never shipped in the Knowledge pack (`distribute: false`, the only value in v1).
+
+PDF fonts that lost their ligatures ("di@erent", "signi%cant") and hyphens stored as control characters are
+repaired when a Book is parsed, only where the result is a real word (`ytbrain/books/ligatures.py`); `books inspect`
+reports what it repaired and what it could not.
+
+```bash
+uv pip install -e ".[pdf]"                       # pypdfium2 only
+ytbrain books inspect data/books/startup/ data/books/leadership/   # check first (no LLM)
+ytbrain sync --type book && ytbrain clean        # register one Document per Chapter, write their transcripts
+ytbrain extract --doc 9780753550304              # one Book first (its ISBN picks its Chapters); then all
+ytbrain verify --doc 9780753550304 && ytbrain sample --doc 9780753550304 --n 10
+ytbrain index                                    # Books become searchable in `ytbrain search`
+```
+
+Add the folder to `sources.yaml` (template in `sources.example.yaml`) and correct only what `inspect` gets
+wrong, per file: `title`, `subtitle`, `authors`, `year`, `isbn`, `url`, or a `chapters:` fix.
+
+- **Refused:** encrypted, scanned (no text layer) and garbled text layers; there is no OCR. A few garbled lines
+  are dropped and reported.
+- **Metadata** (never from the LLM): `sources.yaml`, then the copyright page (the ebook ISBN, the year of the
+  book's own copyright line), then the PDF's metadata (title and subtitle, authors), then Open Library by ISBN
+  if the Source says `lookup: openlibrary`. Missing or suspect fields are flagged, e.g. a person on the
+  copyright line who isn't among the authors.
+- **Chapters:** the first plausible of a `chapters_only` list, the bookmarks (Parts opened into their chapters),
+  the printed contents page, headings, then 15-page windows; front and back matter skipped.
+- **Ids:** `<ISBN-13>__<chapter-title>`, so a re-split or a renamed file keeps them. An unchanged Chapter is
+  never cleaned again; a book removed from the folder leaves the index; a PDF that fails to parse keeps what it had.
+- **Check your books:** keep the expected title, authors, year, ISBN and chapters in a local YAML and run
+  `ytbrain books inspect data/books --expect data/books/expected.yaml` (exit 1 on any mismatch).
+- **Extraction** uses the chapter prompt: the Book and its authors are given (never generated), and the
+  authors' own advice is kept, not the lines they quote from others. A Chapter's headings are its Sections.
+- **Citations** name the page: `p. 47` when the PDF has printed page numbers, else `PDF p. 47`, with no link
+  (your copy is private). The coach cites book, chapter, year and page.
+- **Private:** book items are marked private in the index. `ytbrain pack build` leaves them out;
+  `--include-private` keeps them for your own coach, and `scripts/release.py` refuses such a pack. The released
+  eval never seeds from or labels them.
+- **Ranking and evals:** Chapters compete with Talks and Articles under the same rules (nothing is Book-only; a
+  per-Book cap and Book or Section summaries were dropped, see the [books plan](docs/books-plan.md)). Your private
+  Books get their own question set (`dev-private`), graded and scored but never released.
+  Docling (`pdf-docling` extra) is parked.
+
 ## Run the pipeline
 
 ### First run
@@ -637,25 +686,27 @@ only the talks whose records changed.
 
 | Command | Does | Useful flags |
 |---|---|---|
+| `ops [ingest\|eval\|plugin]` | The whole loop in one resumable, change-detecting command: ingest, then eval when the index changed, then the plugin when it passed; asks the plugin version, handles retries and stop reasons, notifies ([docs/ops.md](docs/ops.md)) | `--dry-run`, `--max-cost`, `--max-extract`, `--no-sync`, `--skip-coach`, `--restart`, `--force`, `--version patch\|minor\|skip`, `--no-notify` |
 | `discover` | Build/extend `sources.yaml` | `--method ytdlp\|api`, `--channel` |
-| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube`, `--source ID`, `--limit N` (per Source), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
+| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
 | `clean` | Caption file → deduplicated, ~10–25 s timestamped utterances; web page → numbered paragraphs | `--limit N`, `--retry-failed` |
-| `extract` | One LLM call per Document → structured record | `--limit N`, `--workers N`, `--retry-failed` |
-| `verify` | Locate every evidence quote in the transcript; write pages | `--limit N`, `--retry-failed` |
+| `extract` | One LLM call per Document → structured record | `--limit N`, `--workers N`, `--retry-failed`, `--doc PREFIX` (e.g. a Book's ISBN) |
+| `verify` | Locate every evidence quote in the transcript; write pages | `--limit N`, `--retry-failed`, `--doc PREFIX` |
+| `books inspect PATH…` | Check Books before any LLM call: metadata, Chapters, repaired words, refused files | `--expect FILE` (exit 1 on a mismatch) |
 | `index` | Build the Knowledge index (advice, takeaways, summaries, transcript passages) with local embeddings; only Verified knowledge | `--limit N`, `--device auto\|mps\|cpu\|cuda`, `--retry-failed` |
 | `search "question"` | Hybrid search (vector + full-text, reranked) with deep-link citations | `--stage`, `--require-stage`, `--kind`, `--topic`, `--top-k`, `--no-rerank`, `--device`, `--json`, `--pack [PATH]` |
-| `eval build` | Build or resume the eval benchmark ([docs/eval-spec.md](docs/eval-spec.md)): generated Tuning questions, pooled candidates, two-judge grading; resumable and spend-capped | `--set dev\|test`, `--max-cost`, `--workers`, `--limit`, `--device` |
-| `eval run` | Score a search configuration: nDCG@10, recall, MRR with 95 % intervals; compare with a baseline and apply the regression gate (0.03 nDCG@10 for pack configs) | `--set`, `--config full\|no-rerank\|stage-boost\|pack\|pack-no-rerank\|full-no-passages`, `--save-baseline`, `--compare CONFIG`, `--pack PATH`, `--label NAME` (a variant saved as `<config>-NAME`), `--smoke`, `--device` |
-| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--out DIR` |
+| `eval build` | Build or resume the eval benchmark ([docs/eval-spec.md](docs/eval-spec.md)): one Tuning question set per source kind (Talks, Articles, public Books, your private Sources), each at most 20 % of its Documents; generated questions, pooled candidates, two-judge grading; resumable and spend-capped | `--set dev\|dev-articles\|dev-chapters\|dev-private\|test` (default: every split), `--top-up` (only questions for new Documents), `--max-cost`, `--workers`, `--limit`, `--device` |
+| `eval run` | Score a search configuration: nDCG@10, recall, MRR with 95 % intervals; compare with a baseline and apply the regression gate (0.03 nDCG@10 for pack configs) | `--set` (default `all`: every Tuning split, one nDCG row per source kind), `--config full\|no-rerank\|stage-boost\|pack\|pack-no-rerank\|full-no-passages`, `--save-baseline`, `--compare CONFIG`, `--pack PATH`, `--label NAME` (a variant saved as `<config>-NAME`), `--smoke`, `--device` |
+| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--include-private` (your Books; never released), `--out DIR` |
 | `pack info` | Describe the pack and verify its checksum | `--out DIR` |
 | `eval judge` | Grade the Moments a saved run retrieved that no judge has seen (pool extension), then re-release the labels as a new minor version; resumable and spend-capped | `--config C` (repeatable), `--set`, `--depth`, `--max-cost`, `--workers` |
-| `eval rescore` | Score a saved run again against the current labels, without searching (seconds) | `--config`, `--set`, `--compare`, `--save-baseline` |
+| `eval rescore` | Score a saved run again against the current labels, without searching (seconds); only the questions the run was asked | `--config`, `--set`, `--compare`, `--save-baseline`, `--refresh-baseline`, `--run FILE --as NAME` |
 | `eval status` | Progress and LLM spend per split | |
 | `pages` | Re-render all markdown pages from the JSON records | |
 | `refresh` | Re-apply Series and provenance from `sources.yaml` and yt-dlp metadata to documents, records and pages (no network, no LLM) | |
-| `run` | sync → clean → extract → verify → index | `--limit` (per playlist for sync, per Step after), `--workers`, `--device`, `--force`, `--reconcile`, `--source ID`, `--type website\|youtube` |
+| `run` | sync → clean → extract → verify → index | `--limit` (per playlist for sync, per Step after), `--workers`, `--device`, `--force`, `--reconcile`, `--source ID`, `--type website\|youtube\|book` |
 | `report` | Acceptance numbers + last three runs | |
-| `sample` | Stratified review sheet in `data/reports/` | `--n`, `--seed` |
+| `sample` | Stratified review sheet in `data/reports/` | `--n`, `--seed`, `--doc PREFIX` |
 | `status` | Count of finished items per stage | |
 | `invalidate <stage>` | Mark `fetch`, `clean`, `extract`, `verify` or `index` for redo | `--only-flagged`, `--source ID`, `--reason` |
 | `drop --source ID` | Take a Source's Documents out of the knowledge (then `index`) | |
@@ -668,6 +719,8 @@ only the talks whose records changed.
 ### From corpus to plugin: the whole flow
 
 ```bash
+ytbrain ops                                        # all of it, resumable: ingest -> eval -> plugin (docs/ops.md)
+# or one step at a time:
 ytbrain run                                        # sync -> clean -> extract -> verify -> index
 ytbrain report && ytbrain sample --n 10            # quality gates + a human read
 ytbrain pack build                                 # the Knowledge pack (data/pack)
@@ -1078,6 +1131,7 @@ All settings are environment variables (`.env` or shell). Defaults in parenthese
 | `FOUNDER_COACH_HOME` (`~/.founder-coach`) · `FOUNDER_COACH_MODELS` (`$FOUNDER_COACH_HOME/models`) | Where the coach runtime keeps its data and downloaded ONNX models; the other `FOUNDER_COACH_*` settings are under [The coach runtime](#the-coach-runtime-founder-coach-m3a) |
 | `YTBRAIN_COACH_MODEL` (`haiku`) | Default host model for `eval coach` and `ytbrain claude` |
 | `YTBRAIN_COACH_HOST_KEY` (none) | OpenRouter key for `--host openrouter` / `--openrouter`; falls back to `YTBRAIN_LLM_API_KEY` when `YTBRAIN_LLM_BASE_URL` is OpenRouter |
+| `YTBRAIN_BOOK_TIMEOUT_S` (`1800`) · `YTBRAIN_BOOK_THREADS` (`0` = all cores but one, max 8) | Parked Docling parser only: one book's parse timeout (a timeout fails the book, never half of it); its threads |
 | `YTBRAIN_WEB_CONTACT` (the repo URL) · `YTBRAIN_WEB_USER_AGENT` (`ytbrain/0.1 (+<contact>; polite research crawler)`) | The crawler's honest User-Agent; set your own contact before crawling |
 | `YTBRAIN_DOTENV` (on) | `0` skips loading `.env` (the tests set it) |
 | `YTBRAIN_DEVICE` (`auto`) | PyTorch device: `auto` (mps > cuda > cpu), `mps`, `cpu`, `cuda`; an unavailable explicit device is an error, not a silent fallback |
@@ -1123,12 +1177,17 @@ product.toml              the product's id, display name, SEO description and re
 sources.example.yaml      template for sources.yaml (your playlist list; git-ignored)
 .github/workflows/ci.yml  tests, secret scan, assembled plugin, claude plugin validate
 eval/                     the released retrieval benchmark (queries, qrels, moments; CHECKSUMS)
-ops/                      launchd plist, log rotation, probe_models.py
+ops/                      all.sh, ingest.sh, eval.sh, plugin.sh (`ytbrain ops`), the launchd plist, log rotation, probe_models.py
 ytbrain/                  the pipeline
   cli.py                  all commands
   sources.py              sources.yaml entries and the adapter per Source type (ADR-0013)
   web/                    the website adapter: urls (ids, scope), http (robots, pacing, retries),
                           render (Playwright), page (metadata, main text, page type), state, crawl
+  source_kinds.py         the SourceKind registry: Talk, Article, Chapter (labels, links, Moments, question prefixes)
+  visibility.py           public or private per Source (`distribute: false` = private)
+  ops.py, runstatus.py    `ytbrain ops`: plans, checkpoints, change detection; why a command stopped
+  books/                  PDF Books (ADR-0014): probe (pypdfium2), normalize, parse (PDFium; Docling parked),
+                          chapters (manual, outline, contents, headings, windows), inspect
   locators.py             positions -> labels and links (mm:ss / ¶n, &t= / #:~:text=)
   config.py               every tunable, annotated with the reason for its value; loads .env
   manifest.py             SQLite per-Step checkpoints, parking, run history
@@ -1141,14 +1200,14 @@ ytbrain/                  the pipeline
   knowledge/              items.py (Knowledge items), embed.py, store.py (LanceDB), search.py
   pack.py                 `pack build`: the Knowledge pack writer (embed cache, checks, manifest)
   index.py                transcript passages (used by knowledge/items.py)
-  eval/                   the benchmark build, judges, runs, and `eval coach` (gates G2, G4, G5, G6)
+  eval/                   the benchmark build, judges, runs, splits.py (a question set per source kind), and `eval coach` (gates G2, G4, G5, G6)
   graph.py, mcp_server.py parked for later milestones (docs/archive/phase2-parked.md)
 founder_coach/            the light runtime founders install (ADR-0010): server.py (MCP), store.py
                           (Founder store), search.py (shared ranking), pack.py, models.py (ONNX),
                           product.py (the product id at run time); never imports ytbrain
 plugin/                   the Claude Code plugin template: manifest, .mcp.json, hooks, skills, evals
-scripts/                  assemble_plugin.py (-> dist/plugin), release.py, check_secrets.py
-tests/                    six offline suites; golden/ pins the MCP tool schemas and the generated schema
+scripts/                  assemble_plugin.py (-> dist/plugin), release.py, check.sh, check_secrets.py, ligature_words.py
+tests/                    seven offline suites; golden/ pins the MCP tool schemas and the generated schema
 ```
 
 ### What's in git
@@ -1165,7 +1224,7 @@ Commit everything `git status` lists; `.gitignore` keeps out the rest. The repos
 | `founder_coach/`, incl. the generated `product.json` and `playbooks/` | the runtime founders install (CI checks the generated files are current) |
 | `plugin/` | the plugin template (skills, hooks, manifest, evals) |
 | `scripts/`, `ops/` | assembler, release, secret scan; launchd and helpers |
-| `tests/`, incl. `tests/golden/` | the six suites and their snapshots |
+| `tests/`, incl. `tests/golden/` | the seven suites and their snapshots |
 | `eval/` | the released retrieval benchmark (no transcript text: ids, titles, timestamps, grades) |
 
 | Never in git | Why |
@@ -1200,7 +1259,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 206 tests, no network
+for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 288 tests, no network
 pytest tests/                                                                        # the same under pytest
 ```
 
@@ -1211,6 +1270,7 @@ pytest tests/                                                                   
 | `test_pack.py` | the Knowledge pack format, checksums, incremental rebuilds, shared search |
 | `test_coach.py` | the Founder store (history, idempotent writes, migrations, backups, forget/restore, Feedback, the usage log, Check-in warnings), Nudges, all 8 MCP tools through the SDK client, the tool-schema snapshot, stdio under both protocol versions, concurrent writers |
 | `test_plugin.py` | manifest, skills and their invocation, the assembler (template filling, atomic swap, `--check`), the product id living only in `product.toml`, releases (tags, version checks, renames) |
+| `test_books.py` | PDF Books on synthetic text and fixture PDFs only: probe, ligature repair, metadata, Chapters, ids and resume, private visibility, the sample sheet, folders found recursively |
 | `test_web.py` | website Sources against the acceptance criteria in docs/web-sources-plan.md: config, ids, scope and depth, robots.txt, page types, rendering, retries and host pausing, conditional re-checks, aliases, resume, articles through clean → extract → verify → items → pages, the CLI over a localhost server |
 
 The tests use fakes (a hashing embedder, stubbed yt-dlp and LLM calls), so they need no keys,
@@ -1218,7 +1278,7 @@ models or YouTube access, and they are hermetic: every suite sets `YTBRAIN_DOTEN
 is never read) and never reads your `sources.yaml`, so a clean checkout passes exactly like your
 machine. CI (`.github/workflows/ci.yml`) runs on every push and pull request: a secret scan,
 then the suites on Python 3.11 and 3.13 (`serve,pack,dev,web` plus LanceDB), failing on any skipped
-test; then it assembles a plugin from a test pack, fails if the generated files are stale, and
+test, and all of them again in one process (`pytest tests`, which catches state leaking between suites); then it assembles a plugin from a test pack, fails if the generated files are stale, and
 runs `claude plugin validate --strict`.
 Answer quality is measured separately, on the real host (the local Claude Code on your plan,
 Haiku by default): `ytbrain eval coach` (gates G2, G4, G5, G6) and `ytbrain claude -- plugin eval …` (mocked skill
@@ -1233,7 +1293,7 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 |---|---|---|
 | M0 | Extraction hardening (schema 2.2.0), Series fix, `refresh` | **done** |
 | M1 | Knowledge index + `ytbrain search` | **done** |
-| M2 | Evaluation: a Tuning set (150 generated questions, labels v1.3.0 with article Moments) and a Holdout set | Tuning set **done**; Holdout (M2c lite, G3) next |
+| M2 | Evaluation: Tuning sets, one per source kind, each at most 20 % of its Documents (Talks 150, labels v1.5.0; Articles and private Books are built by `ytbrain ops eval`), and a Holdout set | Talks set **done**; Holdout (M2c lite, G3) next |
 | M2d | The Knowledge pack (ONNX, no torch) | **done**; pack experiments toward G1 pending |
 | M3a/b | The coach runtime (8 MCP tools, local Founder store) and the Claude Code plugin (9 skills, hook) | **done**; one live session left |
 | M3d | Coach evaluation on the real host (G2, G4, G5, G6) | on Haiku: G2, G4, G6 pass; G5 re-run after the Check-in fixes |
@@ -1241,6 +1301,8 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 | — | Website Sources: generic crawler for any listed site (robots.txt, pacing, Playwright when needed), articles through the same Steps | **done** (2026-09-26); first crawls (paulgraham.com, pmarchive.com, YC Library) done, fixes in CHANGELOG |
 | — | Local usage log | **done** (2026-09-26) |
 | — | Coach answers first, search budget, Check-in warnings, cheaper `eval coach` (Haiku, turn cap) | **done** (2026-09-28) |
+| — | PDF Books: one Document per Chapter, private by default, PDFium parser ([ADR-0014](docs/adr/0014-books-are-private-chapters-parsed-with-docling.md)); every source competes in one ranking and one benchmark | **done** (2026-09-30) |
+| — | `ytbrain ops`: the whole loop in one resumable command, version question, stop reasons, notifications | **done** (2026-10-01); first full run on your machine pending |
 | — | Eval support for articles (article Moments), review fixes (index/pack upgrades, hermetic tests) | **done** (2026-09-26) |
 | next | M2c lite (Holdout, G3); Jev (typed judgements) plan | planned |
 | M4 | Dogfood with real founders; every miss becomes an eval case | after the first beta release |
@@ -1250,7 +1312,7 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 
 The repository is private during the beta. Changes follow [AGENTS.md](AGENTS.md):
 
-1. Run the six suites before and after a change, and add a test for any behaviour change,
+1. Run the seven suites before and after a change, and add a test for any behaviour change,
    especially anything touching resume, retries, verification or the Founder store.
 2. Keep the invariants: bump `SCHEMA_VERSION` in `config.py` for any change to
    `extract/schema.py`; a Founder-store table change is a new numbered migration; never spell

@@ -149,7 +149,7 @@ the Holdout source needs a decision (a pre-2024 CC BY-SA dump on archive.org, or
 
 ## Next, in order
 
-0. **Commit and push** (docs/release.md); check CI (six suites green).
+0. **Commit and push** (docs/release.md); check CI (seven suites green).
 1. **G5 on a reassembled build:** `python scripts/assemble_plugin.py --pack data/pack --check`, then
    `ytbrain eval coach --gate g5` (don't reassemble while it runs). Then one full `ytbrain eval coach`
    on the final build, and `--model sonnet` as the sign-off before the beta.

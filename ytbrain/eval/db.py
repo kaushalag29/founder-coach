@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS grades (
 );
 CREATE TABLE IF NOT EXISTS answers (qid TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS spend (ts REAL, build TEXT, model TEXT, kind TEXT, cost REAL);
+CREATE TABLE IF NOT EXISTS targets (       -- a split's size at its last seeding, and its Documents then
+  split TEXT PRIMARY KEY, target INTEGER NOT NULL, docs TEXT NOT NULL, ts REAL
+);
 """
 
 
@@ -98,7 +101,8 @@ class EvalDB:
 
     def add_to_pool(self, qid: str, ranked: list[tuple[str, int]], variant: str) -> int:
         """Add Moments a new system retrieved (pool extension, eval-spec §6); existing
-        entries keep their variants and rank. Returns how many were new."""
+        entries keep their variants and rank. Returns how many were new. Moments of private
+        Documents are pooled and graded like any other; the release decides where they go."""
         with self.db:
             before = self.db.execute("SELECT COUNT(*) FROM pools WHERE qid=?", (qid,)).fetchone()[0]
             self.db.executemany("INSERT OR IGNORE INTO pools VALUES (?,?,?,?)",
@@ -137,6 +141,16 @@ class EvalDB:
 
     def add_spend(self, build: str, model: str, kind: str, cost: float) -> None:
         self.db.execute("INSERT INTO spend VALUES (?,?,?,?,?)", (time.time(), build, model, kind, cost))
+        self.db.commit()
+
+    def target(self, split: str) -> dict | None:
+        r = self.db.execute("SELECT target, docs FROM targets WHERE split=?", (split,)).fetchone()
+        return {"target": int(r["target"]), "docs": json.loads(r["docs"])} if r else None
+
+    def set_target(self, split: str, target: int, docs: list[str]) -> None:
+        self.db.execute("INSERT INTO targets(split, target, docs, ts) VALUES (?,?,?,?) ON CONFLICT(split) DO UPDATE "
+                        "SET target=excluded.target, docs=excluded.docs, ts=excluded.ts",
+                        (split, int(target), json.dumps(sorted(docs)), time.time()))
         self.db.commit()
 
     def spent(self, build: str | None = None) -> float:

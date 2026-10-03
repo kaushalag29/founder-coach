@@ -1,4 +1,4 @@
-# Every push and pull request: the six offline suites, a secret scan, and an assembled
+# Every push and pull request: the seven offline suites (each alone, then all in one process), a secret scan, and an assembled
 # plugin checked by Claude Code's own validator. No paid calls, no model downloads, no .env.
 # Private repo on GitHub Free: 2,000 Linux minutes a month; a run takes a few minutes.
 name: ci
@@ -49,7 +49,7 @@ jobs:
       - name: Test suites (REQUIRE_ALL_TESTS turns a skip into a failure)
         run: |
           set -o pipefail
-          for suite in core eval pack coach plugin web; do
+          for suite in core eval pack coach plugin web books; do
             echo "::group::test_$suite"
             uv run --no-sync python tests/test_$suite.py 2>&1 | tee "$RUNNER_TEMP/test_$suite.log"
             echo "::endgroup::"
@@ -57,6 +57,9 @@ jobs:
               echo "::error::test_$suite skipped tests: a dependency is missing in CI"; exit 1
             fi
           done
+
+      - name: "All suites in one process (pytest tests: catches state leaking between suites)"
+        run: uv run --no-sync python -m pytest tests -q -p no:cacheprovider
 
       - name: Assemble a plugin from a test pack
         run: |

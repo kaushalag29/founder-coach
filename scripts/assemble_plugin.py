@@ -287,12 +287,22 @@ def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals:
     return {"out": str(out), "build_id": stamp, "regenerated": regenerated, "id": prod["id"]}
 
 
+def private_items(out: Path) -> int:
+    """How many private items (your Books, ADR-0014) the assembled plugin's pack holds (0 if unknown)."""
+    try:
+        return int(json.loads((out / "pack" / MANIFEST_FILE).read_text(encoding="utf-8")).get("private_items") or 0)
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
 def zip_plugin(out: Path) -> Path:
     """Package an assembled plugin as <id>-<version>.plugin next to it (a zip with .claude-plugin/ at its root),
-    the file Cowork's Plugins page uploads. Written in place, so a mounted folder that forbids renames works too."""
+    the file Cowork's Plugins page uploads. Written in place, so a mounted folder that forbids renames works too.
+    A pack with private items is named <id>-<version>-private.plugin: it is for your own account only."""
     out = out.resolve()
     manifest = json.loads((out / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    target = out.parent / f"{manifest['name']}-{manifest['version']}.plugin"
+    tag = "-private" if private_items(out) else ""
+    target = out.parent / f"{manifest['name']}-{manifest['version']}{tag}.plugin"
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(out):
             dirs[:] = sorted(d for d in dirs if d != "__pycache__")
@@ -336,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     q = shlex.quote(res["out"])                # paths with spaces must survive a copy-paste
     print(f"assemble: {res['out']} (build {res['build_id']}){regen}\n"
           f"  next: claude plugin validate {q} --strict && claude --plugin-dir {q}")
+    private = private_items(Path(res["out"]))
+    if private:
+        print(f"  PRIVATE: the pack holds {private} private items (your Books): install it on your own account "
+              f"only; never share or release it (scripts/release.py refuses it)")
     if args.zip:
         print(f"  cowork: {shlex.quote(str(zip_plugin(Path(res['out']))))} (upload in Customize > Plugins)")
     return 0

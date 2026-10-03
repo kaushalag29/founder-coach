@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, asdict
 
-from .config import (CHUNK_OVERLAP_RATIO, CHUNK_TARGET_TOKENS, PARENT_TARGET_TOKENS,
+from .config import (CHUNK_OVERLAP_RATIO, CHUNK_TARGET_TOKENS, EMBED_MAX_SEQ, PARENT_TARGET_TOKENS,
                      TOKENS_PER_WORD)
 
 
@@ -33,6 +33,7 @@ class Chunk:
     start_ms: int
     end_ms: int
     n_tokens: int
+    part: int = 0              # > 0: a piece of one unit too long for the embedding window
 
     def indexable(self) -> str:
         """What actually gets embedded and BM25-indexed: header + text."""
@@ -51,26 +52,65 @@ def est_tokens(text: str) -> int:
     return int(len(text.split()) * TOKENS_PER_WORD)
 
 
+# A unit (an utterance, an article or book paragraph) longer than this is cut into the fewest
+# equal pieces that fit the embedding window with their context header: 1.6 tokens per word is a
+# pessimistic bound for English, 60 words leave room for the header. Never smaller than needed:
+# Passages stay ~CHUNK_TARGET_TOKENS, and only a unit the embedder would truncate is cut.
+MAX_UNIT_WORDS = int(EMBED_MAX_SEQ / 1.6) - 60
+SPLIT_VERSION = "units1"            # in the index input hash of a Document that has such a unit
+
+
+def split_long_units(utts: list[dict], max_words: int = MAX_UNIT_WORDS) -> list[dict]:
+    """Each unit longer than `max_words` becomes ceil(words / max_words) near-equal pieces with
+    the same position (so Citations and eval Moments are unchanged) and `part` 1, 2, ..."""
+    out = []
+    for u in utts:
+        words = (u.get("text") or "").split()
+        if len(words) <= max_words:
+            out.append(u)
+            continue
+        n = -(-len(words) // max_words)
+        size = -(-len(words) // n)
+        out += [{**u, "text": " ".join(words[i:i + size]), "part": k}
+                for k, i in enumerate(range(0, len(words), size), 1)]
+    return out
+
+
+def has_long_units(utts: list[dict], max_words: int = MAX_UNIT_WORDS) -> bool:
+    return any(len((u.get("text") or "").split()) > max_words for u in utts)
+
+
+def chunked_differently(utts: list[dict], target_tokens: int = CHUNK_TARGET_TOKENS,
+                        overlap_ratio: float = CHUNK_OVERLAP_RATIO) -> bool:
+    """Whether SPLIT_VERSION changed this Document's Passages: it has a unit long enough to be
+    cut, or to close a short chunk whose whole text used to be carried into the next one."""
+    big = target_tokens * (1 - overlap_ratio)
+    return any(est_tokens(u.get("text") or "") > big for u in utts)
+
+
 def chunk_transcript(transcript: dict,
                      target_tokens: int = CHUNK_TARGET_TOKENS,
                      overlap_ratio: float = CHUNK_OVERLAP_RATIO) -> list[Chunk]:
     doc_id = transcript["doc_id"]
-    utts = transcript["utterances"]
+    utts = split_long_units(transcript["utterances"])
     chunks: list[Chunk] = []
     cur: list[dict] = []
     cur_tokens = 0
+    carried = 0                    # leading units of `cur` that are overlap from the last chunk
+
+    def make(units: list[dict]) -> Chunk:
+        text = " ".join(u["text"] for u in units)
+        part = int(units[0].get("part") or 0)
+        return Chunk(chunk_id=_cid(doc_id, units[0]["start_ms"]) + (f"_{part}" if part else ""),
+                     doc_id=doc_id, parent_chunk_id=None, text=text, context_header="",
+                     start_ms=units[0]["start_ms"], end_ms=units[-1]["end_ms"], n_tokens=est_tokens(text),
+                     part=part)
 
     def flush():
-        nonlocal cur, cur_tokens
-        if not cur:
+        nonlocal cur, cur_tokens, carried
+        if len(cur) <= carried:    # only the previous chunk's overlap: nothing new to emit
             return
-        text = " ".join(u["text"] for u in cur)
-        c = Chunk(
-            chunk_id=_cid(doc_id, cur[0]["start_ms"]),
-            doc_id=doc_id, parent_chunk_id=None, text=text, context_header="",
-            start_ms=cur[0]["start_ms"], end_ms=cur[-1]["end_ms"], n_tokens=est_tokens(text),
-        )
-        chunks.append(c)
+        chunks.append(make(cur))
         # carry the tail forward as overlap (dense side only)
         keep, kept = [], 0
         budget = target_tokens * overlap_ratio
@@ -80,7 +120,9 @@ def chunk_transcript(transcript: dict,
                 break
             keep.insert(0, u)
             kept += t
-        cur, cur_tokens = keep, kept
+        if len(keep) == len(cur):  # a whole short chunk as overlap would start the next one at the
+            keep, kept = [], 0     # same unit: two Passages with one id
+        cur, cur_tokens, carried = keep, kept, len(keep)
 
     for u in utts:
         t = est_tokens(u["text"])
@@ -88,11 +130,8 @@ def chunk_transcript(transcript: dict,
             flush()
         cur.append(u)
         cur_tokens += t
-    cur_tokens = 0
-    if cur:
-        text = " ".join(u["text"] for u in cur)
-        chunks.append(Chunk(_cid(doc_id, cur[0]["start_ms"]), doc_id, None, text, "",
-                            cur[0]["start_ms"], cur[-1]["end_ms"], est_tokens(text)))
+    if len(cur) > carried:
+        chunks.append(make(cur))
 
     _attach_parents(chunks, doc_id)
     return chunks
@@ -118,7 +157,7 @@ def build_context_header(chunk: Chunk, video_meta: dict) -> str:
     so the pipeline runs end-to-end before you turn that on - and so you can A/B
     the two against the eval harness rather than assuming.
     """
-    secs = chunk.start_ms // 1000
+    from .locators import label_for
     bits = [video_meta.get("title_raw") or video_meta.get("title", "")]
     if video_meta.get("speaker"):
         bits.append(f"by {video_meta['speaker']}")
@@ -127,7 +166,7 @@ def build_context_header(chunk: Chunk, video_meta: dict) -> str:
     ch = _chapter_at(video_meta.get("chapters") or [], chunk.start_ms)
     if ch:
         bits.append(f"- section: {ch}")
-    return f"From {' '.join(b for b in bits if b)} at {secs // 60:02d}:{secs % 60:02d}."
+    return f"From {' '.join(b for b in bits if b)} at {label_for(video_meta, chunk.start_ms)}."
 
 
 def _chapter_at(chapters: list[dict], ms: int) -> str | None:

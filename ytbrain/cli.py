@@ -9,6 +9,7 @@ Pipeline (each Step checkpointed per Document, so any one can be re-run alone):
     ytbrain invalidate <step> [--source ID] / drop --source ID
     ytbrain pack build          the Knowledge pack the plugin ships
     ytbrain eval build|run|judge|coach                    benchmark and coach gates
+    ytbrain ops [all|ingest|eval|plugin]                  the whole loop, resumable, only what changed
     ytbrain claude -- <args>    the local Claude Code for plugin work (your plan, Haiku)
 
 README.md has the full guide; docs/commands.md the commands by phase.
@@ -26,12 +27,13 @@ import random
 import re
 import shutil
 import subprocess
+import shlex
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import captions, fetch, pages
+from . import captions, fetch, pages, source_kinds
 from .config import (ACCEPT_MIN_RECORD_RATE, ACCEPT_MIN_SPAN_PASS_RATE,
                      ACCEPT_SAMPLE_SEED, EXTRACT_FAILURES, MANIFEST_DB, ROOT, METADATA, PAGES, RAW, REPORTS,
                      MIN_TRANSCRIPT_WORDS, SCHEMA_VERSION, TRANSCRIPTS, YT_COOLDOWN_BASE_S, YT_COOLDOWN_MAX_S,
@@ -43,7 +45,7 @@ from .manifest import Manifest, StageState
 
 SOURCES = Path(__file__).resolve().parents[1] / "sources.yaml"            # yours, git-ignored
 SOURCES_EXAMPLE = SOURCES.with_name("sources.example.yaml")              # tracked template
-SYNC_TYPES = {"youtube": "youtube_playlist", "website": "website"}   # `sync --type` -> Source type
+SYNC_TYPES = {"youtube": "youtube_playlist", "website": "website", "book": "pdf_books"}   # `sync --type` -> Source type
 
 
 def _sources() -> dict:
@@ -83,6 +85,12 @@ def _all_sources() -> list[dict]:
         return S.load(SOURCES)
     except S.SourceConfigError as e:
         sys.exit(f"sources.yaml: {e}")
+
+
+def _visibility():
+    """Which Documents are private, from sources.yaml (`distribute: false`) and the manifest."""
+    from .visibility import Visibility
+    return Visibility.from_manifest(Manifest(MANIFEST_DB), _all_sources())
 
 
 def _enabled_sources() -> list[dict]:
@@ -547,7 +555,7 @@ def cmd_sync(args) -> int:
     chosen = [s for s in every if (not only or s["id"] == only) and (not kind or s["type"] == kind)]
     if only and not chosen:
         what = next(s["type"] for s in every if s["id"] == only)
-        print(f"sync: {only} is a {'website' if what == 'website' else 'YouTube playlist'}, "
+        print(f"sync: {only} is a {dict(website='website', pdf_books='pdf_books Source').get(what, 'YouTube playlist')}, "
               f"not --type {args.source_type}", file=sys.stderr)
         return 1
     for s in chosen:
@@ -555,12 +563,13 @@ def cmd_sync(args) -> int:
             print(f"sync: {s['id']} is disabled (enabled: false) -- skipped")
     yt = sorted(S.enabled(chosen, "youtube_playlist"), key=lambda s: bool(s.get("fallback")))
     web = S.enabled(chosen, "website")
-    if not yt and not web:
+    books = S.enabled(chosen, "pdf_books")
+    if not yt and not web and not books:
         print("sync: no enabled sources in sources.yaml", file=sys.stderr)
         return 1
     code = 0
-    # --type website skips the YouTube pass (talks found on the sites this run are still fetched below)
-    if kind != "website" and (yt or getattr(args, "backfill", False) or m.db.execute(
+    # --type website/book skips the YouTube pass (talks found on the sites this run are still fetched below)
+    if kind not in ("website", "pdf_books") and (yt or getattr(args, "backfill", False) or m.db.execute(
             "SELECT 1 FROM documents d LEFT JOIN stage_state s ON s.doc_id=d.doc_id AND s.stage='fetch' "
             "WHERE d.doc_type='youtube' AND s.doc_id IS NULL AND d.tombstoned_at IS NULL LIMIT 1").fetchone()):
         code = S.adapter("youtube_playlist").sync(m, yt, args).get("code", 0)
@@ -570,6 +579,8 @@ def cmd_sync(args) -> int:
         if res.get("videos"):             # talks found on websites: fetch their captions too
             print(f"sync: {res['videos']} new video(s) found on websites -- fetching their captions")
             code = S.adapter("youtube_playlist").sync(m, [], args).get("code", 0) or code
+    if books and not getattr(args, "backfill", False):
+        code = S.adapter("pdf_books").sync(m, books, args).get("code", 0) or code
     return code
 
 
@@ -786,6 +797,13 @@ def _ready(m: Manifest, stage: str, upstream: set[str], limit: int) -> tuple[lis
     return (ready[:limit] if limit else ready), len(pend) - len(ready)
 
 
+def _only(ids: set[str], args) -> set[str]:
+    """`--doc PREFIX` (repeatable): only Documents whose id starts with one of them. A Book's
+    ISBN picks all its Chapters (`extract --doc 9780753550304` pilots one Book)."""
+    prefixes = getattr(args, "doc", None) or []
+    return {d for d in ids if d.startswith(tuple(prefixes))} if prefixes else ids
+
+
 def _step_failed(m: Manifest, stage: str, doc_id: str, e: Exception) -> str:
     """One talk's unexpected error: record it and move on, so a single bad talk can't stop
     the Step (or the scheduled run) for every other talk. Parked after STEP_FAILURE_CAP runs."""
@@ -802,7 +820,7 @@ def cmd_clean(args) -> int:
     m = Manifest(MANIFEST_DB)
     n = skipped = refetch = errors = 0
     if getattr(args, "retry_failed", False) and (k := m.unpark("clean")):
-        print(f"clean: retrying {k} parked talk(s)", flush=True)
+        print(f"clean: retrying {k} parked Document(s)", flush=True)
     # yt-dlp writes subtitle files in place, so an interrupted fetch can leave
     # a truncated .srt on disk. The doc row exists (written at enumeration), so
     # pending() offers it -- cleaning it would bank a partial transcript as
@@ -826,7 +844,7 @@ def cmd_clean(args) -> int:
         if i % 25 == 0 and i < len(todo):
             per = (time.time() - started) / i
             print(f"    clean: {i}/{len(todo)}, ETA {_dur(per * (len(todo) - i))}", flush=True)
-    msg = f"\nclean: {n} transcripts, {skipped} skipped (no captions or too short)"
+    msg = f"\nclean: {n} Document(s) cleaned, {skipped} skipped (no captions or text, or too short)"
     if refetch:
         msg += f", {refetch} sent back to sync (caption file missing)"
     if errors:
@@ -894,11 +912,11 @@ def cmd_extract(args) -> int:
     m = Manifest(MANIFEST_DB)
     n = failed = 0
     if getattr(args, "retry_failed", False) and (k := m.unpark("extract")):
-        print(f"extract: retrying {k} parked talk(s)", flush=True)
+        print(f"extract: retrying {k} parked Document(s)", flush=True)
     redo = m.invalidate_old_versions("extract", SCHEMA_VERSION)
     if redo:
         print(f"extract: schema is now {SCHEMA_VERSION}; {redo} older record(s) will be re-extracted")
-    todo, waiting = _ready(m, "extract", m.stage_settled_ids("clean", ("ok",)), args.limit)
+    todo, waiting = _ready(m, "extract", _only(m.stage_settled_ids("clean", ("ok",)), args), args.limit)
     if todo and LLM_BACKEND == "openai":
         # Same up-front check for LM Studio / vLLM / hosted endpoints.
         import httpx
@@ -980,7 +998,7 @@ def cmd_extract(args) -> int:
     pacing = "no rate pacing (local server)" if local else f"<= {LLM_MAX_RPM:g} requests/min shared"
     print(f"extract: {len(todo)} to extract with {LLM_BACKEND}/{LLM_MODEL}, "
           f"{workers} worker(s), {pacing}"
-          + (f", {waiting} without a transcript (fetch failed or no captions)" if waiting else "")
+          + (f", {waiting} not cleaned yet (no transcript or text: see `ytbrain status`)" if waiting else "")
           + (f", {p} parked (`--retry-failed`)" if (p := m.parked("extract")) else ""),
           flush=True)
     if workers > 1 and local:
@@ -1039,16 +1057,17 @@ def cmd_extract(args) -> int:
             for attempt in range(EXTRACT_VIDEO_RETRIES + 1):
                 try:
                     tr = json.loads((TRANSCRIPTS / f"{doc_id}.json").read_text())
-                    article = tr.get("source_kind") == "article"
+                    talk = (tr.get("source_kind") or "talk") == "talk"
                     record = runner.extract_video(
                         tr,
                         {"doc_id": doc_id, "title": doc["title"], "series": doc["series"],
                          "provenance": doc["provenance"], "published_at": doc["published_at"],
                          "duration_s": doc["duration_s"], "caption_kind": doc["caption_kind"],
-                         "url": doc.get("url"), "source_kind": tr.get("source_kind") or "talk",
-                         "speaker": tr.get("speaker")},
-                        tr.get("chapters") or [] if article else
-                        fetch.uploader_chapters(info_path if info_path.exists() else None),
+                         "url": doc.get("url") or tr.get("url"), "source_kind": tr.get("source_kind") or "talk",
+                         "speaker": tr.get("speaker"), "private": tr.get("private"),
+                         "page_labels": tr.get("page_labels")},
+                        fetch.uploader_chapters(info_path if info_path.exists() else None) if talk
+                        else tr.get("chapters") or [],          # an article's or a Chapter's headings
                         on_step=on_step,
                     )
                     err = None
@@ -1107,6 +1126,8 @@ def cmd_extract(args) -> int:
                 print(f"{s_} · ", end="")
         if isinstance(err, runner.BackendUnavailable):
             stop.set()
+            from . import runstatus
+            runstatus.record("network" if runstatus.classify(err) == "network" else "endpoint", str(err))
             print("STOPPED", flush=True)
             print(f"\nextract: the LLM endpoint refused further work -- {err}\n"
                   f"  Videos in flight were not marked failed. Fix the model / key / credits "
@@ -1181,10 +1202,10 @@ def cmd_verify(args) -> int:
     m = Manifest(MANIFEST_DB)
     n = flagged = 0
     if getattr(args, "retry_failed", False) and (k := m.unpark("verify")):
-        print(f"verify: retrying {k} parked talk(s)", flush=True)
-    todo, waiting = _ready(m, "verify", m.stage_settled_ids("extract", ("ok",)), args.limit)
+        print(f"verify: retrying {k} parked Document(s)", flush=True)
+    todo, waiting = _ready(m, "verify", _only(m.stage_settled_ids("extract", ("ok",)), args), args.limit)
     print(f"verify: {len(todo)} to check"
-          + (f", {waiting} without a record yet (no transcript, or extract pending/failed)"
+          + (f", {waiting} without a record yet (not cleaned, or extract pending/failed)"
              if waiting else ""), flush=True)
     errors = 0
     for i, doc_id in enumerate(todo, 1):
@@ -1256,6 +1277,7 @@ INDEX_MISSING_EXTRA = 3        # cmd_index return code: optional extra not insta
 def cmd_index(args) -> int:
     """Build the Knowledge index from verified records (local embeddings, no LLM)."""
     from .config import EMBED_MAX_SEQ, EMBED_MODEL, ITEMS_VERSION
+    from .index import SPLIT_VERSION, chunked_differently
     from .knowledge.items import build_items
     m = Manifest(MANIFEST_DB)
     candidates = m.stage_settled_ids("verify", ("ok",)) & m.stage_settled_ids("extract", ("ok",))
@@ -1265,10 +1287,15 @@ def cmd_index(args) -> int:
         h = hashlib.sha256()
         for p in (METADATA / f"{doc_id}.json", TRANSCRIPTS / f"{doc_id}.json"):
             h.update(p.read_bytes() if p.exists() else b"-")
+        # Documents whose Passages SPLIT_VERSION changed (a unit too long for the embedding window,
+        # or one that closed a short chunk) re-index once; the rest of the corpus doesn't
+        t = TRANSCRIPTS / f"{doc_id}.json"
+        if t.exists() and chunked_differently(json.loads(t.read_text()).get("utterances") or []):
+            h.update(SPLIT_VERSION.encode())
         return h.hexdigest()[:16]
 
     if getattr(args, "retry_failed", False) and (k := m.unpark("index")):
-        print(f"index: retrying {k} parked talk(s)", flush=True)
+        print(f"index: retrying {k} parked Document(s)", flush=True)
     order = {r["doc_id"]: i for i, r in enumerate(m.documents("1=1 ORDER BY published_at DESC"))}
     todo = sorted((d for d in candidates if m.stage_status(d, "index") != "parked"
                    and m.needs(d, "index", input_hash(d), version)),
@@ -1433,6 +1460,81 @@ def _load_pack(path=None, rerank: bool = True):
     return store, embed, reranker
 
 
+def _book_overrides() -> dict[str, dict]:
+    """Per-file corrections from every pdf_books Source in sources.yaml (none when there is no
+    sources.yaml), so `books inspect` reports what `sync` will register."""
+    from . import sources as S
+    if not SOURCES.exists():
+        return {}
+    try:
+        return {name: fields or {} for s in S.load(SOURCES) if s["type"] == "pdf_books"
+                for name, fields in (s.get("books") or {}).items()}
+    except S.SourceConfigError as e:
+        sys.exit(f"sources.yaml: {e}")
+
+
+def cmd_books(args) -> int:
+    """`books inspect`: probe, parse (cached), resolve metadata and split PDFs into Chapters, and
+    report; with --expect, check them against expected values (ADR-0014, docs/books-plan.md)."""
+    import json as _json
+    from .books.inspect import compare, render, report
+    from .books.parse import parser_for
+    from .config import BOOKS_PARSED
+    paths: list[Path] = []
+    for raw in args.paths:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            paths += sorted(q for q in p.rglob("*") if q.is_file() and q.suffix.lower() == ".pdf")
+        elif p.exists():
+            paths.append(p)
+        else:
+            print(f"books: no such file or folder: {p}", file=sys.stderr)
+            return 2
+    if not paths:
+        print("books: no PDF files found", file=sys.stderr)
+        return 2
+    expected = None
+    if args.expect:
+        import yaml
+        try:
+            expected = (yaml.safe_load(Path(args.expect).expanduser().read_text()) or {}).get("books") or {}
+        except (OSError, yaml.YAMLError) as e:
+            print(f"books: can't read {args.expect}: {e}", file=sys.stderr)
+            return 2
+    overrides = _book_overrides()
+    code, out, mismatches = 0, [], 0
+    try:
+        parser = parser_for(args.parser)                   # one parser for the run: a model loads once
+        for p in paths:
+            r = report(p, BOOKS_PARSED, overrides.get(p.name), parser=parser, reparse=args.reparse)
+            code = code or (0 if r["ok"] else 1)
+            if expected is not None:
+                want = expected.get(p.name)
+                r["expect"] = compare(r, want) if want is not None else ["no expectations for this file"]
+                mismatches += bool(want is None or r["expect"])
+            out.append(r)
+            if not args.json:
+                text = render(r)
+                if expected is not None:
+                    text += "\n" + ("  expected: all match" if not r["expect"] else
+                                     "\n".join(f"  EXPECTED MISMATCH: {x}" for x in r["expect"]))
+                print(text + "\n")
+    except RuntimeError as e:                               # a missing extra
+        print(f"books: {e}", file=sys.stderr)
+        return 2
+    if expected is not None:
+        missing = sorted(set(expected) - {p.name for p in paths})
+        for name in missing:
+            print(f"EXPECTED BOOK NOT FOUND: {name}")
+        mismatches += len(missing)
+        print(f"books: {len(paths) - sum(bool(r.get('expect')) for r in out)}/{len(paths)} books match their expectations"
+              + (f"; {len(missing)} expected book(s) missing" if missing else ""))
+        code = code or (1 if mismatches else 0)
+    if args.json:
+        print(_json.dumps(out, indent=1, ensure_ascii=False))
+    return code
+
+
 def cmd_pack(args) -> int:
     """Build or inspect the Knowledge pack the coach plugin ships (ADR-0009)."""
     import json as _json
@@ -1474,7 +1576,11 @@ def cmd_pack(args) -> int:
             if args.with_passages:
                 print("pack: including Passages (transcript excerpts): private beta only, "
                       "never a public pack (ADR-0009)", flush=True)
+            if args.include_private:
+                print("pack: including private items (your Books): for your own coach only; "
+                      "scripts/release.py refuses this pack (ADR-0014)", flush=True)
             manifest = build_pack(store, embedder, out, rerank_model=rerank, batch=args.batch, kinds=kinds,
+                                  include_private=args.include_private,
                                   say=lambda m: print(m, flush=True),
                                   source_info={"index_items": store.count(),
                                                "index_embed_model": store.embed_model() or EMBED_MODEL})
@@ -1509,7 +1615,8 @@ def _talk_info() -> dict[str, dict]:
 def cmd_eval(args) -> int:
     """Build, run or inspect the eval benchmark (docs/eval-spec.md)."""
     import datetime as dt
-    from .config import EVAL_DATA, EVAL_DIR
+    from .config import EVAL_DATA, EVAL_DIR, EVAL_PRIVATE
+    from .eval.splits import TUNING_SPLITS
     from .eval.db import EvalDB
     if args.eval_cmd == "coach":
         import shutil as _sh
@@ -1551,18 +1658,30 @@ def cmd_eval(args) -> int:
             if label == "smoke" and not path.exists():
                 continue
             db = EvalDB(path)
-            for split in ("dev", "test"):
+            for split in (*TUNING_SPLITS, "test"):
                 counts = defaultdict(int)
                 for r in db.questions(split):
                     counts[r["status"]] += 1
-                print(f"{label} {split}: {dict(counts) or 'nothing yet'} · spent ${db.spent(split):.3f}")
+                t = db.target(split)
+                goal = f" · target {t['target']} ({len(t['docs'])} Documents)" if t else ""
+                print(f"{label} {split}: {dict(counts) or 'nothing yet'}{goal} · spent ${db.spent(split):.3f}")
         return 0
     from .eval.run import CONFIGS
     if args.eval_cmd == "rescore":
-        from .eval.run import render, rescore
+        from .eval.run import baseline_run, render, rescore
         try:
+            if args.refresh_baseline:
+                src = baseline_run(EVAL_DATA / "runs", args.set, args.config)
+                if src is None:
+                    print(f"eval: no saved {args.set} baseline {args.config} (or its run file) to refresh",
+                          file=sys.stderr)
+                    return 1
+                result, code = rescore(args.set, args.config, run=src, name=args.config, save_baseline=True)
+                print(f"eval rescore: baseline {args.config} re-scored from {src.name} against the current labels")
+                return 0
             result, code = rescore(args.set, args.config, baseline=args.compare,
-                                   save_baseline=args.save_baseline)
+                                   save_baseline=args.save_baseline, run=args.run and Path(args.run),
+                                   name=args.as_name)
         except RuntimeError as e:
             print(f"eval: {e}", file=sys.stderr)
             return 1
@@ -1570,7 +1689,7 @@ def cmd_eval(args) -> int:
         return _eval_exit(code)
     if args.eval_cmd == "judge":
         from .eval import build
-        from .eval.files import load_split
+        from .eval.files import load_set
         from .eval.run import latest_run
         paths = {}
         for c in args.config:
@@ -1585,10 +1704,10 @@ def cmd_eval(args) -> int:
                  for n in _staleness_notes(args.set, c, p.stat().st_mtime, index_at, built)]
         for n in dict.fromkeys(stale):
             print(f"eval judge: note: {n}", file=sys.stderr)
-        existing = load_split(EVAL_DIR, args.set)[0]
+        existing = load_set(EVAL_DIR, args.set)[0]
         freeze = (existing[0].get("valid_as_of") if existing else None) or dt.date.today().isoformat()
         env = build.Env(workers=args.workers or build.EVAL_WORKERS, manifest=Manifest(MANIFEST_DB),
-                        db=EvalDB(EVAL_DATA / "eval.db"), root=EVAL_DIR)
+                        db=EvalDB(EVAL_DATA / "eval.db"), root=EVAL_DIR, visibility=_visibility())
         err = build.preflight(env)
         if err:
             print(f"eval: {err}", file=sys.stderr)
@@ -1616,7 +1735,7 @@ def cmd_eval(args) -> int:
                                     root=smoke / "eval" if args.smoke else EVAL_DIR,
                                     out_dir=(smoke if args.smoke else EVAL_DATA) / "runs",
                                     baseline=args.compare, save_baseline=args.save_baseline,
-                                    label=args.label)
+                                    label=args.label, private=smoke / "private" if args.smoke else EVAL_PRIVATE)
         except RuntimeError as e:
             print(f"eval: {e}", file=sys.stderr)
             return 1
@@ -1630,7 +1749,8 @@ def cmd_eval(args) -> int:
     env = build.Env(store=store, embed=embed, reranker=reranker, workers=args.workers or build.EVAL_WORKERS,
                     manifest=Manifest(MANIFEST_DB),
                     db=EvalDB((smoke if args.limit else EVAL_DATA) / "eval.db"),
-                    root=smoke / "eval" if args.limit else EVAL_DIR)
+                    root=smoke / "eval" if args.limit else EVAL_DIR, visibility=_visibility(),
+                    private=smoke / "private" if args.limit else EVAL_PRIVATE)
     if args.limit:
         print(f"eval: smoke build of {args.limit} questions in {smoke} (not the released benchmark)")
     err = build.preflight(env)
@@ -1641,8 +1761,12 @@ def cmd_eval(args) -> int:
     from .eval.files import load_split
     released = [] if args.limit else load_split(EVAL_DIR, "dev")[0]
     freeze = (released[0].get("valid_as_of") if released else None) or dt.date.today().isoformat()
+    if args.set is None and not args.limit:
+        return build.build_all(env, max_cost=args.max_cost, talk_info=_talk_info(), freeze_date=freeze,
+                               top_up=args.top_up)
     return build.build_dev(env, max_cost=args.max_cost, limit=args.limit or None,
-                           talk_info=_talk_info(), freeze_date=freeze)
+                           talk_info=_talk_info(), freeze_date=freeze, split=args.set or "dev",
+                           top_up=args.top_up)
 
 
 def _eval_exit(code: int) -> int:
@@ -1883,30 +2007,35 @@ def cmd_sample(args) -> int:
     m = Manifest(MANIFEST_DB)
     strata: dict[tuple, list[str]] = defaultdict(list)
     for p in METADATA.glob("*.json"):
+        if getattr(args, "doc", None) and not p.stem.startswith(tuple(args.doc)):
+            continue
         rec = json.loads(p.read_text())
-        strata[(rec.get("caption_kind"), rec.get("series"))].append(rec["doc_id"])
+        # every source kind is its own stratum, then caption kind and series within it
+        strata[(source_kinds.of_record(rec).name, rec.get("caption_kind"), rec.get("series"))].append(rec["doc_id"])
     if not strata:
         print("no records yet", file=sys.stderr)
         return 1
 
     rng = random.Random(args.seed)
     picks: list[str] = []
-    keys = sorted(strata, key=lambda k: (str(k[0]), str(k[1])))
+    keys = sorted(strata, key=lambda k: tuple(str(x) for x in k))
     while len(picks) < args.n and any(strata[k] for k in keys):
         for k in keys:                       # round-robin: every stratum represented
             if strata[k] and len(picks) < args.n:
                 picks.append(strata[k].pop(rng.randrange(len(strata[k]))))
 
     out = [f"# Acceptance sample (n={len(picks)}, seed={args.seed})", "",
-           "For each record: open the video at the cited timestamps and answer —",
+           "For each record: check it against its source (as its heading says) and answer —",
            "is every takeaway actually supported, and is anything here invented?", "",
            "| verdict | notes |", "|---|---|", "| | |", ""]
     for doc_id in picks:
         rec = json.loads((METADATA / f"{doc_id}.json").read_text())
-        out += [f"## {rec.get('title_raw')} (`{doc_id}`)", "",
+        kind = source_kinds.of_record(rec)
+        out += [f"## {rec.get('title_canonical') or rec.get('title_raw')} (`{doc_id}`)", "",
+                f"- {kind.name}: {kind.review_hint}",
                 f"- caption_kind: **{rec.get('caption_kind')}** · series: {rec.get('series')} "
                 f"· status: {(rec.get('extraction_meta') or {}).get('validation_status')}",
-                f"- video: {rec.get('url')}", "",
+                f"- {kind.link_name}: {rec.get('url') or '(no link: your own copy)'}", "",
                 "**Verdict:** _(ok / minor / fabricated)_", "",
                 # reviewer sees withheld claims too, flagged -- judging them is the point
                 pages.render_markdown(rec, show_unverified=True).split("---", 2)[-1].strip(),
@@ -1915,8 +2044,19 @@ def cmd_sample(args) -> int:
     path = REPORTS / f"sample-seed{args.seed}-n{len(picks)}.md"
     pages.atomic_write_text(path, "\n".join(out))
     print(f"wrote {path}")
-    print("strata covered:", {f"{k[0]}/{k[1]}": len(v) for k, v in sorted(strata.items(), key=str)})
+    print("strata covered:", {"/".join(str(x) for x in k): len(v) for k, v in sorted(strata.items(), key=str)})
     return 0
+
+
+def cmd_ops(args) -> int:
+    """The whole loop in one resumable command: ingest, eval when the index changed, the plugin when
+    it passed (docs/ops.md)."""
+    from . import ops
+    return ops.main(ops.Options(plan=args.plan, max_cost=args.max_cost if args.max_cost is not None
+                                else ops.EVAL_MAX_COST, max_extract=args.max_extract,
+                                sync=not args.no_sync, coach=not args.skip_coach, restart=args.restart,
+                                force=args.force, dry_run=args.dry_run, notify=not args.no_notify,
+                                version=args.plugin_version))
 
 
 def cmd_status(args) -> int:
@@ -2009,6 +2149,12 @@ def coach_env_file_vars() -> dict[str, str]:
 MUTATING = {"sync", "clean", "extract", "verify", "index", "pages", "refresh", "run", "invalidate", "eval", "drop"}
 
 
+def rerun_command(argv=None) -> str:
+    """The command as it was typed (`--set dev-private`, `--config full`, ...), for resume hints:
+    a hint that drops an option resumes a different job."""
+    return shlex.join(["ytbrain", *(sys.argv[1:] if argv is None else argv)])
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ytbrain", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2055,12 +2201,15 @@ def main(argv=None) -> int:
                             help="parallel LLM calls in the extract stage (default: YTBRAIN_LLM_WORKERS or 1)")
     RETRY_HELP = "also retry talks parked after failing this Step repeatedly"
     add("clean", cmd_clean, "max videos to clean").add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
+    DOC_HELP = "only Documents whose id starts with PREFIX (repeatable); a Book's ISBN picks its Chapters"
     sp = add("extract", cmd_extract, "max videos to extract")
     sp.add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
     sp.add_argument("--workers", type=int, default=0,
                     help="parallel LLM calls (default: YTBRAIN_LLM_WORKERS or 1)")
-    add("verify", cmd_verify, "max records to verify").add_argument("--retry-failed", action="store_true",
-                                                                  help=RETRY_HELP)
+    sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
+    sp = add("verify", cmd_verify, "max records to verify")
+    sp.add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
+    sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
     sp = add("index", cmd_index, "max Documents to index")
     sp.add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
     sp.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"],
@@ -2090,6 +2239,7 @@ def main(argv=None) -> int:
     sp = add("sample", cmd_sample)
     sp.add_argument("--n", type=int, default=10, help="records in the review sheet")
     sp.add_argument("--seed", type=int, default=ACCEPT_SAMPLE_SEED, help="fixed for reproducibility")
+    sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
     add("status", cmd_status)
     sp = add("invalidate", cmd_invalidate)
     sp.add_argument("stage", choices=["fetch", "clean", "extract", "verify", "index"],
@@ -2114,16 +2264,23 @@ def main(argv=None) -> int:
     sp.set_defaults(func=cmd_eval, limit=0, workers=0)
     esub = sp.add_subparsers(dest="eval_cmd", required=True)
     eb = esub.add_parser("build", help="build or resume one split (resumable, spend-capped)")
-    eb.add_argument("--set", choices=["dev", "test"], default="dev")
+    from .eval.splits import SETS as _eval_sets, TUNING_SPLITS as _tuning
+    eb.add_argument("--set", choices=[*_tuning, "test"], default=None,
+                    help="one Tuning split (default: every split in turn): dev (from Talks), dev-articles (from "
+                         "Articles), dev-chapters (public Books), dev-private (your private Sources; never released)")
+    eb.add_argument("--top-up", action="store_true",
+                    help="grow each split to its target (at most 20%% of its Documents) with questions written "
+                         "from Documents added since it was last seeded")
     eb.add_argument("--max-cost", type=float, default=None,
                     help="USD cap for this split's LLM spend, cumulative across runs (default 5)")
     eb.add_argument("--workers", type=int, default=0, help="parallel LLM calls (default 8)")
     eb.add_argument("--limit", type=int, default=0,
                     help="smoke test: N questions in a scratch benchmark under data/eval/smoke")
     er = esub.add_parser("run", help="score a search configuration")
-    er.add_argument("--set", choices=["dev", "test"], default="dev")
-    er.add_argument("--config", choices=["full", "no-rerank", "stage-boost", "pack", "pack-no-rerank",
-                                         "full-no-passages"],
+    er.add_argument("--set", choices=list(_eval_sets), default="all",
+                    help="all (default): every Tuning split together, one row per source kind; or one split")
+    from .eval.run import CONFIGS as _eval_configs
+    er.add_argument("--config", choices=list(_eval_configs),
                     default="full", help="pack configs search the Knowledge pack (see --pack)")
     er.add_argument("--pack", default=None, metavar="PATH",
                     help="Knowledge pack for pack configs (default data/pack)")
@@ -2151,7 +2308,8 @@ def main(argv=None) -> int:
     ec.add_argument("--max-cost", type=float, default=None, help="USD cap for judge calls (default 5)")
     ej = esub.add_parser("judge", help="grade the Moments a saved run retrieved that no judge has seen "
                                        "(pool extension); re-releases the labels as a new minor version")
-    ej.add_argument("--set", choices=["dev", "test"], default="dev")
+    ej.add_argument("--set", choices=list(_eval_sets), default="all",
+                    help="all (default): every Tuning split together, one row per source kind; or one split")
     ej.add_argument("--config", action="append", required=True,
                     help="configuration whose latest saved run to add (repeatable)")
     ej.add_argument("--depth", type=int, default=10, help="top Moments per question to add (default 10)")
@@ -2159,10 +2317,50 @@ def main(argv=None) -> int:
                     help="USD cap for this split's LLM spend, cumulative across runs (default 5)")
     ej.add_argument("--workers", type=int, default=0, help="parallel LLM calls (default 8)")
     es = esub.add_parser("rescore", help="score a saved run again against the current labels (no search)")
-    es.add_argument("--set", choices=["dev", "test"], default="dev")
+    es.add_argument("--set", choices=list(_eval_sets), default="all",
+                    help="all (default): every Tuning split together, one row per source kind; or one split")
     es.add_argument("--config", required=True)
     es.add_argument("--compare", metavar="CONFIG", help="compare with the saved baseline of CONFIG")
     es.add_argument("--save-baseline", action="store_true")
+    es.add_argument("--run", metavar="FILE", help="a saved run file (in data/eval/runs) instead of the newest one")
+    es.add_argument("--as", dest="as_name", metavar="NAME",
+                    help="score (and with --save-baseline, save) under this name, e.g. full-prebooks")
+    es.add_argument("--refresh-baseline", action="store_true",
+                    help="re-score the saved baseline CONFIG from its own run against the current labels "
+                         "(after `eval judge` released new ones), keeping its questions")
+
+    sp = sub.add_parser("ops", help="the whole loop, resumable: ingest, eval when the index changed, "
+                                    "the plugin when it passed (docs/ops.md)")
+    sp.add_argument("plan", nargs="?", default="all", choices=["all", "ingest", "eval", "plugin"])
+    sp.add_argument("--max-cost", type=float, default=None,
+                    help="USD cap on this run's eval and coach-judge spend (default 5); extraction is billed "
+                         "by your endpoint, see --max-extract")
+    sp.add_argument("--max-extract", type=int, default=0, metavar="N", help="extract at most N Documents this run")
+    sp.add_argument("--no-sync", action="store_true", help="skip the network sync (work on what is already fetched)")
+    sp.add_argument("--skip-coach", action="store_true", help="don't run the coach eval on a new plugin build")
+    sp.add_argument("--restart", action="store_true", help="start over instead of resuming the last run")
+    sp.add_argument("--force", action="store_true", help="run eval and the plugin even if nothing changed or the "
+                                                         "last verdict wasn't a pass")
+    sp.add_argument("--dry-run", action="store_true", help="show what is due and the steps, run nothing")
+    sp.add_argument("--version", choices=["patch", "minor", "skip"], default=None, dest="plugin_version",
+                    help="the new plugin build's version, without the question (default: ask, patch after 60 s "
+                         "or with no terminal)")
+    sp.add_argument("--no-notify", action="store_true", help="no macOS notifications (data/ops/last-run.md is "
+                                                              "still written)")
+    sp.set_defaults(func=cmd_ops)
+
+    sp = sub.add_parser("books", help="PDF Books (ADR-0014): inspect how a PDF would be split into Chapters")
+    sp.set_defaults(func=cmd_books, limit=0, workers=0)
+    bsub = sp.add_subparsers(dest="books_cmd", required=True)
+    bi = bsub.add_parser("inspect", help="probe, parse (cached by file hash) and split PDFs; no LLM calls")
+    bi.add_argument("paths", nargs="+", metavar="PDF_OR_FOLDER")
+    bi.add_argument("--json", action="store_true", help="the report as JSON")
+    bi.add_argument("--reparse", action="store_true", help="ignore the cached parse")
+    bi.add_argument("--parser", choices=["pdfium", "docling"], default="pdfium",
+                    help="pdfium (default: model-free, about a second per book) or docling (parked: layout "
+                         "models, needs the pdf-docling extra)")
+    bi.add_argument("--expect", metavar="YAML", default=None,
+                    help="compare with expected metadata and chapters (e.g. data/books/expected.yaml); exit 1 on a mismatch")
 
     sp = sub.add_parser("pack", help="build or inspect the Knowledge pack the coach plugin ships")
     sp.set_defaults(func=cmd_pack, limit=0, workers=0)
@@ -2179,6 +2377,8 @@ def main(argv=None) -> int:
                          "Engine, experimental: compare speed on a small run first)")
     pb.add_argument("--with-passages", action="store_true",
                     help="also ship Passages (transcript excerpts, ~2x the size): private beta only (ADR-0009)")
+    pb.add_argument("--include-private", action="store_true",
+                    help="also pack private Sources (your own Books): for your own coach only, never released")
     pi = psub.add_parser("info", help="describe the pack and verify its checksum")
     for x in (pb, pi):
         x.add_argument("--out", default=None, metavar="DIR", help="pack folder (default data/pack)")
@@ -2196,7 +2396,7 @@ def main(argv=None) -> int:
     # reading commands never wait for (or block) a long build: `eval status`, and `eval rescore`
     # (scores a saved run; its result file is written atomically)
     read_only = args.cmd == "eval" and getattr(args, "eval_cmd", "") in ("status", "rescore", "coach") \
-        and not getattr(args, "save_baseline", False)
+        and not getattr(args, "save_baseline", False) and not getattr(args, "refresh_baseline", False)
     if args.cmd not in MUTATING or read_only:
         return args.func(args)
     try:
@@ -2206,10 +2406,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         # Every finished video is already committed to the manifest; the one
         # in flight was never marked, so it is simply redone. Nothing to clean up.
-        again = " ".join(x for x in (args.cmd, getattr(args, "eval_cmd", None),
-                                     "--backfill" if getattr(args, "backfill", False) else None) if x)
+        from . import runstatus
+        runstatus.record("interrupted", "Ctrl+C")
         print(f"\n\n{args.cmd}: interrupted. Finished work is saved; "
-              f"re-run `ytbrain {again}` to resume where it stopped.", file=sys.stderr)
+              f"re-run `{rerun_command(argv)}` to resume where it stopped.", file=sys.stderr)
         return 130
     except LockBusy as e:
         print(f"{e}", file=sys.stderr)

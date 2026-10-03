@@ -7,9 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from ..config import ARTICLE_MOMENT_PARAS, MOMENT_S
+from .. import source_kinds
 from ..pages import atomic_write_text
-from .moments import is_article_moment, moment_url, parse_moment_id
+from .moments import moment_url, parse_moment_id
 
 SPEC_VERSION = "1.0.0"
 
@@ -38,18 +38,22 @@ def bump_minor(version: str) -> str:
 
 def write_split(root: Path, split: str, queries: list[dict], labels: dict[str, dict[str, dict]],
                 talk_info: dict[str, dict], answers: list[dict] | None = None,
-                version: str | None = None) -> None:
+                version: str | None = None, visibility=None) -> None:
     """queries: records per eval-spec §4. labels: {qid: {moment_id: {"grade": g, "judges": {...}}}}.
-    `version` defaults to the version already released (never silently reset)."""
+    `version` defaults to the version already released (never silently reset). With a
+    `visibility` (ytbrain.visibility), a label on a private Document is refused (ADR-0014): those
+    belong in the private overlay (`write_private`), and old private rows leave the corpus."""
     version = version or current_version(root)
+    private = (lambda m: visibility.is_private_moment(m)) if visibility is not None else (lambda m: False)
+    leaked = sorted(m for ms in labels.values() for m in ms if private(m))
+    if leaked:
+        raise ValueError(f"refusing to release {len(leaked)} label(s) on private Documents, e.g. {leaked[0]}")
     keep = lambda rows: [r for r in rows if r.get("split") != split]
     _write_jsonl(root / "queries.jsonl",
                  sorted(keep(_read_jsonl(root / "queries.jsonl")) + queries, key=lambda r: r["_id"]))
     def span(q: str, m: str, lab: dict) -> dict:
         doc, start = parse_moment_id(m)
-        where = ({"doc_id": doc, "start_paragraph": start, "end_paragraph": start + ARTICLE_MOMENT_PARAS}
-                 if is_article_moment(m) else
-                 {"youtube_id": doc, "start_ms": start * 1000, "end_ms": (start + MOMENT_S) * 1000})
+        where = source_kinds.for_moment(m).span(doc, start)
         return {"qid": q, "moment_id": m, **where, "grade": lab["grade"], "judges": lab["judges"], "split": split}
     spans = [span(q, m, lab) for q, ms in sorted(labels.items()) for m, lab in sorted(ms.items())]
     _write_jsonl(root / "moments.jsonl",
@@ -61,13 +65,11 @@ def write_split(root: Path, split: str, queries: list[dict], labels: dict[str, d
     (root / "trec").mkdir(parents=True, exist_ok=True)
     atomic_write_text(root / "trec" / f"{split}.qrels",
                       "".join(f"{s['qid']} 0 {s['moment_id']} {s['grade']}\n" for s in spans))
-    corpus = {r["_id"]: r for r in _read_jsonl(root / "corpus.jsonl")}
+    corpus = {r["_id"]: r for r in _read_jsonl(root / "corpus.jsonl") if not private(r["_id"])}
     for s in spans:
         doc, start = parse_moment_id(s["moment_id"])
         info = talk_info.get(doc, {})
-        where = ({"doc_id": doc, "start_paragraph": start, "end_paragraph": start + ARTICLE_MOMENT_PARAS}
-                 if is_article_moment(s["moment_id"]) else
-                 {"youtube_id": doc, "start_s": start, "end_s": start + MOMENT_S})
+        where = source_kinds.for_moment(s["moment_id"]).corpus_fields(doc, start)
         corpus[s["moment_id"]] = {"_id": s["moment_id"], "title": info.get("title", ""), "text": "", **where,
                                   "url": moment_url(s["moment_id"], info.get("url")),
                                   "speaker": info.get("speaker", ""),
@@ -118,14 +120,61 @@ def consistent(root: Path) -> bool:
     return p.read_text() == _checksum_lines(root)
 
 
-def load_split(root: Path, split: str) -> tuple[list[dict], dict[str, dict[str, int]]]:
-    """(queries, qrels) of one split from the released files."""
-    queries = [q for q in _read_jsonl(root / "queries.jsonl") if q.get("split") == split]
-    qrels: dict[str, dict[str, int]] = {}
-    path = root / "trec" / f"{split}.qrels"
+def _read_trec(path: Path, into: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
     if path.exists():
         for line in path.read_text().splitlines():
             parts = line.split()
             if len(parts) == 4:
-                qrels.setdefault(parts[0], {})[parts[2]] = int(parts[3])
+                into.setdefault(parts[0], {})[parts[2]] = int(parts[3])
+    return into
+
+
+def load_split(root: Path, split: str, private: Path | None = None) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    """(queries, qrels) of one split from the released files, plus the private overlay when
+    `private` names one (labels on private Sources' Moments; never released). One benchmark:
+    the overlay only adds labels, so every question is scored across every Source you index."""
+    queries = [q for q in _read_jsonl(root / "queries.jsonl") if q.get("split") == split]
+    qrels = _read_trec(root / "trec" / f"{split}.qrels", {})
+    if private is not None:
+        queries += [q for q in _read_jsonl(private / "queries.jsonl") if q.get("split") == split]
+        _read_trec(private / "trec" / f"{split}.qrels", qrels)
     return queries, qrels
+
+
+def load_set(root: Path, name: str, private: Path | None = None) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    """(queries, qrels) of a set to score: one split, or `all` (every Tuning split together:
+    each source kind's questions, released and private, in one run with one row per kind)."""
+    from .splits import members
+    queries: list[dict] = []
+    qrels: dict[str, dict[str, int]] = {}
+    for split in members(name):
+        q, r = load_split(root, split, private)
+        queries += q
+        qrels.update(r)
+    return queries, qrels
+
+
+def write_private(private: Path, split: str, labels: dict[str, dict[str, dict]],
+                  queries: list[dict] | None = None) -> bool:
+    """The private overlay of one split: labels on private Documents' Moments (and every label of
+    the questions written from private Sources), with their judges, plus those questions.
+    Git-ignored (data/), never released. Returns whether it changed."""
+    spans = []
+    for q, ms in sorted(labels.items()):
+        for m, lab in sorted(ms.items()):
+            doc, start = parse_moment_id(m)
+            spans.append({"qid": q, "moment_id": m, **source_kinds.for_moment(m).span(doc, start),
+                          "grade": lab["grade"], "judges": lab["judges"], "split": split})
+    trec = "".join(f"{s['qid']} 0 {s['moment_id']} {s['grade']}\n" for s in spans)
+    path = private / "trec" / f"{split}.qrels"
+    old_q = [q for q in _read_jsonl(private / "queries.jsonl") if q.get("split") == split]
+    new_q = sorted(queries or [], key=lambda r: r["_id"])
+    if path.exists() and path.read_text() == trec and old_q == new_q:
+        return False
+    (private / "trec").mkdir(parents=True, exist_ok=True)
+    keep_q = [q for q in _read_jsonl(private / "queries.jsonl") if q.get("split") != split]
+    _write_jsonl(private / "queries.jsonl", sorted(keep_q + new_q, key=lambda r: r["_id"]))
+    keep = [r for r in _read_jsonl(private / "moments.jsonl") if r.get("split") != split]
+    _write_jsonl(private / "moments.jsonl", sorted(keep + spans, key=lambda r: (r["qid"], r["moment_id"])))
+    atomic_write_text(path, trec)
+    return True

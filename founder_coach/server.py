@@ -157,7 +157,9 @@ class Hit(BaseModel):
     year: int | None
     deep_link: str
     start_s: int | None = Field(description="seconds into a talk; null for an article (its link opens at the quote)")
-    source_kind: Literal["talk", "article"] = "talk"
+    source_kind: Literal["talk", "article", "chapter"] = "talk"
+    page: int | None = Field(None, description="a book chapter's PDF page (cite it as \"PDF p. N\"); "
+                                               "`talk` is then the chapter title and `series` the book")
     relevance: float | None = None
     doc_id: str | None = None
     series: str | None = None
@@ -458,8 +460,11 @@ def _hit(r: dict, detailed: bool) -> Hit:
     h = Hit(item_id=r["item_id"], kind=r["kind"], text=text, quote=quote,
             talk=r.get("title") or "", speaker=r.get("speaker") or "", year=_year(r),
             deep_link=r.get("deep_link") or "", start_s=_start_s(r),
-            source_kind="article" if r.get("source_kind") == "article" else "talk",
+            source_kind=r.get("source_kind") if r.get("source_kind") in ("article", "chapter") else "talk",
             relevance=r.get("relevance"))
+    if h.source_kind == "chapter":            # a Book: which book and which page, always
+        ms = r.get("start_ms")
+        h.series, h.page = r.get("series"), (ms // 1000 if isinstance(ms, int) and ms > 0 else None)
     if detailed:
         h.doc_id, h.series, h.stages, h.topics = r.get("doc_id"), r.get("series"), r.get("stages"), r.get("topics")
     return h
@@ -476,7 +481,9 @@ def _search_text(out: SearchOut) -> str:
         lines.append(out.note)
     for i, h in enumerate(out.hits, 1):
         when = f" ({h.year})" if h.year else ""
-        lines.append(f"{i}. [{h.kind}] {h.text}\n   — {h.speaker}, \"{h.talk}\"{when} · {h.deep_link} · item_id {h.item_id}"
+        where = (f" in {h.series}" + (f", PDF p. {h.page}" if h.page else "")) if h.source_kind == "chapter" else ""
+        link = f" · {h.deep_link}" if h.deep_link else ""
+        lines.append(f"{i}. [{h.kind}] {h.text}\n   — {h.speaker}, \"{h.talk}\"{where}{when}{link} · item_id {h.item_id}"
                      + (f"\n   {_untrusted(h.item_id, h.quote)}" if h.quote else ""))
     if not out.hits:
         lines.append("No results.")

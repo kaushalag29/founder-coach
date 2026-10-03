@@ -173,14 +173,21 @@ def _check(tmp: Path, rows: list[dict], matrix, embedder) -> None:
 
 def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
                kinds: tuple[str, ...] = P.KINDS, batch: int = 64, say=print,
-               source_info: dict | None = None) -> dict:
+               source_info: dict | None = None, include_private: bool = False) -> dict:
     """Build out_dir/knowledge.sqlite + pack.json from `source.rows(kinds=...)`.
-    Returns the manifest."""
+    A Private Source's items (your own Books, ADR-0014) are left out unless `include_private`:
+    such a pack is for your own coach only, and `scripts/release.py` refuses it. Returns the manifest."""
     import numpy as np
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob(f".{P.PACK_FILE}.tmp-*"):        # left by a killed build
         old.unlink(missing_ok=True)
-    rows = sorted((_clean(r) for r in source.rows(kinds=list(kinds))), key=lambda r: r["item_id"])
+    raw = list(source.rows(kinds=list(kinds)))
+    private = [r for r in raw if (r.get("visibility") or "public") == "private"]
+    if private and not include_private:
+        say(f"pack: leaving out {len(private)} private items (your Books; `--include-private` "
+            "keeps them, for your own coach only)")
+        raw = [r for r in raw if (r.get("visibility") or "public") != "private"]
+    rows = sorted((_clean(r) for r in raw), key=lambda r: r["item_id"])
     rows = [r for r in rows if r["kind"] in kinds]          # Passages only when asked for (--with-passages)
     if not rows:
         raise RuntimeError("no Verified items in the index -- run `ytbrain index` first")
@@ -204,6 +211,7 @@ def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
             "doc_prefix": getattr(embedder, "doc_prefix", ""),
             "rerank_model": rerank_model or "none",
             "source": source_info or {},
+            "private_items": len(private) if include_private else 0,
             **corpus_stats(rows)}
     final = out_dir / P.PACK_FILE
     tmp = out_dir / f".{P.PACK_FILE}.tmp-{os.getpid()}"

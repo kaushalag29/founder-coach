@@ -161,7 +161,11 @@ class VideoMetadata(Generated):
     caption_kind: Literal["human", "auto", "asr", "none", "missing_file"] = "auto"
     # Given, not generated (ADR-0013): what the Document is and what its positions mean. The
     # defaults are what every record written before websites means, so they need no re-extract.
-    source_kind: Literal["talk", "article"] = "talk"
-    locator: Literal["time", "paragraph"] = "time"
+    source_kind: Literal["talk", "article", "chapter"] = "talk"
+    locator: Literal["time", "paragraph", "page"] = "time"
+    # Books (ADR-0014): a Private Source never leaves this machine in a pack, and a Chapter's
+    # printed page numbers ({pdf page: label}) name its Citations when the PDF has them.
+    private: bool = False
+    page_labels: dict[str, str] = Field(default_factory=dict)
     chapters: list[Chapter] = Field(default_factory=list)
     extraction_meta: ExtractionMeta

@@ -30,8 +30,14 @@ def _year(published_at: str | None) -> int:
 
 
 def context_header(record: dict, chapter: str | None = None) -> str:
-    """Deterministic header prepended before embedding and full-text indexing."""
+    """Deterministic header prepended before embedding and full-text indexing. `chapter` is the
+    section at the item's position (a talk's chapter, an article's or a Book Chapter's heading)."""
     who = f" by {record['speaker']}" if record.get("speaker") else ""
+    if record.get("source_kind") == "chapter":       # the Book, its authors, then the Chapter
+        year = _year(record.get("published_at"))
+        head = f"From the book \"{record.get('series') or ''}\"{who}" + (f" ({year})" if year else "")
+        head += f", chapter \"{record.get('title_raw') or record.get('title_canonical') or ''}\""
+        return head + (f" — {chapter}" if chapter else "")
     where = ", ".join(x for x in (record.get("series"), str(_year(record.get("published_at")) or ""))
                       if x)
     head = f"From \"{record.get('title_canonical') or record.get('title_raw') or ''}\"{who}"
@@ -67,6 +73,8 @@ def build_items(record: dict, transcript: dict | None) -> list[dict]:
         "provenance": record.get("provenance") or "",
         "published_at": record.get("published_at") or "", "year": _year(record.get("published_at")),
         "topics": topics,
+        # a Private Source's items never leave this machine (pack, released eval) [ADR-0014]
+        "visibility": "private" if record.get("private") else "public",
     }
 
     def item(kind: str, iid: str, text: str, evidence: str, ms: int | None, end_ms: int | None,
@@ -96,6 +104,6 @@ def build_items(record: dict, transcript: dict | None) -> list[dict]:
                         doc_stages, "document"))
     if transcript and transcript.get("utterances"):
         for c in chunk_transcript({"doc_id": doc_id, "utterances": transcript["utterances"]}):
-            out.append(item("passage", f"psg:{doc_id}:{c.start_ms}", c.text, "", c.start_ms,
+            out.append(item("passage", f"psg:{doc_id}:{c.start_ms}" + (f".{c.part}" if c.part else ""), c.text, "", c.start_ms,
                             c.end_ms, doc_stages, "document"))
     return out

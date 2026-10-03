@@ -15,12 +15,19 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from ..config import EVAL_DATA, EVAL_DIR
-from ..knowledge.search import search
+from ..config import EVAL_DATA, EVAL_DIR, EVAL_PRIVATE
+from ..knowledge.search import POLICIES, search
 from ..pages import atomic_write_text
 from . import metrics as M
-from .files import load_split
-from .moments import moment_for, results_to_moments, results_to_talks
+from .files import load_set
+from .splits import SETS
+from .moments import (
+    moment_for,
+    moment_kind,
+    parse_moment_id,
+    results_to_moments,
+    results_to_talks,
+)
 
 CONFIGS = {
     "full": {"rerank": True, "stage_boost": False},
@@ -32,6 +39,12 @@ CONFIGS = {
     # the full index and models on the pack's content (no Passages): separates the cost of
     # dropping Passages from the cost of the smaller ONNX models
     "full-no-passages": {"rerank": True, "stage_boost": False, "kinds": ["advice", "takeaway", "summary"]},
+    # candidate diversity policies (founder_coach.search.POLICIES), source-agnostic: adopted as the
+    # default only when they don't lower nDCG@10 overall or for any source kind's questions
+    "full-series3": {"rerank": True, "stage_boost": False, "diversity": "series3"},
+    "full-neardup": {"rerank": True, "stage_boost": False, "diversity": "neardup"},
+    "pack-series3": {"rerank": False, "stage_boost": False, "backend": "pack", "diversity": "series3"},
+    "pack-neardup": {"rerank": False, "stage_boost": False, "backend": "pack", "diversity": "neardup"},
 }
 PACK_KINDS = ["advice", "takeaway", "summary"]
 # below this share of judged top-10 Moments, a comparison says more about the pool than the
@@ -40,7 +53,12 @@ JUDGED_MIN = 0.90
 EXIT_FAIL, EXIT_INCONCLUSIVE = 1, 3
 GATE = {"ndcg@10": 0.05, "recall@10": 0.05}
 PRIMARY = "ndcg@10"          # decided before looking (eval-spec §7): tested unadjusted
-FACETS = ("question_type", "origin", "popularity", "stage", "topic")
+FACETS = ("question_type", "origin", "popularity", "stage", "topic", "seed_kind")
+# Every source kind's questions are gated too, so no source is traded away for another: a group
+# of at least KIND_GATE_MIN_N questions fails when its nDCG@10 drops more than KIND_GATE, and
+# the drop is significant (paired randomization p < KIND_GATE_P)
+KIND_GATE, KIND_GATE_MIN_N, KIND_GATE_P = 0.03, 10, 0.05
+DOC_NDCG = "doc_ndcg@10"     # Document-level nDCG@10: a Document's grade is its best Moment's
 # ADR-0009: the plugin ships the pack unless it loses more than 0.03 nDCG@10 to `full`
 PACK_GATE = {"ndcg@10": 0.03}
 
@@ -57,7 +75,12 @@ def base_config(name: str) -> str:
 
 
 def gate_for(config: str) -> dict[str, float]:
-    return PACK_GATE if CONFIGS[base_config(config)].get("backend") == "pack" else GATE
+    """The regression gate of a configuration (a named baseline like `prebooks` gets the default)."""
+    try:
+        base = base_config(config)
+    except RuntimeError:
+        return GATE
+    return PACK_GATE if CONFIGS[base].get("backend") == "pack" else GATE
 RESULT_DEPTH = 50            # items requested per question
 
 
@@ -71,7 +94,8 @@ def run_config(store, embed, reranker, queries: list[dict], config: str) -> dict
     for i, q in enumerate(queries, 1):
         stage = (q.get("stage") or [None])[0] if cfg["stage_boost"] else None
         res = search(store, embed, q["text"], stage=stage, top_k=RESULT_DEPTH, kinds=cfg.get("kinds"),
-                     reranker=reranker if cfg["rerank"] else None)
+                     reranker=reranker if cfg["rerank"] else None,
+                     diversity=POLICIES[cfg.get("diversity", "default")])
         moments = results_to_moments(res)
         best: dict[str, float] = {}
         for r in res:                              # a Moment's score = its best item's score
@@ -88,27 +112,42 @@ def run_config(store, embed, reranker, queries: list[dict], config: str) -> dict
     return out
 
 
-def talk_qrels(qrels: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
-    """Talk-level labels: a Talk's grade is its best Moment's grade."""
+def doc_qrels(qrels: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    """Document-level labels: a Document's grade is its best Moment's grade (any source kind)."""
     out: dict[str, dict[str, int]] = {}
     for q, ms in qrels.items():
         for m, g in ms.items():
-            t = m[:11]
-            out.setdefault(q, {})[t] = max(out.get(q, {}).get(t, 0), g)
+            d = parse_moment_id(m)[0]
+            out.setdefault(q, {})[d] = max(out.get(q, {}).get(d, 0), g)
     return out
 
 
+def facet_keys(q: dict, facet: str) -> list[str]:
+    """A question's groups for one facet. `seed_kind` is the source kind of the Moment the
+    question was written from: one group per kind, so each source's questions are measured."""
+    if facet == "seed_kind":
+        seed = (q.get("creation") or {}).get("seed_moment")
+        return [moment_kind(seed)] if seed else ["(none)"]
+    keys = q.get(facet) or ["(none)"]
+    return keys if isinstance(keys, list) else [keys]
+
+
 def score(queries: list[dict], qrels: dict[str, dict[str, int]], runs: dict) -> dict:
+    """Scores over the questions this run was asked (`runs`): a labelled question it never saw
+    (written after the run was saved) is left out, not scored zero."""
+    qrels = {q: v for q, v in qrels.items() if q in runs}
     moment_run = {q: r["moments"] for q, r in runs.items()}
     per = M.per_query(qrels, moment_run)
-    if any(r.get("talks") for r in runs.values()):    # older run files have no talk ranking
-        per["talk_ndcg@10"] = M.per_query(talk_qrels(qrels), {q: r["talks"] for q, r in runs.items()},
-                                          {"x": M.METRICS["ndcg@10"]})["x"]
+    if any(r.get("talks") for r in runs.values()):    # older run files have no Document ranking
+        per[DOC_NDCG] = M.per_query(doc_qrels(qrels), {q: r["talks"] for q, r in runs.items()},
+                                    {"x": M.METRICS["ndcg@10"]})["x"]
     summary = {}
     for name, vals in per.items():
         lo, hi = M.bootstrap_ci(list(vals.values()))
         summary[name] = {"mean": round(M.mean(vals.values()), 4), "ci95": [round(lo, 4), round(hi, 4)],
                          "n": len(vals)}
+    # Diagnostic (not compared or gated): what the top 10 is made of, by source kind
+    summary["_mix@10"] = M.kind_mix([moment_run.get(q, []) for q in per["ndcg@10"]])
     summary["_ceilings"] = {"recall@10": round(M.ceiling(qrels, 10), 4),
                             "recall@10-l2": round(M.ceiling(qrels, 10, 2), 4),
                             "recall@50": round(M.ceiling(qrels, 50), 4)}
@@ -116,12 +155,30 @@ def score(queries: list[dict], qrels: dict[str, dict[str, int]], runs: dict) -> 
     for facet in FACETS:
         buckets = defaultdict(list)
         for q in queries:
-            keys = q.get(facet) or ["(none)"]
-            for k in (keys if isinstance(keys, list) else [keys]):
+            for k in facet_keys(q, facet):
                 if q["_id"] in per["ndcg@10"]:
                     buckets[k].append(per["ndcg@10"][q["_id"]])
         groups[facet] = {k: {"ndcg@10": round(M.mean(v), 4), "n": len(v)} for k, v in sorted(buckets.items())}
-    return {"summary": summary, "by": groups, "per_query": per}
+    kinds = {q["_id"]: facet_keys(q, "seed_kind")[0] for q in queries if q["_id"] in per["ndcg@10"]}
+    return {"summary": summary, "by": groups, "per_query": per, "seed_kind": kinds}
+
+
+def paired_delta(a: dict[str, float], b: dict[str, float]) -> float:
+    qs = sorted(set(a) & set(b))
+    return M.mean([a[q] - b[q] for q in qs]) if qs else 0.0
+
+
+def question_overlap(current: dict, baseline: dict) -> dict:
+    """Which questions the two results share: the ones only the current run was asked (added to
+    the set since the baseline) and the ones only the baseline was asked (retired since)."""
+    cur = set(current["per_query"].get(PRIMARY, {}))
+    base = set(baseline.get("per_query", {}).get(PRIMARY, {}))
+    new_kinds: dict[str, int] = {}
+    for q in cur - base:
+        kind = (current.get("seed_kind") or {}).get(q, "(none)")
+        new_kinds[kind] = new_kinds.get(kind, 0) + 1
+    return {"shared": len(cur & base), "new": len(cur - base), "retired": len(base - cur),
+            "new_by_kind": dict(sorted(new_kinds.items()))}
 
 
 def compare(current: dict, baseline: dict, gate: dict[str, float] = GATE) -> dict:
@@ -136,7 +193,9 @@ def compare(current: dict, baseline: dict, gate: dict[str, float] = GATE) -> dic
         adj[PRIMARY] = p[PRIMARY]
     out = {}
     for m in shared:
-        delta = current["summary"][m]["mean"] - baseline["summary"][m]["mean"]
+        # over the questions both scored, like the interval and p: a question one run was never
+        # asked (added to the set later) is not a zero, it is outside the comparison
+        delta = paired_delta(current["per_query"][m], baseline["per_query"][m])
         lo, hi = M.paired_bootstrap_ci(current["per_query"][m], baseline["per_query"][m])
         out[m] = {"delta": round(delta, 4), "ci95": [round(lo, 4), round(hi, 4)],
                   "p": round(adj[m], 4), "p_adjust": "none (primary)" if m == PRIMARY else "holm",
@@ -144,13 +203,47 @@ def compare(current: dict, baseline: dict, gate: dict[str, float] = GATE) -> dic
     return out
 
 
+def compare_kinds(current: dict, baseline: dict) -> dict:
+    """nDCG@10 per source kind of the question's seed, paired against the baseline on the
+    questions both scored. A kind with at least KIND_GATE_MIN_N questions fails its gate when it
+    drops more than KIND_GATE and the drop is significant."""
+    cur, base = current["per_query"].get(PRIMARY, {}), baseline.get("per_query", {}).get(PRIMARY, {})
+    groups: dict[str, list[str]] = {}
+    for q, kind in (current.get("seed_kind") or {}).items():
+        if q in base and q in cur:
+            groups.setdefault(kind, []).append(q)
+    out = {}
+    for kind, qs in sorted(groups.items()):
+        a, b = {q: cur[q] for q in qs}, {q: base[q] for q in qs}
+        delta = M.mean(a.values()) - M.mean(b.values())
+        lo, hi = M.paired_bootstrap_ci(a, b)
+        p = M.paired_randomization(a, b)
+        big = len(qs) >= KIND_GATE_MIN_N
+        out[kind] = {"n": len(qs), "delta": round(delta, 4), "ci95": [round(lo, 4), round(hi, 4)],
+                     "p": round(p, 4), "gated": big,
+                     "fails_gate": big and delta < -KIND_GATE and p < KIND_GATE_P}
+    return out
+
+
+def refresh_baseline_command(split: str, name: str | None, baseline: dict) -> str:
+    """The free command that scores a saved baseline again against the current labels. A baseline
+    named after another run (`--as full-prebooks`) remembers its run file, so the same run is
+    re-scored under the same name; any other baseline is its configuration's newest run."""
+    src = baseline.get("rescored_from") or ""
+    m = RUN_NAME.fullmatch(src)
+    if m:
+        return (f"ytbrain eval rescore --set {split} --config {m['config']} --run {src} "
+                f"--as {name} --save-baseline")
+    return f"ytbrain eval rescore --set {split} --config {name} --save-baseline"
+
+
 def verdict(result: dict, baseline: dict, config: str) -> tuple[int, dict]:
     """(exit code, {"status", "reasons"}): a failed gate counts only when the comparison is
     sound -- both scored against the same labels, and this run's top 10 mostly judged."""
     reasons = []
     if baseline.get("qrels_sha256") and baseline["qrels_sha256"] != result.get("qrels_sha256"):
-        reasons.append(f"the baseline was scored against different labels: re-run "
-                       f"`ytbrain eval run --set {result['split']} --config {result.get('compared_with')} --save-baseline`")
+        reasons.append("the baseline was scored against different labels: re-score it with "
+                       f"`{refresh_baseline_command(result['split'], result.get('compared_with'), baseline)}`")
     elif not baseline.get("qrels_sha256"):
         reasons.append("the baseline predates label tracking; if labels changed since, re-save it")
     judged = result["summary"].get("judged@10", {}).get("mean", 1.0)
@@ -159,7 +252,8 @@ def verdict(result: dict, baseline: dict, config: str) -> tuple[int, dict]:
                        f"other systems), so its scores are underestimates: run `ytbrain eval judge "
                        f"--set {result['split']} --config {config}`, then rescore")
     blocking = [r for r in reasons if not r.startswith("the baseline predates")]
-    failed = any(c["fails_gate"] for c in result.get("compare", {}).values())
+    failed = any(c["fails_gate"] for c in result.get("compare", {}).values()) or \
+        any(c["fails_gate"] for c in result.get("compare_kinds", {}).values())
     if blocking:
         return EXIT_INCONCLUSIVE, {"status": "inconclusive", "reasons": reasons}
     return (EXIT_FAIL if failed else 0), {"status": "fail" if failed else "pass", "reasons": reasons}
@@ -191,7 +285,10 @@ def load_run(path: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     return read(path), read(path.with_name(path.stem + ".talks.run"))
 
 
-RUN_NAME = re.compile(r"(?P<split>[a-z]+)-(?P<config>[a-z0-9-]+)-(?P<at>\d{4}-\d\d-\d\dT\d{6})\.run")
+# a set name may contain "-" (dev-articles): known sets first, so `dev-articles-full-...` is not
+# read as set `dev`, config `articles-full`
+RUN_NAME = re.compile(r"(?P<split>" + "|".join(sorted(SETS, key=len, reverse=True)) + r"|[a-z]+)"
+                      r"-(?P<config>[a-z0-9-]+)-(?P<at>\d{4}-\d\d-\d\dT\d{6})\.run")
 
 
 def latest_run(out_dir: Path, split: str, config: str) -> Path | None:
@@ -225,10 +322,11 @@ def reachable(store, kinds: list[str] | None) -> set[str] | None:
 
 def evaluate(store, embed, reranker, split: str, config: str, root: Path = EVAL_DIR,
              out_dir: Path = EVAL_DATA / "runs", baseline: str | None = None,
-             save_baseline: bool = False, label: str | None = None) -> tuple[dict, int]:
+             save_baseline: bool = False, label: str | None = None,
+             private: Path | None = EVAL_PRIVATE) -> tuple[dict, int]:
     if label and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", label):
         raise RuntimeError("--label must be lowercase letters, digits and dashes, e.g. arctic-passages")
-    queries, qrels = load_split(root, split)
+    queries, qrels = load_set(root, split, private)
     if not queries:
         raise RuntimeError(f"no {split} questions in {root} -- run `ytbrain eval build --set {split}` first")
     answerable = [q for q in queries if q.get("answerable", True)]
@@ -244,27 +342,60 @@ def evaluate(store, embed, reranker, split: str, config: str, root: Path = EVAL_
 
 
 def rescore(split: str, config: str, root: Path = EVAL_DIR, out_dir: Path = EVAL_DATA / "runs",
-            baseline: str | None = None, save_baseline: bool = False) -> tuple[dict, int]:
-    """Score a saved run again, against the current labels, without searching (seconds)."""
-    queries, qrels = load_split(root, split)
-    path = latest_run(out_dir, split, config)
-    if path is None:
+            baseline: str | None = None, save_baseline: bool = False,
+            private: Path | None = EVAL_PRIVATE, run: Path | None = None,
+            name: str | None = None) -> tuple[dict, int]:
+    """Score a saved run again, against the current labels, without searching (seconds).
+    `run` picks a saved run file (default: the newest of `config`); `name` saves it under another
+    name, so any past run can be a named baseline (`--run dev-full-...run --as full-prebooks`)."""
+    queries, qrels = load_set(root, split, private)
+    if name and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        raise RuntimeError(f"--as {name!r}: use lowercase letters, digits and '-'")
+    path = (run if run.is_absolute() or run.exists() else out_dir / run) if run else latest_run(out_dir, split, config)
+    if path is None or not path.exists():
         raise RuntimeError(f"no saved {split} run for {config} -- run `ytbrain eval run --set {split} "
-                           f"--config {config}` first")
+                           f"--config {config}` first" if run is None else f"no run file {path}")
+    config = name or config
     moments, talks = load_run(path)
-    answerable = [q for q in queries if q.get("answerable", True)]
+    asked = asked_questions(path, moments)
+    answerable = [q for q in queries if q.get("answerable", True) and q["_id"] in asked]
+    not_asked = sum(1 for q in queries if q.get("answerable", True) and q["_id"] not in asked)
     runs = {q["_id"]: {"moments": moments.get(q["_id"], []), "talks": talks.get(q["_id"], [])}
             for q in answerable}
-    print(f"eval rescore: {config} from {path.name} against the current labels", flush=True)
+    print(f"eval rescore: {config} from {path.name} against the current labels"
+          + (f" ({not_asked} question(s) added since that run: not scored, not zero)" if not_asked else ""),
+          flush=True)
     return _finish(answerable, qrels, runs, split, config, out_dir, baseline, save_baseline,
                    reach=None, write_runs=False, source=path.name)
+
+
+def asked_questions(path: Path, moments: dict[str, list[str]]) -> set[str]:
+    """The questions a saved run was asked: its `.asked` file, or, for runs saved before those
+    existed, every question it ranked something for (hybrid search always returns results)."""
+    listed = path.with_suffix(".asked")
+    if listed.exists():
+        return {line.strip() for line in listed.read_text().splitlines() if line.strip()}
+    return set(moments)
+
+
+def baseline_run(out_dir: Path, split: str, name: str) -> Path | None:
+    """The saved run a baseline was scored from, so it can be scored again against new labels."""
+    p = out_dir / f"baseline-{split}-{name}.json"
+    if not p.exists():
+        return None
+    base = json.loads(p.read_text())
+    src = base.get("rescored_from") or f"{split}-{base.get('config', name)}-{str(base.get('at', '')).replace(':', '')}.run"
+    run = out_dir / src
+    return run if run.exists() else None
 
 
 def _baseline_path(out_dir: Path, split: str, baseline: str) -> Path:
     p = out_dir / f"baseline-{split}-{baseline}.json"
     if not p.exists():
-        raise RuntimeError(f"no saved baseline for {baseline} -- run `ytbrain eval run --set {split} "
-                           f"--config {baseline} --save-baseline` first")
+        raise RuntimeError(f"no saved baseline named {baseline} -- save one with `ytbrain eval run --set {split} "
+                           f"--config {baseline} --save-baseline` (a configuration), or "
+                           f"`ytbrain eval rescore --set {split} --config <config> --run <file>.run "
+                           f"--as {baseline} --save-baseline` (a saved run)")
     return p
 
 
@@ -277,6 +408,7 @@ def _finish(queries, qrels, runs, split, config, out_dir, baseline, save_baselin
         # saved before scoring: a Ctrl+C during the bootstrap keeps the (slow) search, and
         # `eval rescore` can finish the job
         write_trec_run(out_dir / f"{stem}.run", runs, f"ytbrain-{config}")
+        atomic_write_text(out_dir / f"{stem}.asked", "".join(f"{q}\n" for q in sorted(runs)))
     result = score(queries, qrels, runs)
     result.update({"split": split, "config": config, "at": at,
                    "n_questions": len(queries), "qrels_sha256": qrels_sha(qrels)})
@@ -289,6 +421,8 @@ def _finish(queries, qrels, runs, split, config, out_dir, baseline, save_baselin
     if baseline:
         base = json.loads(_baseline_path(out_dir, split, baseline).read_text())
         result["compare"] = compare(result, base, gate_for(config))
+        result["compare_kinds"] = compare_kinds(result, base)
+        result["overlap"] = question_overlap(result, base)
         result["compared_with"] = baseline
         code, result["verdict"] = verdict(result, base, config)
     atomic_write_text(out_dir / f"{stem}.json", json.dumps(result, indent=1))   # with the comparison
@@ -311,6 +445,9 @@ def render(result: dict) -> str:
             continue
         cap = f"   (best possible {ceilings[name]:.4f})" if name in ceilings else ""
         lines.append(f"  {name:14} {s['mean']:.4f}   95% CI [{s['ci95'][0]:.4f}, {s['ci95'][1]:.4f}]{cap}")
+    mix = result["summary"].get("_mix@10") or {}
+    if mix:
+        lines.append("  top-10 mix by source kind: " + ", ".join(f"{k} {v:.1%}" for k, v in mix.items()))
     for facet in FACETS:
         groups = result["by"].get(facet) or {}
         if facet in ("stage", "topic"):          # long tails: show the groups big enough to read
@@ -322,13 +459,31 @@ def render(result: dict) -> str:
             small = "  (too few to compare)" if v["n"] < 10 else ""
             lines.append(f"    {k:28} {v['ndcg@10']:.4f}  (n={v['n']}){small}")
     if "compare" in result:
+        ov = result.get("overlap") or {}
         lines.append(f"\n  vs baseline {result.get('compared_with', '')} "
                      f"(difference, its 95% CI, p; nDCG@10 unadjusted, others Holm-corrected):")
+        if ov.get("new") or ov.get("retired"):
+            kinds = ", ".join(f"{k} {n}" for k, n in (ov.get("new_by_kind") or {}).items())
+            lines.append(f"    compared on the {ov['shared']} question(s) both were asked"
+                         + (f"; {ov['new']} new since the baseline ({kinds}), not compared" if ov.get("new") else "")
+                         + (f"; {ov['retired']} retired since" if ov.get("retired") else ""))
         for m, c in result["compare"].items():
             flag = "  FAILS GATE" if c["fails_gate"] else ""
             ci = c.get("ci95") or [0, 0]
             lines.append(f"    {m:14} {c['delta']:+.4f}  [{ci[0]:+.4f}, {ci[1]:+.4f}]  "
                          f"p={c.get('p', c.get('p_holm', 1.0)):.3f}{flag}")
+    if result.get("compare_kinds"):
+        lines.append(f"\n  nDCG@10 by the source kind of the question's seed, vs the baseline "
+                     f"(gated: n >= {KIND_GATE_MIN_N}, drop > {KIND_GATE}, p < {KIND_GATE_P}):")
+        for kind, c in result["compare_kinds"].items():
+            flag = "  FAILS GATE" if c["fails_gate"] else ("" if c["gated"] else "  (too few to gate)")
+            lines.append(f"    {kind:14} {c['delta']:+.4f}  [{c['ci95'][0]:+.4f}, {c['ci95'][1]:+.4f}]  "
+                         f"p={c['p']:.3f}  (n={c['n']}){flag}")
+    new_kinds = [k for k in (result.get("overlap") or {}).get("new_by_kind", {})
+                 if k not in (result.get("compare_kinds") or {})]
+    if "compare_kinds" in result and new_kinds:
+        lines.append(f"    {', '.join(new_kinds)}: no baseline yet (every such question is new); "
+                     f"this run's score is the first reference")
     if "verdict" in result:
         v = result["verdict"]
         lines.append(f"\n  verdict: {v['status'].upper()}")

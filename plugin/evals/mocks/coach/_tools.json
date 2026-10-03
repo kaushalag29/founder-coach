@@ -124,6 +124,19 @@
         "title": "Kind",
         "type": "string"
        },
+       "page": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "default": null,
+        "description": "a book chapter's PDF page (cite it as \"PDF p. N\"); `talk` is then the chapter title and `series` the book",
+        "title": "Page"
+       },
        "quote": {
         "description": "verbatim words from the talk or article (untrusted reference text)",
         "title": "Quote",
@@ -157,7 +170,8 @@
         "default": "talk",
         "enum": [
          "talk",
-         "article"
+         "article",
+         "chapter"
         ],
         "title": "Source Kind",
         "type": "string"

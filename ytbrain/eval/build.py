@@ -16,14 +16,25 @@ import re
 import time
 from functools import lru_cache
 
-from ..config import (EVAL_DATA, EVAL_DIR, EVAL_GENERATOR, EVAL_JUDGE_BATCH,
-                      EVAL_JUDGES, EVAL_MAX_COST, EVAL_MAX_RPM, EVAL_POOL_DEPTH, EVAL_TUNING_OVERSAMPLE,
-                      EVAL_TUNING_SIZE, EVAL_WORKERS, TRANSCRIPTS)
+from ..config import (
+    EVAL_DATA,
+    EVAL_DIR,
+    EVAL_GENERATOR,
+    EVAL_JUDGE_BATCH,
+    EVAL_JUDGES,
+    EVAL_MAX_COST,
+    EVAL_MAX_RPM,
+    EVAL_PRIVATE,
+    EVAL_TUNING_OVERSAMPLE,
+    EVAL_WORKERS,
+    TRANSCRIPTS,
+)
 from ..extract import runner
-from . import files, generate, judge, pool
+from ..visibility import Visibility
+from . import files, generate, judge, pool, splits
 from .db import EvalDB
 from .llm import Budget, ask, run_parallel
-from .moments import is_article_moment, moment_text, parse_moment_id
+from .moments import moment_locator, moment_text, parse_moment_id
 
 EXIT_STOPPED = 2          # stopped early (budget / endpoint); re-run to resume
 
@@ -33,8 +44,12 @@ class Env:
 
     def __init__(self, store=None, embed=None, reranker=None, ask_fn=ask, db: EvalDB | None = None,
                  root=EVAL_DIR, generator=EVAL_GENERATOR, judges=None, workers=EVAL_WORKERS,
-                 max_cost=EVAL_MAX_COST, transcripts=TRANSCRIPTS, manifest=None):
+                 max_cost=EVAL_MAX_COST, transcripts=TRANSCRIPTS, manifest=None, visibility=None,
+                 private=None):
         self.store, self.embed, self.reranker, self.ask = store, embed, reranker, ask_fn
+        # which Documents are private (ADR-0014): their labels go to the overlay, never the release
+        self.visibility = visibility or Visibility.everything_public()
+        self.private = private if private is not None else EVAL_PRIVATE
         self.db = db or EvalDB(EVAL_DATA / "eval.db")
         self.root, self.generator = root, generator
         self.judges = judges or list(EVAL_JUDGES)
@@ -48,7 +63,7 @@ class Env:
 
     def moment_text(self, mid: str) -> str:
         doc, start = parse_moment_id(mid)
-        return moment_text(list(self.utterances(doc)), start, article=is_article_moment(mid))
+        return moment_text(list(self.utterances(doc)), start, locator=moment_locator(mid))
 
 
 def _say(msg: str) -> None:
@@ -75,40 +90,96 @@ def _spend(env: Env, budget: Budget, build: str, model: str, kind: str, cost: fl
 
 # --------------------------------------------------------------------------- dev questions
 
-def seed_dev(env: Env, limit: int | None = None) -> int:
-    """Step 1a: sample seeds once; later runs reuse them (the sample is part of the set)."""
-    if env.db.questions("dev"):
-        return 0
+# The Tuning set is one question set per kind of Source the questions are written from (eval/splits.py),
+# each built, decided and versioned on its own: `dev` from Talks, `dev-articles` from Articles,
+# `dev-chapters` from public Books (released in eval/), `dev-private` from your private Sources (the
+# private overlay only, ADR-0014). Every question is graded over every Source you index, so a talk
+# question can be answered by a book page; `eval run --set all` scores the sets together.
+PRIVATE_SPLIT = splits.PRIVATE_SPLIT
+SPLITS = splits.SPEC
+PUBLIC_SPLITS = splits.PUBLIC_SPLITS
+LIVE = ("seeded", "generated", "accepted", "spare")          # a question that holds (or will hold) a slot
+
+
+def _seed_rows(env: Env) -> list[dict]:
     rows = env.store.rows(kinds=["advice", "takeaway"],
                           columns=["item_id", "kind", "doc_id", "text", "evidence", "start_ms",
-                                   "topics", "stages", "year", "speaker", "title"])
+                                   "topics", "stages", "year", "speaker", "title", "visibility",
+                                   "deep_link"])
+    for r in rows:                     # the Source's configuration decides, whatever the index says
+        if env.visibility.is_private(r["doc_id"]):
+            r["visibility"] = "private"
+    return rows
+
+
+def split_target(env: Env, split: str) -> int:
+    """The split's size as last computed by seeding (`targets` table), else what it was built with
+    (a split seeded before targets existed keeps every question it has)."""
+    t = env.db.target(split)
+    if t is not None:
+        return t["target"]
+    return splits.LEGACY_SIZE.get(split, sum(q["status"] in LIVE for q in env.db.questions(split)))
+
+
+def seed_dev(env: Env, limit: int | None = None, split: str = "dev", top_up: bool = False) -> int:
+    """Step 1a: sample seeds. The first build samples the whole split; later builds reuse it (the
+    sample is part of the set) unless `top_up`, which samples only the questions still missing to
+    reach the split's target -- from Documents no question of the split was written from, the ones
+    added since the last seeding first."""
+    existing = env.db.questions(split)
+    if existing and not top_up:
+        return 0
+    spec = SPLITS[split]
+    eligible = generate.eligible(_seed_rows(env), private=spec["private"], kinds=spec["kinds"])
+    docs = sorted({r["doc_id"] for r in eligible})
+    have = sum(q["status"] in ("accepted", "spare") for q in existing)
+    known = env.db.target(split)
+    goal = limit or splits.target(len(docs), max(have, split_target(env, split) if existing else 0))
+    env.db.set_target(split, goal, docs)
+    live = sum(q["status"] in LIVE for q in existing)
+    missing = goal - live
+    if missing <= 0:
+        if top_up:
+            _say(f"  {split}: {live} question(s) for {len(docs)} Document(s): at its target ({goal})")
+        return 0
+    used = {q["record"].get("doc_id") for q in existing}
+    fresh = [r for r in eligible if r["doc_id"] not in used]
+    seen = set(known["docs"]) if known else set()
     caption = {}
     if env.manifest is not None:
         caption = {d["doc_id"]: d["caption_kind"] for d in env.manifest.documents()}
-    n = limit or math.ceil(EVAL_TUNING_SIZE * EVAL_TUNING_OVERSAMPLE)
-    picks = generate.sample_items(rows, n, caption)
-    for i, row in enumerate(picks, 1):
-        qid = f"dev-{i:04d}"
+    n = missing if limit else math.ceil(missing * EVAL_TUNING_OVERSAMPLE)
+    picks = generate.sample_items([r for r in fresh if r["doc_id"] not in seen], n, caption,
+                                  private=spec["private"], kinds=spec["kinds"], seed=42 + len(existing))
+    if len(picks) < n:                 # then any Document not used yet
+        taken = {r["doc_id"] for r in picks}
+        picks += generate.sample_items([r for r in fresh if r["doc_id"] not in taken], n - len(picks), caption,
+                                       private=spec["private"], kinds=spec["kinds"], seed=43 + len(existing))
+    start = max((q["sort_key"] for q in existing), default=0)
+    for i, row in enumerate(picks, start + 1):
+        qid = f"{spec['prefix']}-{i:04d}"
         seed = generate.seed_record(row, qid)
-        env.db.upsert_question(qid, "dev", i, "seeded", seed, seed_moment=seed["seed_moment"])
-    _say(f"  questions: sampled {len(picks)} seeds from {len(rows)} Advice/Takeaways")
+        env.db.upsert_question(qid, split, i, "seeded", seed, seed_moment=seed["seed_moment"])
+    what = "private Sources only" if spec["private"] else f"{', '.join(spec['kinds'])} only"
+    _say(f"  questions: sampled {len(picks)} seeds ({what}) for {missing} missing of {goal} "
+         f"({len(docs)} Document(s), {len(fresh)} not used yet)")
     return len(picks)
 
 
-def generate_dev(env: Env, budget: Budget) -> str | None:
+def generate_dev(env: Env, budget: Budget, split: str = "dev") -> str | None:
     """Step 1b: write a question for every seed not yet written."""
-    todo = env.db.questions("dev", ("seeded",))
+    todo = env.db.questions(split, ("seeded",))
     if not todo:
         return None
     _say(f"  questions: generating {len(todo)} with {env.generator}")
-    accepted_vecs = [q["record"]["_vec"] for q in env.db.questions("dev", ("generated", "accepted"))
+    accepted_vecs = [q["record"]["_vec"] for s in SPLITS for q in env.db.questions(s, ("generated", "accepted"))
                      if q["record"].get("_vec")]
 
     def work(q):
         return env.ask(generate.prompt_for(q["record"]), generate.GeneratedQuestion, env.generator)
 
     def on_result(q, ans, err):
-        _spend(env, budget, "dev", env.generator, "generate", ans.cost if ans is not None else _paid(err))
+        _spend(env, budget, split, env.generator, "generate", ans.cost if ans is not None else _paid(err))
         if err is not None or ans is None or ans.value is None:
             env.db.set_status(q["qid"], "seeded", f"generation failed: {err or (ans and ans.error)}")
             return
@@ -122,7 +193,7 @@ def generate_dev(env: Env, budget: Budget) -> str | None:
             rec["_vec"] = meas["_vec"]
             if ok:
                 accepted_vecs.append(meas["_vec"])
-        env.db.upsert_question(q["qid"], "dev", q["sort_key"], "generated" if ok else "rejected",
+        env.db.upsert_question(q["qid"], split, q["sort_key"], "generated" if ok else "rejected",
                                rec, text=g.question, seed_moment=q["seed_moment"], reason=reason or None)
 
     return run_parallel(todo, work, on_result, workers=env.workers, budget=budget, label="generate")
@@ -150,7 +221,7 @@ def rewrites(env: Env, split: str, budget: Budget, statuses=("generated",)) -> s
 
 
 def pool_step(env: Env, split: str, statuses=("generated",)) -> int:
-    depth = EVAL_POOL_DEPTH[split]
+    depth = splits.pool_depth(split)
     todo = [q for q in env.db.questions(split, statuses) if not env.db.is_pooled(q["qid"])]
     # A question pooled without its rewrite would lose the fifth variant for good (a pool is
     # never redone), so it waits for the rewrite -- unless the rewrite has failed twice.
@@ -172,10 +243,14 @@ def pool_step(env: Env, split: str, statuses=("generated",)) -> int:
     return len(todo)
 
 
-def judge_step(env: Env, split: str, budget: Budget, statuses=("generated",)) -> str | None:
-    """Grade every pooled Moment with the first two judges, then tie-break where needed."""
+def judge_step(env: Env, split: str, budget: Budget, statuses=("generated",),
+               questions: list[dict] | None = None) -> str | None:
+    """Grade every pooled Moment with the first two judges, then tie-break where needed.
+    `questions` (from several splits, e.g. a pool extension) overrides the split's own;
+    spend is booked to `split` either way."""
     ver = judge.PROMPT_VERSION
-    qs = [q for q in env.db.questions(split, statuses) if env.db.is_pooled(q["qid"])]
+    qs = [q for q in (questions if questions is not None else env.db.questions(split, statuses))
+          if env.db.is_pooled(q["qid"])]
     for phase, who in (("grade", env.judges[:2]), ("tie-break", env.judges[2:3])):
         jobs = []
         for q in qs:
@@ -238,19 +313,23 @@ def popularity(labels: dict[str, dict]) -> str:
     return "head" if n >= 10 else "torso" if n >= 3 else "tail"
 
 
-def finalize_dev(env: Env, talk_info: dict[str, dict], freeze_date: str,
-                 bump_if_changed: bool = True) -> dict:
-    """Decide every question and write the released files once. A question already released
-    keeps its slot, and if any of them is still being graded nothing is written (releasing
-    now would silently drop it). When the released questions or labels change -- or the last
-    release was interrupted -- the new files go out under the next minor version, in the same
-    write, so no crash can leave new labels under an old version."""
-    kept, discarded, pending, blocked = [], 0, 0, []
+def _decide(env: Env, split: str) -> dict:
+    """Decide one split's questions: keep those whose seed the judges found relevant, up to the
+    split's size; a question already released keeps its slot."""
+    kept, discarded, pending, blocked, retired = [], 0, 0, [], 0
     labels_by_q: dict[str, dict] = {}
-    qs = env.db.questions("dev", ("generated", "accepted", "discarded", "spare"))
+    gone = removed_documents(env)
+    size = split_target(env, split)
+    qs = env.db.questions(split, ("generated", "accepted", "discarded", "spare"))
     qs.sort(key=lambda q: (q["status"] != "accepted", q["sort_key"]))   # released ones keep their slot
     for q in qs:
+        if q["status"] != "discarded" and q["seed_moment"] and parse_moment_id(q["seed_moment"])[0] in gone:
+            # its seed Document was removed: the "its source answers it" guarantee is gone
+            env.db.set_status(q["qid"], "retired", "its seed Document was removed")
+            retired += 1
+            continue
         labels, undecided = decided_labels(env, q["qid"])
+        labels = {m: lab for m, lab in labels.items() if parse_moment_id(m)[0] not in gone}
         if undecided or not env.db.is_pooled(q["qid"]):
             pending += 1
             if q["status"] == "accepted":
@@ -261,30 +340,99 @@ def finalize_dev(env: Env, talk_info: dict[str, dict], freeze_date: str,
             env.db.set_status(q["qid"], "discarded", f"judges graded its seed Moment {seed}")
             discarded += 1
             continue
-        if len(kept) >= EVAL_TUNING_SIZE:
+        if len(kept) >= size:
             env.db.set_status(q["qid"], "spare")
             continue
         env.db.set_status(q["qid"], "accepted")
         kept.append(q)
         labels_by_q[q["qid"]] = labels
-    out = {"accepted": len(kept), "discarded": discarded, "pending": pending, "blocked": len(blocked),
-           "changed": False, "version": files.current_version(env.root)}
+    return {"kept": kept, "labels": labels_by_q, "discarded": discarded, "pending": pending,
+            "blocked": blocked, "retired": retired, "target": size}
+
+
+def removed_documents(env: Env) -> set[str]:
+    """Documents removed from their Source (tombstoned): their questions retire, their labels go."""
+    if env.manifest is None or not hasattr(env.manifest, "tombstoned_ids"):
+        return set()
+    return env.manifest.tombstoned_ids()
+
+
+def finalize_dev(env: Env, talk_info: dict[str, dict], freeze_date: str,
+                 bump_if_changed: bool = True) -> dict:
+    """Decide every question of every Tuning split and write the released files once. A
+    question already released keeps its slot, and if any of them is still being graded nothing
+    is written (releasing now would silently drop it). When any public split's questions or
+    labels change -- or the last release was interrupted -- the new files go out under the next
+    minor version (one bump for all splits), so no crash leaves new labels under an old version.
+    Returns totals plus `splits`: {split: {accepted, discarded, pending, blocked, changed}}."""
+    decided = {s: _decide(env, s) for s in SPLITS}
+    per = {s: {"accepted": len(d["kept"]), "discarded": d["discarded"], "pending": d["pending"],
+               "blocked": len(d["blocked"]), "retired": d["retired"], "target": d["target"], "changed": False}
+           for s, d in decided.items()}
+    blocked = sum(len(decided[s]["blocked"]) for s in SPLITS)
+    out = {"accepted": per["dev"]["accepted"], "discarded": per["dev"]["discarded"],
+           "pending": per["dev"]["pending"], "blocked": blocked, "changed": False,
+           "version": files.current_version(env.root), "splits": per}
     if blocked:
         return out                     # a released question isn't fully graded: keep the old release
-    records = [query_record(q, labels_by_q[q["qid"]], freeze_date, "dev") for q in kept]
-    if records:
-        old_q, old_labels = files.load_split(env.root, "dev")
-        new_labels = {q: {m: lab["grade"] for m, lab in ms.items()} for q, ms in labels_by_q.items()}
-        released = bool(old_q)
+    # One benchmark, two homes (ADR-0014): labels on private Documents go to the overlay
+    hidden: dict[str, dict] = {}
+    writes = []
+    for split in PUBLIC_SPLITS:
+        d = decided[split]
+        public, private = split_by_visibility(d["labels"], env.visibility)
+        hidden[split] = private
+        records = [query_record(q, public[q["qid"]], freeze_date, split) for q in d["kept"]]
+        if not records:
+            continue
+        old_q, old_labels = files.load_split(env.root, split)
+        new_labels = {q: {m: lab["grade"] for m, lab in ms.items()} for q, ms in public.items()}
         changed = (new_labels != old_labels or sorted(old_q, key=lambda r: r["_id"]) != records
                    or not files.consistent(env.root))
-        version = None
-        if released and changed and bump_if_changed:
-            version = files.bump_minor(files.current_version(env.root))
+        released = bool(old_q)
+        per[split]["changed"] = changed and released
         if changed or not released:
-            files.write_split(env.root, "dev", records, labels_by_q, talk_info, version=version)
-        out.update(changed=changed and released, version=files.current_version(env.root))
+            writes.append((split, records, public))
+    version = None
+    if bump_if_changed and any(per[s]["changed"] for s in PUBLIC_SPLITS):
+        version = files.bump_minor(files.current_version(env.root))
+    for split, records, public in writes:
+        files.write_split(env.root, split, records, public, talk_info, version=version,
+                          visibility=env.visibility)
+    out.update(changed=any(per[s]["changed"] for s in PUBLIC_SPLITS), version=files.current_version(env.root))
+    out.update(release_overlay(env, hidden, decided[PRIVATE_SPLIT], freeze_date))
     return out
+
+
+def release_overlay(env: Env, hidden: dict[str, dict], private: dict, freeze_date: str) -> dict:
+    """Write the private overlay, per split: labels on private Documents for each public split's
+    questions (`hidden`), and the questions written from private Sources (`dev-private`) with all
+    their labels (every Source). Never released."""
+    changed = False
+    n_labels = 0
+    for split in PUBLIC_SPLITS:
+        labels = hidden.get(split, {})
+        n_labels += sum(len(v) for v in labels.values())
+        changed |= files.write_private(env.private, split, labels, [])
+    labels = private["labels"]
+    records = [{**query_record(q, labels[q["qid"]], freeze_date, PRIVATE_SPLIT), "private": True}
+               for q in private["kept"]]
+    n_labels += sum(len(v) for v in labels.values())
+    changed |= files.write_private(env.private, PRIVATE_SPLIT, labels, records)
+    return {"private_labels": n_labels, "private_questions": len(private["kept"]),
+            "private_changed": changed}
+
+
+def split_by_visibility(labels: dict[str, dict[str, dict]], visibility) -> tuple[dict, dict]:
+    """({qid: public labels}, {qid: private labels}): every question keeps a (maybe empty) public set."""
+    public: dict[str, dict] = {}
+    private: dict[str, dict] = {}
+    for q, ms in labels.items():
+        public[q] = {m: lab for m, lab in ms.items() if not visibility.is_private_moment(m)}
+        hidden = {m: lab for m, lab in ms.items() if visibility.is_private_moment(m)}
+        if hidden:
+            private[q] = hidden
+    return public, private
 
 
 def query_record(q: dict, labels: dict[str, dict], freeze_date: str, split: str) -> dict:
@@ -423,7 +571,9 @@ def preflight(env: Env, generator: bool = True) -> str | None:
     if len(env.judges) < 2:
         return "YTBRAIN_EVAL_JUDGES needs at least two judge models (a third breaks ties)"
     import os
+
     import httpx
+
     from . import llm
     base = os.environ.get("YTBRAIN_LLM_BASE_URL", "")
     extra = json.loads(os.environ.get("YTBRAIN_LLM_EXTRA_BODY") or "{}")
@@ -476,35 +626,86 @@ def preflight(env: Env, generator: bool = True) -> str | None:
     return None
 
 
+def build_all(env: Env, max_cost: float | None = None, talk_info: dict | None = None,
+              freeze_date: str = "", top_up: bool = False) -> int:
+    """Build, resume or (`top_up`) grow every Tuning split in turn; a split with no Documents to
+    write from is skipped. Each split keeps its own spend cap."""
+    worst = 0
+    for split in splits.TUNING_SPLITS:
+        if SPLITS[split]["private"] and not env.visibility.private_docs:
+            continue
+        code = build_dev(env, max_cost=max_cost, talk_info=talk_info, freeze_date=freeze_date, split=split,
+                         top_up=top_up, quiet_if_empty=True)
+        worst = max(worst, code)
+        if code and getattr(env, "stopped_by", None) not in (None, "budget"):
+            return code                # the endpoint refused: every later split would stop the same way
+    return worst
+
+
 def build_dev(env: Env, max_cost: float | None = None, limit: int | None = None,
-              talk_info: dict | None = None, freeze_date: str = "") -> int:
+              talk_info: dict | None = None, freeze_date: str = "", split: str = "dev",
+              top_up: bool = False, quiet_if_empty: bool = False) -> int:
+    """Build or resume one Tuning split; `top_up` first grows it to its target."""
     runner.set_max_rpm(EVAL_MAX_RPM)
-    budget = Budget(max_cost if max_cost is not None else env.max_cost, env.db.spent("dev"))
-    _say(f"eval build dev: generator {env.generator}; judges {', '.join(env.judges)}; "
+    budget = Budget(max_cost if max_cost is not None else env.max_cost, env.db.spent(split))
+    seed_dev(env, limit, split, top_up=top_up)
+    if not env.db.questions(split):
+        if not quiet_if_empty:
+            _say(f"eval build {split}: no Documents of this kind to write questions from")
+        return 0
+    _say(f"eval build {split}: generator {env.generator}; judges {', '.join(env.judges)}; "
          f"{env.workers} workers; spent so far ${budget.spent:.3f} of ${budget.limit:g}")
-    seed_dev(env, limit)
-    for step in (lambda: generate_dev(env, budget), lambda: rewrites(env, "dev", budget)):
+    for step in (lambda: generate_dev(env, budget, split), lambda: rewrites(env, split, budget)):
         stopped = step()
         if stopped:
-            return _stopped(stopped, budget)
-    pool_step(env, "dev")
-    stopped = judge_step(env, "dev", budget)
+            return _stopped(stopped, budget, split, env)
+    pool_step(env, split)
+    stopped = judge_step(env, split, budget)
     if stopped:
-        return _stopped(stopped, budget)
+        return _stopped(stopped, budget, split, env)
     res = finalize_dev(env, talk_info or {}, freeze_date)
-    _say(f"eval build dev: {res['accepted']} questions accepted, {res['discarded']} discarded "
-         f"(seed not relevant), {res['pending']} incomplete; spent ${budget.spent:.3f}"
-         + (f"; released as v{res['version']}" if res["changed"] else ""))
+    mine = res["splits"][split]
+    _say(f"eval build {split}: {mine['accepted']} questions accepted, {mine['discarded']} discarded "
+         f"(seed not relevant), {mine['pending']} incomplete; spent ${budget.spent:.3f}"
+         + (f"; released as v{res['version']}" if mine["changed"] else "")
+         + ("; private overlay only, never released" if SPLITS[split]["private"] else ""))
+    if res.get("private_questions") or res.get("private_labels"):
+        _say(f"  private overlay: {res.get('private_questions', 0)} question(s) from private Sources, "
+             f"{res.get('private_labels', 0)} private label(s) ({env.private}; never released)")
     if res["blocked"]:
         _say(f"  {res['blocked']} released question(s) still have ungraded Moments: the released files "
              f"are unchanged until they're graded (re-run to finish)")
         return EXIT_STOPPED
-    if res["pending"]:
-        _say("  re-run `ytbrain eval build --set dev` to finish the incomplete ones")
-    if res["accepted"] < EVAL_TUNING_SIZE and not res["pending"] and not limit:
-        _say(f"  note: fewer than {EVAL_TUNING_SIZE} questions survived; raise "
-             "EVAL_TUNING_OVERSAMPLE or add seeds")
+    if mine["pending"]:
+        _say(f"  re-run `ytbrain eval build --set {split}` to finish the incomplete ones")
+    else:
+        for line in next_steps(env, split, res):
+            _say(line)
+    if mine["retired"]:
+        _say(f"  {mine['retired']} question(s) retired: their seed Document was removed")
+    if mine["accepted"] < mine["target"] and not mine["pending"] and not limit:
+        _say(f"  {mine['accepted']} of {mine['target']} questions survived: `ytbrain eval build --set {split} "
+             f"--top-up` writes more")
     return 0
+
+
+def next_steps(env: Env, split: str, res: dict) -> list[str]:
+    """What to run after a finished build: new questions only count once a run has searched them
+    and the judge has graded what they retrieve. A build also says when some split was never
+    built, so a split name is never guessed."""
+    per = res.get("splits") or {}
+    out = []
+    if per.get(split, {}).get("accepted"):
+        out += ["  next: `ytbrain eval run --config full`, then `ytbrain eval judge --config full`",
+                "        (`--set all` is the default: every Tuning split, one row per source kind)"]
+    elif split == PRIVATE_SPLIT:
+        out.append("  no question survived from the private Sources; check `ytbrain eval status`")
+    never = [s for s in splits.TUNING_SPLITS if s != split and env.db.target(s) is None
+             and (not SPLITS[s]["private"] or env.visibility.private_docs)]
+    if never:
+        out.append(f"  never built: {', '.join(never)} -- `ytbrain eval build` builds every split "
+                   f"(a kind with no Documents is skipped)")
+    return out
 
 
 def judge_runs(env: Env, split: str, run_paths: dict, depth: int = 10, max_cost: float | None = None,
@@ -513,12 +714,13 @@ def judge_runs(env: Env, split: str, run_paths: dict, depth: int = 10, max_cost:
     Moments each saved run retrieved that no judge has seen, with the same judges and prompt,
     then re-release the labels as a new minor version. Resumable and spend-capped like a build."""
     from .run import load_run
-    if split != "dev":
-        _say("eval judge: only the dev split exists so far")
+    if split not in ("all", *SPLITS):
+        _say(f"eval judge: no {split} questions to judge yet (the Tuning splits: {', '.join(SPLITS)})")
         return 1
     runner.set_max_rpm(EVAL_MAX_RPM)
     budget = Budget(max_cost if max_cost is not None else env.max_cost, env.db.spent(split))
-    accepted = env.db.questions(split, ("accepted",))
+    splits = list(SPLITS) if split == "all" else [split]
+    accepted = [q for s in splits for q in env.db.questions(s, ("accepted",))]
     if not accepted:
         _say("eval judge: no accepted questions -- build the split first")
         return 1
@@ -533,7 +735,7 @@ def judge_runs(env: Env, split: str, run_paths: dict, depth: int = 10, max_cost:
                if len(env.db.grades(q["qid"], ver).get(m, {})) < 2)
     _say(f"eval judge: {added} Moment(s) newly pooled from {', '.join(run_paths)} (top {depth}); "
          f"{todo} still to grade · judges {', '.join(env.judges)} · spent so far ${budget.spent:.3f} of ${budget.limit:g}")
-    stopped = judge_step(env, split, budget, statuses=("accepted",))
+    stopped = judge_step(env, split, budget, questions=accepted)
     if stopped:
         return _stopped(stopped, budget)
     undecided = [q["qid"] for q in accepted if decided_labels(env, q["qid"])[1]]
@@ -546,20 +748,30 @@ def judge_runs(env: Env, split: str, run_paths: dict, depth: int = 10, max_cost:
     # finishes grades an interrupted run pooled still changes the labels, and bumps
     res = finalize_dev(env, talk_info or {}, freeze_date)
     changed = res["changed"]
-    n_labels = sum(len(v) for v in files.load_split(env.root, split)[1].values())
+    n_labels = sum(len(v) for s in PUBLIC_SPLITS for v in files.load_split(env.root, s)[1].values())
     _say(f"eval judge: labels {'released as v' + res['version'] if changed else 'unchanged'} "
-         f"({res['accepted']} questions, {n_labels} labels); spent ${budget.spent:.3f}")
-    if changed:
+         f"({sum(res['splits'][s]['accepted'] for s in PUBLIC_SPLITS)} released questions, {n_labels} labels); "
+         f"spent ${budget.spent:.3f}")
+    if res.get("private_labels"):
+        _say(f"  private overlay: {res['private_labels']} label(s), {res.get('private_questions', 0)} private question(s) "
+             f"({'updated' if res.get('private_changed') else 'unchanged'}; {env.private}, never released)")
+    if changed or res.get("private_changed"):
         _say(f"  scores against the old labels are stale: `ytbrain eval rescore --set {split} --config full "
              f"--save-baseline` (no new search), then `ytbrain eval rescore --set {split} --config <c> --compare full` "
              f"for the others")
     return 0
 
 
-def _stopped(why: str, budget: Budget) -> int:
+def _stopped(why: str, budget: Budget, split: str = "", env: Env | None = None) -> int:
+    from .. import runstatus
+    name = f"eval build {split}".strip()
+    runstatus.record("budget" if why == "budget" else runstatus.classify(why) if runstatus.classify(why) != "unknown"
+                     else "endpoint", why)
+    if env is not None:
+        env.stopped_by = why
     if why == "budget":
-        _say(f"eval build: stopped at the spend cap (${budget.spent:.3f} of ${budget.limit:g}). "
+        _say(f"{name}: stopped at the spend cap (${budget.spent:.3f} of ${budget.limit:g}). "
              "Re-run with a higher --max-cost to continue; nothing is lost.")
     else:
-        _say(f"eval build: stopped -- {why}. Fix it and re-run; finished work is kept.")
+        _say(f"{name}: stopped -- {why}. Fix it and re-run; finished work is kept.")
     return EXIT_STOPPED

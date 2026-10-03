@@ -8,6 +8,9 @@ Inline, right after the claim it supports:
 - An article hit (`source_kind: article`, no `start_s`) has no timestamp: author, title and year,
   linked with its `deep_link` (it opens at the quoted words), e.g.
   ([Paul Graham, "Do Things That Don't Scale", 2013](https://paulgraham.com/ds.html#:~:text=…)).
+- A book chapter hit (`source_kind: chapter`) is the Founder's own copy of a book: authors,
+  book (`series`), chapter title (`talk`), year and `PDF p. <page>`, with no link, e.g.
+  (Peter Thiel and Blake Masters, *Zero to One*, "Secrets", 2014 · PDF p. 74).
 - Quote the Evidence (`quote`) when the exact wording matters.
 - One Citation per claim is enough; more only when talks agree or disagree.
 - Never build a link by hand: use the `deep_link` the tool returned.

@@ -17,8 +17,8 @@ knowledge, and is growing into a founder-coach served over MCP.
 ## Commands
 
 - Setup: `uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"` (what CI installs; with less, suites skip tests). Everything: `".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"`
-- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the six suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
-- Tests: `for s in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
+- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the seven suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
+- Tests: `for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
 - CLI reference: `ytbrain --help` and `README.md`.
 - Plugin: edit `plugin/skills/*/SKILL.md`, never `founder_coach/playbooks/*.md` or `founder_coach/product.json` (generated); `python scripts/assemble_plugin.py --pack data/pack --check` builds `dist/plugin`. `plugin/` is a template: load `dist/plugin`, not `plugin/`.
 - Repos, CI and releases: `docs/release.md` (`.github/workflows/ci.yml`, `scripts/release.py`, `scripts/check_secrets.py`).
@@ -26,6 +26,8 @@ knowledge, and is growing into a founder-coach served over MCP.
 ## Invariants
 
 - **Runtime boundary:** `founder_coach/` is what founders install; it never imports `ytbrain`, torch, LanceDB or yt-dlp (ADR-0010). Ranking changes go in `founder_coach/search.py` so the index and the pack stay identical.
+- **Every source competes:** ranking never looks at a result's source kind; a diversity rule is a `DiversityRule` in `founder_coach/search.py`, measured as an eval config before it becomes the default. Per-kind behaviour (Locator, Moments) lives in one `SourceKind` class (`ytbrain/source_kinds.py`), never in `if kind == ...` branches (ADR-0014, amendment 2026-09-30).
+- **Privacy comes from the Source** (`distribute: false`, `ytbrain/visibility.py`), never from a kind or an id format: private labels go to the eval's private overlay, never to `eval/`.
 - **Git:** the maintainer runs every git command (including `scripts/release.py`); agents leave the repository state alone.
 - **Product id:** the product's name lives only in `product.toml` (ADR-0012). Shipped files say `{{id}}` (plugin/) or use `founder_coach.product` (runtime: `product.ID`, `product.env("HOME")`); a test fails on a spelled-out id.
 - **Founder store schema:** a change to its tables is a new numbered migration in `founder_coach/store.py` (bump `SCHEMA_VERSION`); migrations are forward-only and take a backup first (ADR-0010, ADR-0011).
@@ -41,7 +43,12 @@ knowledge, and is growing into a founder-coach served over MCP.
   records; `tests/golden/generated_schema.json` pins it. Given fields (url, series, source_kind…)
   may be added with defaults that match existing records, without a bump (ADR-0013).
 - **Source types:** a new one is an adapter (`sync` + `clean` to the shared text-units transcript)
-  registered in `ytbrain/sources.py`; nothing after `clean` may depend on the Source type (ADR-0013).
+  registered in `ytbrain/sources.py`, plus a `SourceKind` in `ytbrain/source_kinds.py` if its Documents need a new
+  Locator; nothing after `clean` may depend on the Source type (ADR-0013).
+- **Books are a Private Source:** book records carry `private: true` and their Knowledge items
+  `visibility: private`; `pack build` drops them unless `--include-private`, `scripts/release.py` refuses such a
+  pack, and the released eval (`eval/`) never seeds from or labels them. Never commit a PDF, a parse or a
+  transcript of one (all under `data/`) (ADR-0014).
 - **Crawling:** obey robots.txt, pace per host, never log in, never rotate IPs or spoof a browser
   fingerprint, never solve CAPTCHAs (docs/web-sources-plan.md D6).
 - **Persisted names:** `data/manifest.db` keeps its `stage_state` table and `stage` column

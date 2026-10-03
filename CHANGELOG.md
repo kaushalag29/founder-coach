@@ -3,7 +3,169 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
-## 2026-09-28 (the coach answers first; search budget)
+## 2026-10-01 (`ytbrain ops` runs unattended: stop reasons, retries, notices, versions, references)
+
+- **No more waiting on the last call:** an eval step (questions, rewrites, grading) that had one call hanging at the
+  provider sat at `100/101` for up to 7 minutes until the deadline. A call slower than 5x the median (at least 30 s)
+  is now asked again in parallel and the first answer wins; the deadline stays as the last resort.
+  Not while the provider is rate-limiting us (429s): then the slowness is the backoff, and a repeat only adds load.
+- **Stop reasons:** commands that stop early write why (`data/ops/last-stop.json`); `ops` retries network
+  stops twice (1 and 5 min), goes on after a sync that keeps failing, stops with the fix for a refused
+  endpoint or the spend cap, and leaves the coach eval pending (re-run alone) on a Claude plan limit.
+- **Notices:** a macOS notification and `data/ops/last-run.md` on every stop and finished run (`--no-notify`).
+- **Plugin version:** a new build asks patch / minor / skip (patch after 60 s or with no terminal; a version
+  set by hand is kept; `--version` answers up front).
+- **References:** before the gate moves the baseline it is kept as `full-<date>` (last 10), and as
+  `full-before-<kind>` the first time a kind of Source is indexed.
+
+## 2026-09-30 (`ytbrain ops`; question sets that grow with the Sources; book folders found by themselves)
+
+- **`ytbrain ops [all|ingest|eval|plugin]`** (and `ops/*.sh`): the whole loop in one resumable command
+  (docs/ops.md). Checkpoints in `data/ops/state.json`; fingerprints of the index, labels and plugin decide what
+  runs; a FAIL or INCONCLUSIVE gate stops before the plugin and keeps the baseline; `--max-cost` caps the run's
+  eval and coach-judge spend; flagged extractions are retried once each; `--dry-run` shows what is due.
+- **Question sets sized by their Sources:** each split holds at most 20% of its Documents (no minimum), never
+  fewer than it has. `eval build --top-up` writes the missing ones (new Documents first);
+  `eval build` without `--set` builds every split; `eval status` shows targets. Questions whose seed Document
+  was removed retire (and labels on removed Documents go) at the next build or judge.
+- **Splits come from the source-kind registry:** `dev` (talks), `dev-articles`, `dev-chapters` (public books),
+  plus `dev-private`; a new source kind gets its own split without eval changes.
+- **`eval rescore --refresh-baseline`** re-scores a saved baseline on the current labels, keeping its questions.
+- **Books:** `path: data/books` picks up every subfolder you add (startup/, leadership/, finance/ ...); the
+  caches (parsed/, plans/, openlibrary/) and hidden or `_` folders are skipped.
+
+## 2026-09-30 (Eval: one question set per source kind; fair baselines; source-neutral wording)
+
+- **Separate Tuning sets per kind of Source:** `dev` (Talks, 150), `dev-articles` (public Articles, 30,
+  released), `dev-private` (your private Sources such as Books, 30, overlay only). Each is built with
+  `eval build --set <split>`, seeded only from its kind, and graded over every Source.
+  `eval run|judge|rescore` default to `--set all`: every set in one run, one nDCG row per source kind.
+  Private questions written by the previous release under `dev` move to `dev-private` at the next judge.
+- **`eval judge` grades every set in the run.** It used to grade only `dev` questions: a private
+  question's newly pooled Moments were never graded and the next judge stopped on them.
+- **Baselines compare like with like:** a run records the questions it was asked; questions added after
+  a baseline are left out of the comparison (and listed), not scored zero, and differences are paired.
+- **Question generation knows the source:** the prompt says talk, article or book; an article or book
+  seed links to its page, not to a YouTube URL. The build's closing lines report the set it built.
+- **Wording:** `extract`/`verify`/`clean` counts no longer say "transcript"/"talk(s)" for every kind;
+  `ytbrain sample` stratifies by source kind and tells the reviewer how to check each one.
+- **Tests:** all suites also run together in one process (`check.sh`), which caught two leaks between them.
+- **Coach eval checks Citations for every source kind:** G2 asks questions from each Tuning set (talks 70%,
+  articles 15%, your books 15% when the plugin carries them); a link no search returned, or a book page no
+  book hit had, counts as an unsupported claim without a judge; cited book hits reach the judges first;
+  the judge prompts and the `ask` template name talks, articles and books.
+- **Passages fit the 1024-token embedding window:** an article or book paragraph longer than it is cut into
+  the fewest equal pieces that fit (same position, so Citations and eval Moments are unchanged); a short
+  chunk is never carried whole into the next one (two Passages had one id). Only the ~80 affected
+  Documents re-index on the next `ytbrain index`.
+
+## 2026-09-30 (Books: several folders per Source, better chapter splits, a retry before verify flags)
+
+- **Resume and next-step hints name the real command.** An interrupted run now prints the command as typed (`ytbrain eval build --set dev-private`, not a bare `eval build`); a finished `dev-private` build says to run `eval run --set dev --config full` and then `eval judge`; a `dev` build says when private Sources still have no questions; a stale baseline names the `eval rescore --run … --as …` that refreshes it.
+- **`path` may list several folders or files** for one `pdf_books` Source (`path: [data/books/startup,
+  data/books/leadership]`). Per-book corrections stay keyed by file name, so two PDFs with one name are refused.
+- **Nested bookmarks:** a bookmark level that only groups Parts or numbered chapters is opened ("THE FORCE" >
+  "PART 1" > "1. Protection from Above"): *Leaders Eat Last* splits into 27 chapters, not 4 of up to 31k words.
+  Chapter levels whose children are sections are never skipped.
+- **More back matter skipped:** Resources ("Additional Resources"), Photo Insert, Photographs, Illustrations,
+  Plates. The "damaged words" warning counts only Chapter text (not Notes or Index links).
+- **Self-check retry at the verify threshold:** extraction retries once with feedback whenever verification
+  would flag the record (< 90 % of quotes grounded; it was < 60 %), keeping the better attempt; a misquote reused
+  by several items is listed once. Thresholds live in `config.VERIFY_PASS_RATE` / `VERIFY_FAIL_RATE`.
+- 6 new books checked (11/11 match `data/books/expected.yaml`). 4 new offline tests (272 in all).
+
+## 2026-09-30 (P3: every source competes; one benchmark across all Sources)
+
+- **Fix (privacy):** `eval judge --config pack` over a pack built with `--include-private` had released 48
+  labels on Book pages (ids, titles, pages; no text) in labels v1.4.0. Privacy now comes from the Source
+  (`distribute: false`, `ytbrain/visibility.py`; unknown Documents count as private): `files.write_split`
+  refuses a label on a private Document, and those labels go to the **private overlay** instead
+  (`data/eval/private/`, never released). Re-running `eval judge` ($0) moves the 48 there.
+- **One benchmark:** private Moments are pooled and graded like any other; `eval run`/`rescore` score the
+  released set plus the overlay. `eval build --set dev-private` writes 30 questions from your private Sources
+  (your Books), graded over every Source, overlay only.
+- **Every source kind measured and gated:** nDCG@10 by `seed_kind`; a kind with >= 10 questions fails the run
+  when it drops > 0.03 significantly. `top-10 mix by source kind` is shown. **Fix:** `doc_ndcg@10` replaces
+  `talk_ndcg@10`, which cut Document ids at 11 characters and so never counted an Article or a Chapter as a
+  hit (Document-level nDCG@10 of `full` is 0.643, not 0.519).
+- **`eval rescore --run FILE --as NAME`:** any saved run becomes a named baseline (e.g. the pre-books run).
+- **`DiversityPolicy`** (`founder_coach/search.py`): composable, source-agnostic rules; the default is
+  unchanged. Candidates `PerSeriesCap` and `NearDuplicateCollapse` run as eval configs `full-series3`,
+  `full-neardup`, `pack-series3`, `pack-neardup`.
+- **`SourceKind` registry** (`ytbrain/source_kinds.py`): Talk, Article and Book Chapter own their Locator and
+  Moment rules; locators, moments, the eval files and the runner dispatch to them (behaviour unchanged).
+- **Private plugin builds:** `assemble_plugin.py` warns when the pack holds private items and names the zip
+  `<id>-<version>-private.plugin`.
+- Dropped from the books plan: the Book-only Series cap, the within-Book near-duplicate merge, Section and
+  Book summaries (ADR-0014 amendment).
+- 7 new offline tests (268 in all).
+
+## 2026-09-30 (PDF Books: damaged ligatures and hyphens repaired when a PDF is parsed)
+
+- **Ligature repair:** some PDF fonts lose their ligatures (ff, fi, fl, ffi, ffl) and the text layer holds a
+  stand-in ("di@erent", "e&orts", "signi%cant", "pro1t", "in3uenced", "diKcult"), which verification could never
+  match. `ytbrain/books/ligatures.py` tries each stray symbol, digit or capital inside a word as every ligature
+  and accepts a result only if it is a word the language really has (the Book's own correctly spelled words, plus
+  `ytbrain/books/ligature_words.txt`, built from your transcripts by `scripts/ligature_words.py`). Brands,
+  ordinals, "R&D" and URLs are never touched; anything no ligature explains is left as printed and reported.
+  *The Lean Startup*: 603 damaged words repaired (310 distinct), 9-11 left (joined words like
+  "systematically8guring"); the other four books needed none.
+- **Hyphens:** a control character between letters is a hyphen in some fonts ("one\x02time"); it is now "-".
+  This changes the text of all five Books slightly.
+- `books inspect` shows the repairs and warns about the words it could not repair; the parse cache format is 3,
+  so cached parses are redone. After `sync --type book && clean`, Chapter transcripts change, so `extract`
+  treats them as new: re-run `extract`, `verify`, `index`. 8 new offline tests (261 in all).
+
+## 2026-09-30 (PDF Books, P2: Chapters through extract, verify and index)
+
+- **Chapter prompt:** book Chapters extract with the talk prompt reworded for a book (one source of truth, as for
+  articles): "Chapter / Book … by <authors> / Sections", `[p. n]` page markers, the authors given (never
+  generated), and a rule to keep the authors' own advice rather than lines they quote. No chaptering call: a
+  Chapter's headings are its Sections. `extract`, `verify` and `sample` take `--doc PREFIX`, so
+  `extract --doc <ISBN>` pilots one Book. The P1 hold on book Chapters is gone.
+- **Page Citations:** `locator: page` reads `p. 47` (printed page) or `PDF p. 47`, with no link for a private
+  PDF; pages render it bare, the coach returns `source_kind: chapter` with `page` and the book, and the citation
+  guide shows the format. Moments for Chapters are one PDF page (`<doc>_b<page>`).
+- **Book header:** a Chapter's items are indexed as `From the book "<Book>" by <authors> (<year>), chapter
+  "<Chapter>" — <Section>`; talks and articles keep theirs (the unused legacy chunk header now uses the Locator
+  label, so an Article no longer reads "at 00:00").
+- **Private stays private (moved up from P3):** Knowledge items carry `visibility`; `pack build` leaves private
+  items out unless `--include-private`, `pack.json` counts them, `scripts/release.py` refuses such a pack, and
+  the released eval never seeds from or labels them. An index built before the column reads as public.
+- 7 new offline tests (253 in all; the P1 extract-hold test is gone), incl. a Chapter end to end through extract (fake LLM), verify, pages, items
+  and Moments.
+
+## 2026-09-30 (PDF Books, P1: Chapters become Documents)
+
+- **`type: pdf_books` Sources:** `ytbrain sync --type book` registers one Document per Chapter
+  (`<ISBN-13>__<chapter-title>`), `ytbrain clean` writes their transcripts (paragraphs at `page * 1000 + n`,
+  `source_kind: chapter`, `locator: page`, `private: true`, the Book's given fields). Unchanged Chapters aren't
+  cleaned again; a removed book leaves the index; a refused or failing PDF never stops the others.
+- **Metadata, never from the LLM:** sources.yaml, then the copyright page (ebook ISBN, the book's own copyright
+  year), then the PDF's metadata (title/subtitle, "Last, First" and "A & B" authors), then Open Library by ISBN
+  when asked. Missing or suspect fields are flagged (e.g. a copyright-line author missing from the authors).
+- **`books inspect --expect FILE`** checks metadata and chapters against expected values; the five owned books
+  match 5/5. Per-file `chapters:` corrections rename, add or drop single chapter starts.
+- **PDFium is the default parser; Docling is parked** (`pdf-docling` extra), so books need no model download.
+- `extract` holds book Chapters until P2 (chapter prompt, page Citations). 15 new offline tests (39 in the suite).
+
+## 2026-09-29 (PDF Books, first slice)
+
+- **`ytbrain books inspect <pdf-or-folder>`** shows what the pipeline would make of a PDF Book before any
+  paid extraction: refused or not (encrypted, scanned), parse time, what was dropped (running headers and
+  footers, tables, figures, captions, footnotes), which chapter-detection method won and why the others
+  didn't, and each Chapter's printed pages and length. New `ytbrain/books/` package (probe, normalize, parse,
+  chapters, inspect) behind a `BookParser` seam; Docling via the new `pdf` extra; ADR-0014,
+  `docs/books-plan.md`, `docs/research/book-indexing.md`; glossary: Book, Chapter, Section. A seventh
+  offline suite, `tests/test_books.py` (24 tests), runs on tiny fixture PDFs with a fake parser (`pypdfium2` joins `dev`).
+- **Chapter detection** tries a manual list, the bookmarks (Parts and Sections opened into their chapters), the
+  printed contents page (entries matched to page openings, in order), the parser's headings, then page windows.
+- **`--parser pdfium`**: a model-free parser (about a second per book) for dry-runs and well-bookmarked PDFs.
+- **Refusals and warnings:** encrypted, scanned and garbled text layers (fonts without a text map) are refused;
+  a few garbled lines are dropped and reported. A Docling timeout or partial parse fails the book, never half of
+  it; one failing book never stops the others. `YTBRAIN_BOOK_TIMEOUT_S`, `YTBRAIN_BOOK_THREADS`.
+- **Dry-run on five books:** all five split correctly with the model-free parser.
+
 
 - **`assemble_plugin.py --zip`** writes `dist/<id>-<version>.plugin`, the file Cowork's Plugins page uploads. The
   README gained "Use the coach": installing uv and Claude Code, the Claude Code and Cowork steps, first run.

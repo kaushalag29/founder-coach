@@ -4,10 +4,17 @@ Every command is resumable: Ctrl+C keeps finished work, and re-running continues
 `uv pip install -e ".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"` (everything; `graph` and
 `asr` are optional), then `playwright install chromium` for JavaScript-only websites.
 
+## The whole loop (docs/ops.md)
+
+```bash
+ytbrain ops                 # ingest -> eval when the index changed -> plugin when it passed; resumable
+ytbrain ops --dry-run       # what is due
+```
+
 ## Tests (run after any change)
 
 ```bash
-for t in core eval pack coach plugin web; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
+for t in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
 ```
 
 ## Phase 1: corpus (sync → clean → extract → verify)
@@ -40,8 +47,10 @@ ytbrain search "..." --no-rerank --kind advice --json
 
 ```bash
 ytbrain eval build --set dev --limit 5            # smoke test in data/eval/smoke
-ytbrain eval build --set dev                      # the 150-question Tuning set (spend-capped, $5)
-ytbrain eval status
+ytbrain eval build                                # every Tuning split (talks, articles, books, private), spend-capped per split
+ytbrain eval build --top-up                       # grow each split to 20% of its Documents (at most)
+ytbrain eval build --set dev-private              # one split
+ytbrain eval status                               # each split's questions, target and spend
 ytbrain eval run --set dev --save-baseline        # full setup = the baseline
 ytbrain eval run --set dev --config no-rerank --compare full
 ytbrain eval run --set dev --config full-no-passages --compare full
@@ -50,6 +59,7 @@ ytbrain eval run --set dev --config pack-no-rerank --compare full
 ytbrain eval judge --set dev --config full --config pack   # grade Moments no judge has seen (pool extension)
 ytbrain eval rescore --set dev --config full --save-baseline      # score a saved run again, no search
 ytbrain eval rescore --set dev --config pack --compare full
+ytbrain eval rescore --config full --refresh-baseline   # the baseline, re-scored on new labels
 ```
 
 Exit codes: 0 pass, 1 regression, 3 inconclusive (read the verdict). After new Documents are
@@ -150,8 +160,21 @@ uv pip install -e ".[web]" && playwright install chromium   # once; the browser 
 ytbrain sync                          # every enabled Source: playlists and websites
 ytbrain sync --source <id> --limit 50 # one Source, at most 50 pages this run (the rest resume next run)
 ytbrain sync --type website           # only websites (talks found on them still get their captions)
+ytbrain sync --type book              # only PDF Books: one Document per Chapter (then `ytbrain clean`)
 ytbrain sync --type youtube           # only YouTube playlists
 ytbrain run                           # sync -> clean -> extract -> verify -> index, articles and talks alike
 ytbrain invalidate clean --source <id> # re-run one Step for one Source
 ytbrain drop --source <id>            # take a Source's Documents out of the knowledge (then `ytbrain index`)
+```
+
+## PDF Books (docs/books-plan.md)
+
+```bash
+ytbrain books inspect <pdf-or-folder> # refused or not, metadata, chapters found and how (no LLM; parse cached)
+ytbrain books inspect data/books --expect data/books/expected.yaml   # exit 1 on any mismatch
+ytbrain sync --type book && ytbrain clean
+ytbrain extract --doc <ISBN>          # one Book's Chapters (pilot), then plain `ytbrain extract`
+ytbrain verify --doc <ISBN> && ytbrain sample --doc <ISBN> --n 10
+ytbrain index                         # Books join the index, marked private
+ytbrain pack build --include-private --out data/pack-mine   # your own coach only; release refuses it
 ```

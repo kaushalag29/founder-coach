@@ -105,6 +105,36 @@ def test_pack_builds_verifies_and_searches_like_the_index():
     assert {r["item_id"] for r in store.document_items("CCCCCCCCCC3")} == {"tkw:CCCCCCCCCC3:01", "sum:CCCCCCCCCC3"}
 
 
+def test_private_items_stay_out_of_the_pack_unless_asked_and_release_refuses_them():
+    book = {**_row("adv:9780000000002__go:a01", "advice", "9780000000002__go", "charge your first customers early"),
+            "source_kind": "chapter", "visibility": "private", "deep_link": ""}
+    rows = ROWS + [book]
+    out = Path(tempfile.mkdtemp())
+    manifest, _ = _build(out, rows=rows)
+    store = P.PackStore(out, verify=True)
+    assert store.get(book["item_id"]) is None and manifest["private_items"] == 0 and manifest["items"] == 4
+    store.close()
+    mine = Path(tempfile.mkdtemp())
+    with contextlib.redirect_stdout(io.StringIO()):
+        manifest = build_pack(Source(rows), HashEmbed(), mine, rerank_model="none", say=lambda m: None,
+                              include_private=True)
+    assert manifest["private_items"] == 1 and P.PackStore(mine).get(book["item_id"]) is not None
+    import subprocess
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import release as R
+    with tempfile.TemporaryDirectory() as t:
+        root, mk = Path(t) / "repo", Path(t) / "marketplace"
+        root.mkdir()
+        (root / "product.toml").write_text((Path(__file__).resolve().parents[1] / "product.toml").read_text())
+        subprocess.run(["git", "init", "-q", str(mk)], check=True)
+        try:
+            R.release(root, mine, mk, validate=False, say=lambda m: None)
+        except R.ReleaseError as e:
+            assert "private items" in str(e)
+        else:
+            raise AssertionError("a pack holding your Books must never be released")
+
+
 def test_full_text_queries_are_literal_and_never_raise():
     out = Path(tempfile.mkdtemp())
     _build(out)

@@ -41,6 +41,7 @@ def pool_question(store, embed, reranker, question: str, rewrite: str | None, de
         ranked["rewrite"] = _hybrid(store, embed, rewrite, wide)
     out: dict[str, tuple[list[str], int]] = {}
     for name, results in ranked.items():
+        # every Source is pooled; the release puts private Documents' labels in the overlay (ADR-0014)
         for rank, m in enumerate(results_to_moments(results, depth), 1):
             variants, best = out.get(m, ([], rank))
             out[m] = (variants + [name], min(best, rank))

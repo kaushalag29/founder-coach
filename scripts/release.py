@@ -177,6 +177,12 @@ def release(root: Path, pack: Path, marketplace: Path, version: str | None = Non
     pid = prod["id"]
 
     # 1. checks, before anything changes
+    pack_manifest = (Path(pack).expanduser() / "pack.json" if Path(pack).expanduser().is_dir()
+                     else Path(pack).expanduser().with_name("pack.json"))
+    if pack_manifest.exists() and json.loads(pack_manifest.read_text()).get("private_items"):
+        raise ReleaseError(f"{pack} holds private items (your Books, `pack build --include-private`): "
+                           "rebuild it without that flag before releasing (ADR-0014)")
+
     if not _is_repo(marketplace):
         owner, name = prod["repos"].get("owner"), prod["repos"].get("marketplace")
         raise ReleaseError(f"{marketplace} isn't a git clone of the marketplace repo. Create the private repo "

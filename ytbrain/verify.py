@@ -16,7 +16,8 @@ from dataclasses import dataclass
 
 from .config import (EMPTY_RECORD_MIN_WORDS, EVIDENCE_CONTAINMENT_MIN_WORDS,
                      EVIDENCE_MIN_CONTAINMENT, EVIDENCE_MIN_JACCARD, EVIDENCE_WINDOW_SCALES,
-                     NARRATIVE_CATEGORIES, NO_ADVICE_FLAG_MIN_WORDS)
+                     NARRATIVE_CATEGORIES, NO_ADVICE_FLAG_MIN_WORDS, VERIFY_FAIL_RATE,
+                     VERIFY_PASS_RATE)
 
 _NORM = re.compile(r"[^a-z0-9' ]+")
 # Disfluencies are in the auto-captions but models drop them when quoting, so a
@@ -116,7 +117,7 @@ def record_issues(record: dict, utterances: list[dict]) -> list[str]:
         return [f"no highlights or advice from {words} words"]
     if (not record.get("advice_atoms") and words >= NO_ADVICE_FLAG_MIN_WORDS
             and record.get("category") not in NARRATIVE_CATEGORIES):
-        kind = "article" if record.get("source_kind") == "article" else "talk"
+        kind = record.get("source_kind") or "talk"
         return [f"no advice from a {record.get('category')} {kind} of {words} words"]
     return []
 
@@ -176,7 +177,7 @@ def verify_record(record: dict, utterances: list[dict],
     if issues:           # only when present: unchanged records keep byte-identical files
         record["extraction_meta"]["verification"]["issues"] = issues
     record["extraction_meta"]["validation_status"] = (
-        "failed" if pass_rate < 0.6 else "flagged" if pass_rate < 0.9 or issues else "pass"
+        "failed" if pass_rate < VERIFY_FAIL_RATE else "flagged" if pass_rate < VERIFY_PASS_RATE or issues else "pass"
     )
     return {"checked": checked, "failed": failed, "pass_rate": pass_rate, "details": details,
             "issues": issues}

@@ -248,6 +248,9 @@ def test_zip_packages_the_shipped_plugin_for_cowork():
         assert not [n for n in names if n.endswith((".pyc", ".DS_Store")) or "embed-cache" in n or n.startswith("evals/")]
         assert zipfile.ZipFile(z).testzip() is None
         assert A.zip_plugin(out) == z, "re-zipping overwrites the same file"
+        (out / "pack" / "pack.json").write_text(json.dumps({"private_items": 12}))
+        assert A.private_items(out) == 12
+        assert A.zip_plugin(out).name == f"{m['name']}-{m['version']}-private.plugin", "a private pack says so"
 
 
 def test_assembler_refuses_a_missing_pack_and_a_failed_check_without_touching_the_last_build():

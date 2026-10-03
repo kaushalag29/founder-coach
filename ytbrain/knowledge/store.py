@@ -14,10 +14,11 @@ from ..config import KNOWLEDGE_TABLE, LANCE_DIR
 
 STRING_COLS = ("item_id", "kind", "doc_id", "text", "evidence", "deep_link", "source_kind",
                "series", "title", "speaker", "provenance", "published_at", "stage_origin",
-               "context_header", "indexable", "embed_model")
+               "context_header", "indexable", "embed_model", "visibility")
 LIST_COLS = ("stages", "topics")
 INT_COLS = ("start_ms", "end_ms", "year")
-COLUMN_DEFAULTS = {"source_kind": "talk"}     # for rows written before the column existed
+COLUMN_DEFAULTS = {"source_kind": "talk",     # for rows written before the column existed
+                   "visibility": "public"}
 
 
 def _schema(dim: int):
@@ -145,12 +146,18 @@ class KnowledgeStore:
 
     def rows(self, kinds: list[str] | None = None, columns: list[str] | None = None) -> list[dict]:
         """Every item (optionally of some kinds), without vectors unless asked for."""
-        cols = columns or [c for c in STRING_COLS + LIST_COLS + INT_COLS]
+        have = set(self._t.schema.names)       # an index built before a column existed lacks it
+        cols = [c for c in columns or STRING_COLS + LIST_COLS + INT_COLS if c in have]
         q = self._t.search().select(cols)
         where = where_clause(kinds=kinds)
         if where:
             q = q.where(where)
-        return q.limit(max(1, self.count())).to_list()
+        out = q.limit(max(1, self.count())).to_list()
+        for r in out:
+            for c, v in COLUMN_DEFAULTS.items():
+                if c not in r and (columns is None or c in columns):
+                    r[c] = v
+        return out
 
     def document_items(self, doc_id: str) -> list[dict]:
         return self._t.search().where(f"doc_id = {_q(doc_id)}").limit(10_000).to_list()

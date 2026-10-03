@@ -24,11 +24,11 @@ Follow the coaching contract of the coach skill throughout: cite only retrieved 
 ```
 **Short answer:** one or two sentences.
 
-**<Part 1>**: the advice with inline Citations (speaker, talk, year · mm:ss).
+**<Part 1>**: the advice with inline Citations: a talk (speaker, title, year · mm:ss), an article (author, title, year), a book (author, book, PDF p. N, unlinked).
 **<Part 2>**: …
 
-**Where talks disagree:** only if they do.
-**Gaps:** what the talks don't cover, and "general knowledge" for anything said without a Citation.
+**Where sources disagree:** only if they do.
+**Gaps:** what the sources don't cover, and "general knowledge" for anything said without a Citation.
 **For you:** one line applying it to the Founder's Stage and Goals.
 ```
 

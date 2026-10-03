@@ -2,8 +2,9 @@
 and the coach runtime (Knowledge pack), so eval numbers describe what founders run.
 
 vector top-N + full-text top-N -> reciprocal-rank fusion -> optional cross-encoder
-rerank -> soft boosts (Stage [ADR-0005], kind, recency) -> diversity cap per Document.
-Hard filters only when the caller asks.
+rerank -> soft boosts (Stage [ADR-0005], kind, recency) -> a DiversityPolicy. Hard filters
+only when the caller asks. Nothing here looks at a result's source kind: talks, articles and
+book chapters compete on relevance alone (ADR-0014, amendment 2026-09-30).
 
 A store is anything with `ready`, `vector_search(vector, filter, limit)` and
 `text_search(query, filter, limit)` returning row dicts that carry `item_id` plus the
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -97,29 +99,110 @@ def boosts(row: dict, stage: str | None, this_year: int) -> float:
     return b
 
 
+# -- diversity -------------------------------------------------------------------------------
+# A result list is kept readable by small rules, each deciding whether the next result (in rank
+# order) joins the ones already kept. Rules are source-agnostic; a new one is a class with
+# `admits`, and a policy is chosen by the eval (`ytbrain eval run --config full-<policy>`).
+
+class DiversityRule(Protocol):
+    def admits(self, row: dict, kept: list[dict]) -> bool: ...
+
+
+def _quote(row: dict) -> str:
+    return " ".join((row.get("evidence") or "").lower().split())
+
+
+@dataclass(frozen=True)
+class SameQuote:
+    """One result per quote per Document: an advice item and a takeaway often cite the same sentence."""
+
+    def admits(self, row, kept):
+        q = _quote(row)
+        return not q or not any(k["doc_id"] == row["doc_id"] and _quote(k) == q for k in kept)
+
+
+@dataclass(frozen=True)
+class PerDocumentCap:
+    """At most `n` results from one Document."""
+    n: int = MAX_PER_DOCUMENT
+
+    def admits(self, row, kept):
+        return sum(k["doc_id"] == row["doc_id"] for k in kept) < self.n
+
+
+@dataclass(frozen=True)
+class PerSeriesCap:
+    """At most `n` of the first `window` results from one Series (a playlist, a blog, a book).
+    Results without a Series are never capped; past the window nothing is."""
+    n: int = 3
+    window: int = 10
+
+    def admits(self, row, kept):
+        series = row.get("series")
+        if not series or len(kept) >= self.window:
+            return True
+        return sum(k.get("series") == series for k in kept) < self.n
+
+
+_WORD = re.compile(r"[a-z0-9']+")
+
+
+def _words(row: dict) -> frozenset[str]:
+    return frozenset(_WORD.findall((row.get("text") or "").lower()))
+
+
+@dataclass(frozen=True)
+class NearDuplicateCollapse:
+    """Drop a result whose text says what a kept one already says (word-set Jaccard >= threshold),
+    whichever Documents or sources they come from: the higher-ranked one stays."""
+    threshold: float = 0.8
+
+    def admits(self, row, kept):
+        a = _words(row)
+        if not a:
+            return True
+        for k in kept:
+            b = _words(k)
+            if b and len(a & b) / len(a | b) >= self.threshold:
+                return False
+        return True
+
+
+@dataclass(frozen=True)
+class DiversityPolicy:
+    """Rules applied in order to a ranked list; a result is kept when every rule admits it."""
+    rules: tuple = (SameQuote(), PerDocumentCap())
+
+    def apply(self, rows: list[dict]) -> list[dict]:
+        kept: list[dict] = []
+        for r in rows:
+            if all(rule.admits(r, kept) for rule in self.rules):
+                kept.append(r)
+        return kept
+
+    def with_rule(self, rule) -> DiversityPolicy:
+        return DiversityPolicy(self.rules + (rule,))
+
+
+DEFAULT_POLICY = DiversityPolicy()
+# Candidate policies, measured by the eval before any becomes the default (docs/eval-spec.md §7)
+POLICIES = {
+    "default": DEFAULT_POLICY,
+    "series3": DEFAULT_POLICY.with_rule(PerSeriesCap(3, 10)),
+    "neardup": DEFAULT_POLICY.with_rule(NearDuplicateCollapse(0.8)),
+}
+
+
 def diversify(rows: list[dict], per_doc: int = MAX_PER_DOCUMENT) -> list[dict]:
-    """At most `per_doc` results per Document, and one per quote: an advice item and
-    a takeaway often cite the same sentence, which read as a duplicate result."""
-    seen: dict[str, int] = {}
-    quotes: set[tuple[str, str]] = set()
-    out = []
-    for r in rows:
-        q = " ".join((r.get("evidence") or "").lower().split())
-        if q and (r["doc_id"], q) in quotes:
-            continue
-        n = seen.get(r["doc_id"], 0)
-        if n < per_doc:
-            out.append(r)
-            seen[r["doc_id"]] = n + 1
-            if q:
-                quotes.add((r["doc_id"], q))
-    return out
+    """The default policy (one result per quote, at most `per_doc` per Document)."""
+    return DiversityPolicy((SameQuote(), PerDocumentCap(per_doc))).apply(rows)
 
 
 def search(store: Store, embed: Embed, query: str, *, stage: str | None = None,
            kinds: list[str] | None = None, topics: list[str] | None = None,
            require_stage: bool = False, top_k: int = 8, reranker: Reranker | None = None,
-           candidates: int = SEARCH_CANDIDATES, info: dict | None = None) -> list[dict]:
+           candidates: int = SEARCH_CANDIDATES, info: dict | None = None,
+           diversity: DiversityPolicy = DEFAULT_POLICY) -> list[dict]:
     """Ranked Knowledge items for `query`, each with `score` and Citation fields. If `info`
     is given, it receives `top_similarity`: the cosine similarity of the closest item (from
     stores that report it), an absolute signal for Gaps that reranking can't distort."""
@@ -147,4 +230,4 @@ def search(store: Store, embed: Embed, query: str, *, stage: str | None = None,
         out.append({**{f: r.get(f) for f in PUBLIC_FIELDS},
                     "relevance": round(rel[i], 4),
                     "score": round(rel[i] + boosts(r, stage, this_year), 4)})
-    return diversify(out)[:top_k]
+    return diversity.apply(out)[:top_k]

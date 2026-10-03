@@ -14,15 +14,35 @@ The type of content a Document is: talk, article, podcast episode, book chapter,
 _Avoid_: format, media type, essay (an essay is an article)
 
 **Source type**:
-How ytbrain reaches a Source: a YouTube playlist, a website, and later a list of PDFs.
+How ytbrain reaches a Source: a YouTube playlist, a website, or a folder or list of PDF books.
 _Avoid_: kind (that is the Source kind), connector, provider
 
 **Article**:
 A Document whose Source kind is written text published on a web page: an essay, a blog post, a guide.
 _Avoid_: page (a page is only where it lives), post, essay
 
+**Book**:
+One published book, ingested from one PDF, with a given title, author and year. A Book is not a Document: each of its Chapters is.
+_Avoid_: PDF (that is only the file), volume, ebook
+
+**Chapter**:
+A Document whose Source kind is one chapter of a Book, including its introduction and conclusion but not front or back matter (contents, acknowledgements, notes, index).
+_Avoid_: part, section (a Section is inside a Document)
+
+**Section**:
+A titled segment inside one Document, found by the extractor or given by the uploader (a talk's YouTube chapters, an article's headings, a Chapter's subheadings).
+_Avoid_: chapter (that is a Book's), segment
+
+**Private Source**:
+A Source whose Documents are indexed and coached from on this machine but never shipped in a Knowledge pack or the released Eval (every Book in v1). Set by the Source (`distribute: false`), never by its kind.
+_Avoid_: internal, hidden, personal source
+
+**Source kind**:
+What sort of Document a Source yields (Talk, Article, Chapter), which decides its Locator and its Moments. Ranking never looks at it: every kind competes on relevance alone.
+_Avoid_: source type (the config's `type` is how it is fetched), medium, format
+
 **Document**:
-One ingested unit of content from a Source — a single talk, article or chapter — identified by a stable document id.
+One ingested unit of content from a Source — a single talk, article or Chapter — identified by a stable document id.
 _Avoid_: video (except when the Source kind is talk), page, item
 
 **Talk**:
@@ -30,7 +50,7 @@ A Document whose Source kind is a recorded talk or interview (today: a YouTube v
 _Avoid_: video (in domain language), clip, lecture
 
 **Series**:
-The named collection a Document belongs to, taken from its Source (e.g. "Startup School 2026"). A catch-all Source never overrides a more specific Series.
+The named collection a Document belongs to, taken from its Source (e.g. "Startup School 2026"); for a Chapter, its Book's title. A catch-all Source never overrides a more specific Series.
 _Avoid_: playlist (in domain language), collection
 
 **Transcript**:
@@ -42,11 +62,11 @@ A contiguous span of a Document's text with a Locator; the unit of full-text ret
 _Avoid_: chunk (implementation term), snippet, segment
 
 **Locator**:
-Where in a Document something is: a timestamp for a Talk, a paragraph number for an Article, a page for a PDF.
+Where in a Document something is: a timestamp for a Talk, a paragraph number for an Article, a page for a Chapter (the Book's printed page number when it has one).
 _Avoid_: offset, position
 
 **Speaker**:
-The person a Document's advice comes from: who spoke in a Talk, who wrote an Article.
+The person a Document's advice comes from: who spoke in a Talk, who wrote an Article or a Book.
 _Avoid_: author (as a separate concept), presenter
 
 ## Knowledge
@@ -150,7 +170,7 @@ _Avoid_: skill (implementation term), workflow, template
 ## Evaluation
 
 **Moment**:
-A fixed window of a Document that Eval labels point at, so labels survive re-extraction: two minutes of a Talk starting on a whole minute, or six paragraphs of an Article starting on every third.
+A fixed window of a Document that Eval labels point at, so labels survive re-extraction: two minutes of a Talk starting on a whole minute, six paragraphs of an Article starting on every third, or one page of a Chapter.
 _Avoid_: segment, clip, chunk
 
 **Eval question**:
@@ -160,6 +180,10 @@ _Avoid_: test case, query (the text alone), golden question
 **Tuning set**:
 Eval questions generated from the corpus, used to choose search settings and to catch regressions on every change.
 _Avoid_: training set (nothing is trained), dev set, validation set
+
+**Private overlay**:
+The part of the Tuning set that never leaves your machine: labels on Private Sources' Moments for every Eval question, and the Eval questions written from Private Sources. Scored together with the released questions, so one benchmark covers every Source you index.
+_Avoid_: private eval, second benchmark, book eval
 
 **Holdout set**:
 Real founder Eval questions collected from public sources outside the corpus, never used to choose settings, reported only at milestone ends.

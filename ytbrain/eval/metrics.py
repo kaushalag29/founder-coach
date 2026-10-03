@@ -42,6 +42,19 @@ def judged(qrel: dict[str, int], ranked: list[str], k: int = 10) -> float:
     return sum(d in qrel for d in top) / len(top) if top else 0.0
 
 
+def kind_mix(rankings: list[list[str]], k: int = 10) -> dict[str, float]:
+    """{source kind: share of all top-k Moments}: what the answers are made of (a diagnostic;
+    every source competes on relevance alone, so no share is a target)."""
+    from .moments import moment_kind
+    counts: dict[str, int] = {}
+    for ranked in rankings:
+        for m in ranked[:k]:
+            kind = moment_kind(m)
+            counts[kind] = counts.get(kind, 0) + 1
+    total = sum(counts.values())
+    return {kind: round(n / total, 4) for kind, n in sorted(counts.items())} if total else {}
+
+
 METRICS = {
     "ndcg@10": lambda q, r: ndcg(q, r, 10),
     "ndcg@10-l2": lambda q, r: ndcg(q, r, 10, 2),

@@ -29,7 +29,7 @@ When the Founder reports how their week or Commitments went, follow the check-in
 
 Lead with the recommendation, then the reasoning with inline Citations, then Gaps.
 
-A Citation is a markdown link right after the claim: the text is speaker, talk title, year and mm:ss, and the target is the hit's link exactly as the tool returned it, e.g. ([Michael Seibel, "How to Price", 2019 · 12:40](https://www.youtube.com/watch?v=…&t=760s)). An article has no timestamp. Never build a link by hand, and keep item_ids out of what the Founder reads. Everything needed is here; [references/citations.md](references/citations.md) (quotes, articles) and [references/stages.md](references/stages.md) (what each Stage means) are only for edge cases.
+A Citation is a markdown link right after the claim: the text is speaker, talk title, year and mm:ss, and the target is the hit's link exactly as the tool returned it, e.g. ([Michael Seibel, "How to Price", 2019 · 12:40](https://www.youtube.com/watch?v=…&t=760s)). An article has no timestamp; a book chapter cites its book and PDF page, unlinked. Never build a link by hand, and keep item_ids out of what the Founder reads. Everything needed is here; [references/citations.md](references/citations.md) (quotes, articles) and [references/stages.md](references/stages.md) (what each Stage means) are only for edge cases.
 
 ## Gotchas
 

@@ -3,30 +3,51 @@
 Pure functions, no I/O. A talk's Moment starts on every whole minute and lasts two minutes, so
 consecutive Moments overlap by one (the TREC Podcasts convention); id `<youtube id>_<start s>`.
 An article's Locator is a paragraph number (ADR-0013): its Moment is ARTICLE_MOMENT_PARAS
-paragraphs starting every ARTICLE_MOMENT_STEP, id `<doc id>_p<start paragraph>`. Labels name
+paragraphs starting every ARTICLE_MOMENT_STEP, id `<doc id>_p<start paragraph>`. A Book
+Chapter's Locator is page * 1000 + paragraph (ADR-0014): its Moment is one PDF page, id
+`<doc id>_b<page>` (a page is ~300 words, about a two-minute read). Labels name
 Moments, never Knowledge items, so they survive re-extraction and any chunking can map onto them.
+Each rule lives in its kind's class (ytbrain/source_kinds.py); these functions dispatch to it.
 """
 from __future__ import annotations
 
-from ..config import ARTICLE_MOMENT_PARAS, ARTICLE_MOMENT_STEP, MOMENT_S, MOMENT_STEP_S
+from .. import source_kinds as K
+from ..config import MOMENT_S, MOMENT_STEP_S
+
 
 def moment_id(youtube_id: str, start_s: int) -> str:
-    return f"{youtube_id}_{int(start_s):05d}"
+    return K.TALK.moment_id(youtube_id, start_s)
 
 
 def is_article(doc_id: str) -> bool:
-    return str(doc_id).startswith("w-")          # website Documents (ytbrain.web.urls.doc_id)
+    return K.ARTICLE.owns_doc(doc_id)
+
+
+def is_book(doc_id: str) -> bool:
+    """A Book Chapter: `<book id>__<chapter>`, never 11 characters (a YouTube id's length)."""
+    return K.BOOK_CHAPTER.owns_doc(doc_id)
+
+
+def moment_locator(mid: str) -> str:
+    """What a Moment's start counts: 'time' (seconds), 'paragraph' or 'page'."""
+    return K.for_moment(mid).locator
+
+
+def moment_kind(mid: str) -> str:
+    """The source kind of a Moment: 'talk', 'article', 'chapter', ..."""
+    return K.for_moment(mid).name
 
 
 def is_article_moment(mid: str) -> bool:
-    return mid.rsplit("_", 1)[-1].startswith("p")
+    return K.for_moment(mid) is K.ARTICLE
 
 
 def parse_moment_id(mid: str) -> tuple[str, int]:
-    """(doc id, start): seconds for a talk, a paragraph number for an article. The start is
-    after the last '_' (YouTube ids may contain '_' themselves)."""
+    """(doc id, start): seconds for a talk, a paragraph number for an article, a page for a Book
+    Chapter. The start is after the last '_' (YouTube ids may contain '_' themselves)."""
     doc, tail = mid.rsplit("_", 1)
-    return doc, int(tail[1:] if tail.startswith("p") else tail)
+    tag = K.for_moment(mid).moment_tag
+    return doc, int(tail[len(tag):])
 
 
 def moment_for(doc_id: str, locator: int | None) -> str | None:
@@ -34,30 +55,21 @@ def moment_for(doc_id: str, locator: int | None) -> str | None:
     None without a Locator (Document summaries score at Document level only)."""
     if locator is None or locator < 0:
         return None
-    if is_article(doc_id):
-        n = max(1, int(locator))
-        return f"{doc_id}_p{(n - 1) // ARTICLE_MOMENT_STEP * ARTICLE_MOMENT_STEP + 1:05d}"
-    return moment_id(doc_id, (int(locator) // 1000 // MOMENT_STEP_S) * MOMENT_STEP_S)
+    k = K.for_doc(doc_id)
+    return k.moment_id(doc_id, k.moment_start(locator))
 
 
 def moment_url(mid: str, doc_url: str | None = None) -> str:
     """A link to the Moment: the talk at its second; an article's page (the caller knows its URL)."""
-    doc, s = parse_moment_id(mid)
-    if is_article_moment(mid):
-        return doc_url or ""
-    return f"https://www.youtube.com/watch?v={doc}&t={s}s"
+    doc, start = parse_moment_id(mid)
+    return K.for_moment(mid).moment_url(doc, start, doc_url)
 
 
-def moment_text(utterances: list[dict], start_s: int, article: bool = False) -> str:
-    """Text of one Moment: every unit overlapping its window (seconds for a talk, paragraph
-    numbers for an article, whose units' start_ms/end_ms ARE paragraph numbers)."""
-    if article:
-        lo, hi = start_s, start_s + ARTICLE_MOMENT_PARAS
-        return " ".join(u.get("text", "") for u in utterances if lo <= int(u.get("start_ms", 0)) < hi).strip()
-    lo, hi = start_s * 1000, (start_s + MOMENT_S) * 1000
-    return " ".join(u.get("text", "") for u in utterances
-                    if int(u.get("start_ms", 0)) < hi and int(u.get("end_ms", u.get("start_ms", 0))) > lo
-                    ).strip()
+def moment_text(utterances: list[dict], start_s: int, article: bool = False,
+                locator: str | None = None) -> str:
+    """Text of one Moment from its Document's units. `locator` is `moment_locator(mid)`;
+    `article=True` means 'paragraph'."""
+    return K.by_locator("paragraph" if article else locator).moment_text(utterances, start_s)
 
 
 def results_to_moments(results: list[dict], k: int | None = None) -> list[str]:

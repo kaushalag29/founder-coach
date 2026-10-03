@@ -35,6 +35,7 @@ from ..config import (EXTRACT_MAX_REPAIRS, GROUNDING_RETRY_BELOW, LLM_BACKEND, L
                       LLM_SEED, LLM_TEMPERATURE, SCHEMA_VERSION,
                       SINGLE_CALL_MAX_TOKENS, TOKENS_PER_WORD,
                       WORDS_PER_ADVICE, WORDS_PER_HIGHLIGHT)
+from .. import source_kinds
 from . import prompts
 from .schema import (AdviceAtom, Chapter, ChapterList, ExtractionMeta, Generated, Highlight,
                      Overview, VideoMetadata)
@@ -495,8 +496,8 @@ def resolve_chapters(transcript: dict, uploader_chapters: list[dict],
     """Uploader chapters win. They are exact, human-authored and free."""
     if uploader_chapters:
         return [Chapter(**c) for c in uploader_chapters], "uploader"
-    if _P().kind == "article":
-        return [], "none"       # an article's sections are its headings; none means one section
+    if _P().kind in ("article", "chapter"):
+        return [], "none"       # their sections are their headings; none means one section
     _step(on_step, "chaptering")
     prompt = _P().CHAPTER_PROMPT.format(
         schema=json.dumps(ChapterList.model_json_schema(), indent=2),
@@ -537,6 +538,8 @@ def snap_chapters(chapters: list[Chapter], utterances: list[dict]) -> list[Chapt
 
 def est_tokens(utterances: list[dict]) -> int:
     return int(sum(len(u.get("text", "").split()) for u in utterances) * TOKENS_PER_WORD)
+
+
 
 
 def _P():
@@ -612,22 +615,26 @@ def _extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
             else:
                 grounding["kept"] = "first"
 
-    article = _P().kind == "article"
+    kind = _P().kind
+    talk = kind == "talk"
     fields = gen.model_dump()
-    if article and meta.get("speaker"):
-        fields["speaker"] = meta["speaker"]      # given (the page's declared author) beats generated
+    if not talk and meta.get("speaker"):
+        fields["speaker"] = meta["speaker"]      # given (the page's author, the Book's authors) beats generated
     return VideoMetadata(
         **fields,
         doc_id=meta["doc_id"],
         title_raw=meta.get("title") or "",
-        url=meta.get("url") or f"https://www.youtube.com/watch?v={meta['doc_id']}",
+        # a talk's link is its video; a private Book has no url, so its Citation is its page label
+        url=meta.get("url") or (f"https://www.youtube.com/watch?v={meta['doc_id']}" if talk else ""),
         series=meta.get("series"),
         provenance=meta.get("provenance") or "yc-official",
         published_at=meta.get("published_at"),
         duration_s=meta.get("duration_s"),
-        caption_kind=meta.get("caption_kind") or ("none" if article else "auto"),
-        source_kind="article" if article else "talk",
-        locator="paragraph" if article else "time",
+        caption_kind=meta.get("caption_kind") or ("auto" if talk else "none"),
+        source_kind=kind,
+        locator=source_kinds.by_name(kind).locator,
+        private=bool(meta.get("private")),
+        page_labels=meta.get("page_labels") or {},
         chapters=chapters,
         extraction_meta=ExtractionMeta(
             model=LLM_MODEL, backend=backend, schema_version=SCHEMA_VERSION,
@@ -653,15 +660,15 @@ def _problems(gen: Generated, utterances: list[dict], found: int, checked: int,
     from ..verify import find_evidence
     out = []
     if checked and found / checked < GROUNDING_RETRY_BELOW:
-        missing = [it.evidence_span for it in list(gen.highlights) + list(gen.advice_atoms)
-                   if not find_evidence(it.evidence_span or "", utterances).ok][:8]
+        missing = list(dict.fromkeys(it.evidence_span for it in list(gen.highlights) + list(gen.advice_atoms)
+                                     if not find_evidence(it.evidence_span or "", utterances).ok))[:8]
         out.append(f"- Only {found} of {checked} evidence quotes appear in the transcript. "
                    "These were NOT found (they read like paraphrases or quotes from memory):")
         out += [f'    "{q[:160]}"' for q in missing]
     if not checked:
         out.append("- You returned no highlights or advice.")
     if not gen.advice_atoms and words >= NO_ADVICE_RETRY_MIN_WORDS:
-        out.append("- You returned no advice atoms. If the talk recommends anything a founder "
+        out.append(f"- You returned no advice atoms. If the {_P().kind} recommends anything a founder "
                    "could act on, extract it as advice atoms (imperative, one idea each, with "
                    "its own quote); if it truly contains none, say so in unknowns_and_gaps.")
         if gen.highlights:
@@ -671,12 +678,20 @@ def _problems(gen: Generated, utterances: list[dict], found: int, checked: int,
     return "\n".join(out)
 
 
+def _series(meta: dict) -> str:
+    """The prompt's Series line; a Book's names its authors too ("Zero to One by Peter Thiel...")."""
+    series = meta.get("series") or "(none)"
+    if _P().kind == "chapter" and meta.get("speaker"):
+        series += f" by {meta['speaker']}"
+    return series
+
+
 def _extract_once(utterances: list[dict], meta: dict, chapter_titles: str, backend: str,
                   on_step: Step = None, calls: list[dict] | None = None,
                   feedback: str = "", kind: str = "extract"):
     budget = item_budget(sum(len(u.get("text", "").split()) for u in utterances))
     prompt = _P().EXTRACT_PROMPT.format(
-        title=meta.get("title", ""), series=meta.get("series") or "(none)",
+        title=meta.get("title", ""), series=_series(meta),
         chapter_titles=chapter_titles,
         max_highlights=budget[0], max_advice=budget[1],
         schema=json.dumps(Generated.model_json_schema(), indent=2),
@@ -766,7 +781,7 @@ def _extract_windowed(utterances: list[dict], chapters: list[Chapter], meta: dic
     if len(parts) > 1:
         _step(on_step, "overview")
         prompt = _P().OVERVIEW_PROMPT.format(
-            title=meta.get("title", ""), series=meta.get("series") or "(none)",
+            title=meta.get("title", ""), series=_series(meta),
             summaries="\n".join(f"- {p.summary}" for p in parts),
             takeaways="\n".join(f"- {h.text}" for h in merged.highlights),
             schema=json.dumps(Overview.model_json_schema(), indent=2))

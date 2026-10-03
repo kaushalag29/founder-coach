@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import queue
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field as dc_field
@@ -111,13 +112,21 @@ def _progress(done: int, total: int, started: float, budget: Budget | None, spen
     return " · ".join(parts)
 
 
+HEDGE_MIN_S = 30        # never ask again before a call has waited this long...
+HEDGE_FACTOR = 5        # ...and not before it is this many times slower than the typical call
+
+
 def run_parallel(jobs: list, work: Callable, on_result: Callable, *, workers: int,
                  budget: Budget | None = None, label: str = "", heartbeat_s: float = 30,
-                 deadline_s: float | None = None) -> str | None:
+                 deadline_s: float | None = None, hedge_s: float | None = None) -> str | None:
     """Run `work(job)` for each job on daemon threads; call `on_result(job, result, error)`
     on this thread as each finishes. Returns None when all jobs ran, or why it stopped
     early ("budget" / "backend: ..."). Unfinished jobs are left for the next run.
 
+    A call much slower than its siblings (`hedge_s`; default: 5x the median call, at least 30 s)
+    is asked again in parallel and the first answer wins (never while the provider is rate-limiting us,
+    when waiting is the right answer): a provider that hangs on one request
+    answers the repeat in seconds, so the last job of a batch no longer waits for the deadline.
     A call still running after `deadline_s` (default: 3x the per-call timeout, which a
     provider trickling bytes never trips) is given up on: reported as failed, its worker
     replaced, and its late answer ignored, so one stuck request can't hold the whole step."""
@@ -131,6 +140,9 @@ def run_parallel(jobs: list, work: Callable, on_result: Callable, *, workers: in
     stop = threading.Event()
     inflight: dict[str, tuple[float, int]] = {}          # thread -> (call started, job index)
     abandoned: set[int] = set()
+    hedged: set[int] = set()                             # jobs asked a second time
+    completed: set[int] = set()                          # jobs whose first answer was taken
+    durations: list[float] = []                          # seconds taken by calls that answered
     lock = threading.Lock()
 
     def worker() -> None:
@@ -143,18 +155,22 @@ def run_parallel(jobs: list, work: Callable, on_result: Callable, *, workers: in
             if budget and budget.exhausted:
                 stop.set()
                 return
+            t0 = time.time()
             with lock:
-                inflight[me] = (time.time(), i)
+                inflight[me] = (t0, i)
+            result, err = None, None
             try:
-                done.put((i, job, work(job), None))
+                result = work(job)
             except BackendUnavailable as e:
                 stop.set()
-                done.put((i, job, None, e))
+                err = e
             except Exception as e:                       # one job's failure never stops the rest
-                done.put((i, job, None, e))
-            finally:
-                with lock:
-                    inflight.pop(me, None)
+                err = e
+            with lock:                                   # leave `inflight` before reporting, so the
+                inflight.pop(me, None)                   # loop below sees only the OTHER attempts
+                if err is None:
+                    durations.append(time.time() - t0)
+            done.put((i, job, result, err))
             if i in abandoned:                           # replaced while stuck: let the new one work
                 return
 
@@ -189,6 +205,22 @@ def run_parallel(jobs: list, work: Callable, on_result: Callable, *, workers: in
                     errors[msg[:60]] = errors.get(msg[:60], 0) + 1
                     on_result(jobs[i], None, TimeoutError(msg))
                     threads.append(spawn())
+            with lock:
+                typical = statistics.median(durations) if len(durations) >= 5 else None
+            hedge_after = hedge_s if hedge_s is not None else (
+                max(HEDGE_MIN_S, HEDGE_FACTOR * typical) if typical is not None else None)
+            # Slow because the provider is rate-limiting us (429s, backoff, a halved request rate) is not
+            # a hung call: a repeat would only add load and cost, so wait instead.
+            rate_limited = runner.current_rpm() < runner.rpm_ceiling() - 0.5
+            if hedge_after is not None and not rate_limited:
+                for name, (t0, i) in calls:
+                    if now - t0 > hedge_after and i not in hedged and i not in abandoned and i not in completed:
+                        hedged.add(i)
+                        todo.put((i, jobs[i]))
+                        threads.append(spawn())
+                        print(f"    {label}: a call has waited {now - t0:.0f}s"
+                              + (f" (typical {typical:.0f}s)" if typical is not None else "")
+                              + "; asking again in parallel, the first answer wins", flush=True)
             if now - last >= heartbeat_s:
                 last = now
                 waiting = ""
@@ -200,8 +232,14 @@ def run_parallel(jobs: list, work: Callable, on_result: Callable, *, workers: in
                                   "anything unfinished is redone on the next run)" if oldest > 60 else ""))
                 print(f"    {label}: {_progress(finished, len(jobs), started, budget, spent0)}{waiting}", flush=True)
             continue
-        if i in abandoned:
-            continue                                     # a late answer for a job already given up on
+        if i in abandoned or i in completed:
+            continue                                     # a late answer for a job already settled
+        if err is not None and not isinstance(err, BackendUnavailable) and i in hedged:
+            with lock:
+                other_running = any(idx == i for _, idx in inflight.values())
+            if other_running:
+                continue                                 # the repeat of this call may still answer
+        completed.add(i)
         finished += 1
         if isinstance(err, BackendUnavailable):
             stopped = f"backend: {err}"

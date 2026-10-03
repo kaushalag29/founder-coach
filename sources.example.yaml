@@ -35,3 +35,22 @@ sources:
 # - type: website
 #   url: https://www.ycombinator.com/library
 #   render: always                     # a JavaScript site
+
+# PDF Books you own (ADR-0014): one Document per Chapter, text only, private (never in the Knowledge pack).
+# Title, subtitle, authors, year and ISBN are detected (copyright page, then the PDF's metadata); correct
+# only what is wrong. Check first: ytbrain books inspect data/books
+# - type: pdf_books
+#   path: data/books                   # a folder (every PDF in it and in any subfolder you add, e.g. startup/,
+#                                      # leadership/, finance/; the caches are skipped) or one file; relative to the repo
+#   # or several:  path: [data/books/startup, ~/Documents/more-books]   (file names must be unique)
+#   distribute: false                  # books are private: the only value in v1
+#   lookup: openlibrary                # optional: fill still-missing fields from openlibrary.org by ISBN
+#   books:                             # optional, by file name
+#     "Zero to One.pdf":
+#       authors: [Peter Thiel, Blake Masters]
+#       subtitle: Notes on Startups, or How to Build the Future
+#     "The Lean Startup.pdf":
+#       chapters:                      # corrects the detected split; page = printed label or PDF page
+#         - {page: 274, title: Join the Movement}   # renames the chapter that starts there
+#         - {page: 12, skip: true}                  # a detected start that isn't one
+#       # chapters_only: true          # use exactly this list instead of detection

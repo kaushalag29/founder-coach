@@ -25,8 +25,21 @@ paragraphs starting every third paragraph (about a two-minute read, the same 50 
 
 | Split | BEIR name | Size | Origin | Use |
 |---|---|---|---|---|
-| Tuning set | `dev` | 150 | Generated from our corpus | Choosing settings; every change |
+| Tuning set: talks | `dev` | 150 | Generated from Talks | Choosing settings; every change |
+| Tuning set: articles | `dev-articles` | 20% of Articles (at most) | Generated from public Articles | Same; released like `dev` |
+| Tuning set: public books | `dev-chapters` | 20% of Chapters (at most) | Generated from public Book Chapters (none today) | Same; released like `dev` |
+| Tuning set: private | `dev-private` | 20% of their Documents (at most) | Generated from Private Sources (Books today) | Same; private overlay only, never released |
 | Holdout set | `test` | ≤ 50 | Real founder questions: a pre-2024 CC BY-SA Startups Stack Exchange dump (archive.org; the current dumps need a login and forbid LLM training); YC Office Hours later | Milestone ends only; never used to choose anything |
+
+The Tuning set is one question set per kind of Source the questions are written from (amendment
+2026-09-30; the public splits come from the source-kind registry, `ytbrain/eval/splits.py`). A split holds
+at most 20% of the Documents it is written from (floor; no minimum), never fewer than it has (released
+questions are never dropped); `eval build --top-up` grows it as Sources are added (new Documents first), and a question whose seed
+Document is removed retires. Each is built (`eval build [--set <split>]`), decided and versioned on its own, and every
+question is graded over every Source, so a talk question may be answered by a book page.
+`eval run|judge|rescore --set all` (the default) scores the three together with one row per
+source kind; `--set <split>` scores one. A run records which questions it was asked (`.asked`):
+questions added after a baseline was saved are left out of the comparison, never scored zero.
 
 ## 3. Files (BEIR layout + TREC copies + canonical spans)
 
@@ -174,6 +187,24 @@ CRAG-style truthfulness: +1 correct, 0 Gap, −1 wrong.
   *inconclusive* (exit code 3), with the command that fixes it; a failed gate is exit code 1.
   `ndcg@10-cond` (nDCG over the judged part of the ranking) is reported as a pool-bias check:
   with incomplete judgments, the true nDCG@10 lies between it and `ndcg@10`.
+- **Private Sources (ADR-0014, amendment 2026-09-30):** one benchmark in two homes. Every Source's
+  Moments are pooled and graded; labels on a Private Source's Moments, and the questions written from
+  Private Sources (`eval build --set dev-private`), go to the private overlay
+  `data/eval/private/` (git-ignored). `eval run`/`rescore` score the released set plus the overlay when
+  it exists; `files.write_split` refuses a label on a private Document. Which Documents are private
+  comes from sources.yaml (`distribute: false`) via `ytbrain.visibility`, never from their kind.
+- **Every source kind is measured:** nDCG@10 by `seed_kind` (the source kind of the Moment a question
+  was written from) is a facet, and each kind with >= 10 questions is gated: it fails when it drops more
+  than 0.03 and the drop is significant (p < 0.05). `top-10 mix by source kind` is a diagnostic only.
+  `doc_ndcg@10` is Document-level nDCG@10 (a Document's grade is its best Moment's); it replaced
+  `talk_ndcg@10`, which cut ids at 11 characters and so never counted an Article or a Chapter as a hit.
+- **Gate each configuration against its own baseline** (`--compare pack` after
+  `--save-baseline` on a pack run) to catch regressions; comparing the pack with `full` answers
+  a different question (is the lite search good enough to ship, ADR-0009). Any saved run can become a
+  named baseline: `eval rescore --run <file> --as <name> --save-baseline`.
+- **Diversity candidates:** `full-series3`/`pack-series3` (at most 3 of the top 10 per Series) and
+  `full-neardup`/`pack-neardup` (drop a result whose words mostly repeat a higher one) run the same search
+  with another `DiversityPolicy`; one becomes the default only when it passes both gates.
 - **Reach:** each run reports the share of relevant Moments the configuration can return at
   all. A store without Passages can't return a Moment that has no Advice or Takeaway; the
   Knowledge pack reaches 74.2 % of the dev set's relevant Moments (labels v1.3.0).

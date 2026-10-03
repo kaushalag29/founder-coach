@@ -342,6 +342,10 @@ class Manifest:
             q += f" AND {where}"
         return [dict(r) for r in self.db.execute(q, args)]
 
+    def tombstoned_ids(self) -> set[str]:
+        """Documents removed from their Source (kept as tombstones)."""
+        return {r[0] for r in self.db.execute("SELECT doc_id FROM documents WHERE tombstoned_at IS NOT NULL")}
+
     def export(self) -> str:
         return json.dumps(self.stats(), indent=2)
 

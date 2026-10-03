@@ -47,6 +47,40 @@ def _skipped(why: str) -> None:
         raise AssertionError(f"skipped in CI: {why}")
     print(f"    (skipped: {why})")
 
+def test_a_unit_too_long_for_the_embedding_window_is_cut_into_the_fewest_pieces_that_fit():
+    from ytbrain.config import EMBED_MAX_SEQ
+    from ytbrain.index import MAX_UNIT_WORDS, chunk_transcript, chunked_differently, split_long_units
+    assert MAX_UNIT_WORDS * 1.6 + 60 * 1.6 <= EMBED_MAX_SEQ and EMBED_MAX_SEQ >= 1024, "never below 1024"
+    long = " ".join(f"w{i}" for i in range(1946))                     # one article paragraph of 1946 words
+    units = [{"start_ms": 21, "end_ms": 21, "text": "a short lead-in paragraph"},
+             {"start_ms": 22, "end_ms": 22, "text": long},
+             {"start_ms": 23, "end_ms": 23, "text": "and a closing line"}]
+    pieces = split_long_units(units)
+    assert [u.get("part", 0) for u in pieces] == [0, 1, 2, 3, 4, 0]
+    assert max(len(u["text"].split()) for u in pieces) <= MAX_UNIT_WORDS
+    assert " ".join(u["text"] for u in pieces[1:5]) == long, "nothing lost or reordered"
+    assert all(u["start_ms"] == 22 for u in pieces[1:5]), "same position: Citations and Moments are unchanged"
+    chunks = chunk_transcript({"doc_id": "w-x", "utterances": units})
+    ids = [c.chunk_id for c in chunks]
+    assert len(ids) == len(set(ids)) and all(len(c.text.split()) <= MAX_UNIT_WORDS + 60 for c in chunks)
+    assert chunked_differently(units) and not chunked_differently(units[:1])
+
+
+def test_a_short_chunk_is_never_carried_whole_into_the_next_one():
+    """A short chunk closed by a long unit used to be carried entirely as overlap, so the next
+    Passage started at the same unit and both got one id (one overwrote the other)."""
+    from ytbrain.index import chunk_transcript
+    from ytbrain.knowledge.items import build_items
+    units = [{"start_ms": 1000, "end_ms": 2000, "text": "short opening"},
+             {"start_ms": 3000, "end_ms": 9000, "text": " ".join(["word"] * 420)},
+             {"start_ms": 9000, "end_ms": 9500, "text": "tail"}]
+    chunks = chunk_transcript({"doc_id": "abcdefghijk", "utterances": units})
+    assert [c.start_ms for c in chunks] == [1000, 3000, 9000]
+    rec = {"doc_id": "abcdefghijk", "title_raw": "t", "highlights": [], "advice_atoms": []}
+    ids = [i["item_id"] for i in build_items(rec, {"utterances": units}) if i["kind"] == "passage"]
+    assert len(ids) == len(set(ids)) == 3
+
+
 def test_parse_srt_basic():
     evs = captions.parse_srt(SRT)
     assert len(evs) == 3
@@ -617,6 +651,28 @@ def test_self_check_retries_paraphrased_quotes_and_keeps_the_grounded_result():
     assert [c["kind"] for c in rec.extraction_meta.calls] == ["extract", "extract:grounding-retry"]
 
 
+def test_a_result_verify_would_flag_gets_one_retry_and_repeated_misquotes_are_listed_once():
+    """75 % of quotes grounded passed the old 60 % self-check, but verify flags it (< 90 %)."""
+    try:
+        from ytbrain.extract import runner
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    import json as _j
+    first = _j.loads(_gen("talk to your users every single week", n_high=9))   # 9 of 12 grounded: 75 %
+    first["advice_atoms"] = [{"atom_id": f"a0{i}", "text": f"Do {i}", "evidence_span": "listen to the voice of the customer"}
+                             for i in range(1, 4)]
+    good = _gen("talk to your users every single week and charge money", advice_quote="charge money from day one", n_high=10)
+    fn, sent = _fake_backend([_j.dumps(first), good])       # the retry grounds more quotes (11), so it is kept
+    runner.BACKENDS["fake"] = fn
+    rec = runner.extract_video({"utterances": _UTTS}, {"doc_id": "v1", "title": "T"},
+                               [{"chapter_id": "ch01", "title": "all", "start_ms": 0, "source": "uploader"}],
+                               backend="fake")
+    g = rec.extraction_meta.grounding
+    assert g["retried"] and g["kept"] == "retry"
+    assert sent[1].count("listen to the voice of the customer") == 1, "a misquote reused by 3 items is listed once"
+
+
 def test_substantial_talk_with_no_advice_gets_one_retry():
     try:
         from ytbrain.extract import runner
@@ -1024,7 +1080,7 @@ def test_extract_parks_a_rejected_request_and_marks_verify_stale_before_saving()
     with mock.patch.object(config, "LLM_BACKEND", "fake"), \
          mock.patch.object(runner, "extract_video", fake_extract), \
          contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
-        cli.cmd_extract(types.SimpleNamespace(limit=0, workers=1, retry_failed=False))
+        cli.cmd_extract(types.SimpleNamespace(limit=0, workers=1, retry_failed=False, doc=["ex1", "ex2"]))
     assert m.stage_status("ex1", "extract") == "parked", out.getvalue()
     assert "--retry-failed" in out.getvalue()
     assert order == [("write", "stale")]                            # verify was reset before the write
@@ -1032,7 +1088,7 @@ def test_extract_parks_a_rejected_request_and_marks_verify_stale_before_saving()
     with mock.patch.object(config, "LLM_BACKEND", "fake"), \
          mock.patch.object(runner, "extract_video", fake_extract), \
          contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
-        cli.cmd_extract(types.SimpleNamespace(limit=0, workers=1, retry_failed=False))
+        cli.cmd_extract(types.SimpleNamespace(limit=0, workers=1, retry_failed=False, doc=["ex1", "ex2"]))
     assert "0 to extract" in out.getvalue() and "1 parked" in out.getvalue()    # not retried every run
 
 
@@ -1206,6 +1262,43 @@ def test_retry_after_is_honoured_but_capped():
         runner._backoff(0, "3600", "HTTP 429")
         runner._backoff(0, "7", "HTTP 429")
     assert waits == [runner.LLM_BACKOFF_MAX_S, 7.0]
+
+
+
+def test_source_kinds_own_their_locators_and_moments_behind_one_interface():
+    """ADR-0013: adding a source type is one SourceKind; nothing else branches on the kind."""
+    from ytbrain import source_kinds as K
+    assert [k.name for k in K.KINDS][-1] == "talk", "Talk is the fallback, tried last"
+    assert K.for_doc("w-abc") is K.ARTICLE and K.for_doc("9780753550304__secrets") is K.BOOK_CHAPTER
+    assert K.for_doc("UdIPveR__jw") is K.TALK, "a YouTube id may hold '__'"
+    for k, pos, label, mid in ((K.TALK, 61_000, "01:01", "UdIPveRyyjw_00060"),
+                               (K.ARTICLE, 7, "¶7", "w-abc_p00007"),
+                               (K.BOOK_CHAPTER, 47_003, "PDF p. 47", "9780753550304__secrets_b00047")):
+        doc = mid.rsplit("_", 1)[0]
+        assert k.label(pos) == label and K.by_name(k.name) is k and K.by_locator(k.locator) is k
+        assert k.moment_id(doc, k.moment_start(pos)) == mid and K.for_moment(mid) is k
+        assert isinstance(k.span(doc, k.moment_start(pos)), dict)
+    assert K.by_name(None) is K.TALK and K.of_record({"locator": "page"}) is K.BOOK_CHAPTER
+    assert K.BOOK_CHAPTER.label(47_003, {"47": "31"}) == "p. 31"
+
+
+
+def test_diversity_rules_are_source_agnostic_and_compose():
+    from founder_coach.search import (POLICIES, DiversityPolicy, NearDuplicateCollapse, PerDocumentCap,
+                                      PerSeriesCap, SameQuote)
+    rows = [{"i": i, "doc_id": d, "series": s, "text": t, "evidence": ""} for i, (d, s, t) in enumerate([
+        ("a", "PG", "talk to users every week"), ("b", "PG", "charge money early"),
+        ("c", "PG", "hire slowly and fire fast"), ("d", "PG", "focus on one metric"),
+        ("e", "Zero to One", "talk to users every single week"), ("f", "", "no series here")])]
+    assert [r["i"] for r in DiversityPolicy((PerSeriesCap(3, 10),)).apply(rows)] == [0, 1, 2, 4, 5], \
+        "any Series (a blog here) is capped the same way; no Series, no cap"
+    later = rows[:1] + rows[4:] + rows[1:4]
+    assert [r["i"] for r in DiversityPolicy((PerSeriesCap(1, 2),)).apply(later)] == [0, 4, 5, 1, 2, 3], \
+        "past the window nothing is capped"
+    assert [r["i"] for r in DiversityPolicy((NearDuplicateCollapse(0.8),)).apply(rows)] == [0, 1, 2, 3, 5], \
+        "a near-duplicate from another Document and source is dropped; the higher rank stays"
+    assert POLICIES["default"].apply(rows) == DiversityPolicy((SameQuote(), PerDocumentCap(3))).apply(rows)
+    assert POLICIES["series3"].rules[-1] == PerSeriesCap(3, 10)
 
 
 if __name__ == "__main__":

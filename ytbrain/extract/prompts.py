@@ -158,9 +158,9 @@ def format_transcript(utterances: list[dict], with_ms: bool = False,
 
 
 # ---- other Source kinds (ADR-0013) --------------------------------------------------------
-# One source of truth: an article's prompts are the talk prompts with the talk-specific words
-# replaced, so a fix to the talk prompt reaches every Source kind. tests check nothing
-# talk-specific survives.
+# One source of truth: an article's and a book chapter's prompts are the talk prompts with the
+# talk-specific words replaced, so a fix to the talk prompt reaches every Source kind. tests check
+# nothing talk-specific survives.
 _ARTICLE_WORDS = [
     ("startup-advice talk", "startup-advice article"), ("\nTalk: ", "\nArticle: "),
     ("ONE talk", "ONE article"), ("talk-level", "article-level"),
@@ -172,23 +172,69 @@ _ARTICLE_WORDS = [
     ("TRANSCRIPT", "TEXT"), ("transcripts", "texts"), ("transcript", "text"),
 ]
 
+# A Book Chapter (ADR-0014): the Book and its authors are given, the text is the authors' prose,
+# and a book quotes other people; the advice worth keeping is the authors' own.
+_CHAPTER_WORDS = [
+    ("startup-advice talk", "chapter of a startup book"), ("\nTalk: ", "\nChapter: "),
+    ("\nSeries: ", "\nBook: "), ("\nChapters: ", "\nSections: "),
+    ("ONE talk", "ONE book chapter"), ("talk-level", "chapter-level"),
+    ("`[ms]` markers in the transcript", "`[p. n]` page markers in the text"),
+    ("Do NOT output timestamps. They are derived", "Do NOT output page numbers. They are derived"),
+    ("filler (\"like\", \"you know\")\n  and caption misspellings", "the book's spelling and punctuation"),
+    ("Interviews and Q&A sessions often hold\n  the most concrete advice; extract it.",
+     ("Stories and case studies often hold the\n  most concrete advice; extract the lesson the authors draw from them. A\n"
+      "  quotation the authors cite from someone else (an epigraph, a famous line)\n"
+      "  is not the authors' advice unless they endorse it.")),
+    ("`speaker`: only if the transcript or title makes it clear. Otherwise null.",
+     "`speaker`: the Book's authors as given above."),
+    ("Only a clip that is purely logistics (announcements, introductions,\n  housekeeping)",
+     "Only a chapter that is purely front or back matter (acknowledgments,\n  credits, notes)"),
+    ("TRANSCRIPT", "TEXT"), ("transcripts", "texts"), ("transcript", "text"),
+]
 
-def _for_article(text: str) -> str:
+
+def _convert(text: str, words: list[tuple[str, str]], noun: str) -> str:
     import re
     fields = re.findall(r"\{[a-z_]+\}", text)             # format placeholders ({transcript}) stay as they are
     for i, f in enumerate(fields):
         text = text.replace(f, f"\x00{i}\x00", 1)
-    for old, new in _ARTICLE_WORDS:
+    for old, new in words:
         text = text.replace(old, new)
-    text = re.sub(r"\btalk\b", "article", text)          # lowercase noun only: "Talk to ten users" stays
+    text = re.sub(r"\btalk\b", noun, text)              # lowercase noun only: "Talk to ten users" stays
     for i, f in enumerate(fields):
         text = text.replace(f"\x00{i}\x00", f, 1)
     return text
 
 
+def _for_article(text: str) -> str:
+    return _convert(text, _ARTICLE_WORDS, "article")
+
+
+def _for_chapter(text: str) -> str:
+    return _convert(text, _CHAPTER_WORDS, "chapter")
+
+
+_CONVERT = {"article": _for_article, "chapter": _for_chapter}
+
+
+def _pages(utterances: list[dict], max_words: int) -> str:
+    """A Chapter's paragraphs, with a `[p. n]` marker where each PDF page starts."""
+    out, words, page = [], 0, None
+    for u in utterances:
+        text = u.get("text", "")
+        p = int(u.get("start_ms", 0)) // 1000
+        out.append(f"[p. {p}] {text}" if p != page else text)
+        page = p
+        words += len(text.split())
+        if words > max_words:
+            out.append("... [text truncated]")
+            break
+    return "\n".join(out)
+
+
 class _Prompts:
     def __init__(self, kind: str):
-        conv = _for_article if kind == "article" else (lambda s: s)
+        conv = _CONVERT.get(kind, lambda s: s)
         self.kind = kind
         self.CHAPTER_PROMPT = conv(CHAPTER_PROMPT)
         self.EXTRACT_PROMPT = conv(EXTRACT_PROMPT)
@@ -198,7 +244,10 @@ class _Prompts:
         self.OVERVIEW_PROMPT = conv(OVERVIEW_PROMPT)
 
     def format(self, utterances: list[dict], with_ms: bool = False, max_words: int = 40000) -> str:
-        """Talks: `[mm:ss]` (or raw ms for chaptering); articles: `[n]` paragraph numbers."""
+        """Talks: `[mm:ss]` (or raw ms for chaptering); articles: `[n]` paragraph numbers;
+        book chapters: `[p. n]` where each page starts."""
+        if self.kind == "chapter":
+            return _pages(utterances, max_words)
         if self.kind != "article":
             return format_transcript(utterances, with_ms=with_ms, max_words=max_words)
         out, words = [], 0
@@ -217,5 +266,5 @@ class _Prompts:
 
 
 def for_kind(kind: str | None) -> _Prompts:
-    """The prompts for a Source kind: 'talk' (default) or 'article'."""
-    return _Prompts("article" if kind == "article" else "talk")
+    """The prompts for a Source kind: 'talk' (default), 'article' or 'chapter' (a Book Chapter)."""
+    return _Prompts(kind if kind in _CONVERT else "talk")

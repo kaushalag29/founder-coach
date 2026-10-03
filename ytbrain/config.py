@@ -78,6 +78,12 @@ WEB_DEFAULT_MAX_PAGES = 10_000       # pages fetched per Source per run
 WEB_RECHECK_DAYS = 7                 # a known page is re-checked (conditional GET) after this
 WEB_MIN_ARTICLE_WORDS = 150          # main text below this isn't an Article (and triggers rendering)
 WEB_MAX_SITEMAPS = 50                # sitemap files read per Source (index files included)
+# PDF Books (ADR-0014)
+BOOKS_PARSED = DATA / "books" / "parsed"     # one cached parse per file hash and parser
+BOOKS_PLANS = DATA / "books" / "plans"       # per Book: resolved metadata + its Chapters (written by sync, read by clean)
+BOOKS_LOOKUPS = DATA / "books" / "openlibrary"   # cached Open Library answers (only with lookup: openlibrary)
+BOOK_PARSE_TIMEOUT_S = float(os.environ.get("YTBRAIN_BOOK_TIMEOUT_S", "1800"))   # one book; a timed-out parse is a failure, never a partial book
+BOOK_THREADS = int(os.environ.get("YTBRAIN_BOOK_THREADS", "0"))                  # Docling's threads; 0 = all cores but one (max 8)
 WEB_LANGUAGES = ("en",)              # D9: other languages are skipped, recorded as such
 
 # --- caption cleanup ---
@@ -108,9 +114,14 @@ MAX_ADVICE = 12
 # per this many words, at least 2) up to the caps above.
 WORDS_PER_HIGHLIGHT = 150
 WORDS_PER_ADVICE = 120
-# Self-check after extraction (local, no LLM): retry once with feedback when the
-# quotes mostly aren't in the transcript, or a substantial talk yields no advice.
-GROUNDING_RETRY_BELOW = 0.60
+# Verification (ytbrain/verify.py): a record whose share of grounded quotes is below
+# VERIFY_PASS_RATE is flagged, below VERIFY_FAIL_RATE failed.
+VERIFY_PASS_RATE = 0.90
+VERIFY_FAIL_RATE = 0.60
+# Self-check after extraction (local, no LLM): retry once with feedback when verification
+# would flag the record (so a fixable misquote costs one retry, not a manual re-run), or a
+# substantial talk yields no advice. The better of the two attempts is kept.
+GROUNDING_RETRY_BELOW = VERIFY_PASS_RATE
 NO_ADVICE_RETRY_MIN_WORDS = 1_000   # "YC Founders Made These Fundraising Mistakes" (1.4k words) got none
 TOKENS_PER_WORD = 1.33               # estimator; avoids a tokenizer dependency
 
@@ -194,6 +205,7 @@ LANCE_DIR = DATA / "lancedb"
 # --- eval benchmark (docs/eval-spec.md) ---
 EVAL_DIR = ROOT / "eval"                      # released benchmark files (committed)
 EVAL_DATA = DATA / "eval"                     # working state: eval.db, raw downloads, run results
+EVAL_PRIVATE = EVAL_DATA / "private"          # labels on private Sources' Moments: never released (ADR-0014)
 # Knowledge pack [ADR-0009]: what the coach plugin ships (built by `ytbrain pack build`)
 from founder_coach.models import DEFAULT_EMBED_MODEL as _PACK_EMBED  # noqa: E402
 from founder_coach.models import DEFAULT_RERANK_MODEL as _PACK_RERANK  # noqa: E402
@@ -224,7 +236,12 @@ EVAL_JUDGE_BATCH = 5                          # Moments graded per judge call, e
 EVAL_TUNING_SIZE = 150
 EVAL_TUNING_OVERSAMPLE = 1.4                  # candidates generated per kept question (filters, self-check)
 EVAL_HOLDOUT_MAX = 50
-EVAL_POOL_DEPTH = {"dev": 20, "test": 50}
+EVAL_POOL_DEPTH = {"test": 50}                # Moments per variant per question; Tuning splits: EVAL_POOL_DEPTH_TUNING
+EVAL_POOL_DEPTH_TUNING = 20
+# How many questions a Tuning split holds (eval/splits.py): at most EVAL_SPLIT_RATIO of the Documents it
+# can be written from (one question per Document), and never fewer than it already has (questions are
+# never dropped to fit). `eval build --top-up` fills it as Sources grow.
+EVAL_SPLIT_RATIO = 0.20
 
 # --- knowledge index (phase 2, M1) [ADR-0001, ADR-0003] ---
 KNOWLEDGE_TABLE = "knowledge"

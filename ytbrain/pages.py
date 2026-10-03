@@ -48,9 +48,15 @@ def write_record(record: dict) -> Path:
     return atomic_write_text(METADATA / f"{record['doc_id']}.json", canonical_json(record))
 
 
-def _ts(ms: int | None, locator: str = "time") -> str:
+def _ts(ms: int | None, locator: str = "time", record: dict | None = None) -> str:
     from .locators import label
-    return label(ms, locator)
+    return label(ms, locator, (record or {}).get("page_labels"))
+
+
+def _at(doc_id: str, ms: int | None, loc: str, record: dict, quote_text: str | None = None) -> str:
+    """`[label](link)`, or the bare label when there is no link (a private Book's page)."""
+    link = _link(doc_id, ms, record, quote_text)
+    return f"[{_ts(ms, loc, record)}]({link})" if link else _ts(ms, loc, record)
 
 
 def _link(doc_id: str, ms: int | None, record: dict | None = None, quote_text: str | None = None) -> str:
@@ -109,9 +115,11 @@ def render_markdown(record: dict, show_unverified: bool = False) -> str:
     atoms, hidden_a = keep(record.get("advice_atoms") or [])
     hidden = hidden_h + hidden_a
     loc = record.get("locator") or "time"
-    article = record.get("source_kind") == "article"
+    kind = record.get("source_kind") or "talk"
+    article = kind != "talk"
     fm = {
-        **({"doc_id": doc_id, "source_kind": "article"} if article else {"video_id": doc_id}),
+        **({"doc_id": doc_id, "source_kind": kind} if article else {"video_id": doc_id}),
+        **({"private": True} if record.get("private") else {}),
         "title": record.get("title_canonical") or record.get("title_raw"),
         "title_raw": record.get("title_raw"),
         "url": record.get("url"),
@@ -150,14 +158,13 @@ def render_markdown(record: dict, show_unverified: bool = False) -> str:
     if chapters:
         out += ["## Chapters", ""]
         for ch in chapters:
-            out.append(f"- [{_ts(ch.get('start_ms'), loc)}]({_link(doc_id, ch.get('start_ms'), record)}) "
-                       f"— {ch.get('title')}")
+            out.append(f"- {_at(doc_id, ch.get('start_ms'), loc, record)} — {ch.get('title')}")
         out.append("")
 
     if highlights:
         out += ["## Key takeaways", ""]
         for h, ok in highlights:
-            where = (f"([{_ts(h.get('timestamp_ms'), loc)}]({_link(doc_id, h.get('timestamp_ms'), record, h.get('evidence_span'))}))"
+            where = (f"({_at(doc_id, h.get('timestamp_ms'), loc, record, h.get('evidence_span'))})"
                      if ok else f"**{UNVERIFIED_MARK}**")
             out.append(f"- **{h.get('text')}** {where}")
             if h.get("evidence_span"):
@@ -168,7 +175,7 @@ def render_markdown(record: dict, show_unverified: bool = False) -> str:
         out += ["## Advice", ""]
         for a, ok in atoms:
             stages = ", ".join(sorted(a.get("applies_to_stage") or [])) or "any stage"
-            where = (f"([{_ts(a.get('timestamp_ms'), loc)}]({_link(doc_id, a.get('timestamp_ms'), record, a.get('evidence_span'))}))"
+            where = (f"({_at(doc_id, a.get('timestamp_ms'), loc, record, a.get('evidence_span'))})"
                      if ok else f"**{UNVERIFIED_MARK}** — quote: “{a.get('evidence_span', '')}”")
             out.append(f"- {a.get('text')} _({stages})_ {where}")
         out.append("")

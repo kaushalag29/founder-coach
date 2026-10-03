@@ -3,7 +3,6 @@ import datetime as dt
 import json
 import os
 os.environ["YTBRAIN_DOTENV"] = "0"          # hermetic: never read the developer's .env (keys, backend)
-os.environ["YTBRAIN_LLM_BACKEND"] = "openai"   # eval builds need an OpenAI-compatible endpoint (faked below)
 import re
 import sys
 import tempfile
@@ -14,6 +13,10 @@ from founder_coach import product  # noqa: E402
 os.environ.setdefault("YTBRAIN_ROOT", tempfile.mkdtemp(prefix="ytbrain-evaltest-"))
 
 from ytbrain.eval import judge, metrics as M                       # noqa: E402
+from ytbrain.extract import runner as _runner                   # noqa: E402
+# eval builds need an OpenAI-compatible endpoint (faked below). Set on the module that reads
+# it, not in os.environ: config is read once, so another suite imported first would win.
+_runner.LLM_BACKEND = "openai"
 from ytbrain.eval import generate as G                             # noqa: E402
 from ytbrain.eval.moments import (moment_for, moment_id, moment_text, parse_moment_id,  # noqa: E402
                                   results_to_moments, spans_to_qrels)
@@ -55,6 +58,82 @@ def test_article_moments_are_runs_of_paragraphs():
     row = json.loads((root / "corpus.jsonl").read_text().splitlines()[0])
     assert row["url"] == "https://ex.com/a" and row["start_paragraph"] == 4 and "start_s" not in row
     assert files.load_split(root, "dev")[1] == {"q1": {f"{doc}_p00004": 2}}
+
+
+def test_private_moments_are_graded_but_released_only_to_the_private_overlay():
+    """ADR-0014: privacy comes from the Source (Visibility), never from a Document's kind or id."""
+    from ytbrain.eval import files
+    from ytbrain.eval.build import split_by_visibility
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.visibility import Visibility
+    book, essay = "9780753550304__secrets_b00012", "w-abc_p00004"
+    vis = Visibility.from_sources([{"doc_id": "9780753550304__secrets", "source_id": "books"},
+                                   {"doc_id": YT, "source_id": "yc"}, {"doc_id": "w-abc", "source_id": "notes"}],
+                                  [{"id": "books", "distribute": False}, {"id": "yc"}, {"id": "notes", "distribute": False}])
+    assert vis.is_private_moment(book) and vis.is_private_moment(essay), "a private Source of any kind"
+    assert not vis.is_private(YT) and vis.is_private("never-seen"), "fail closed on unknown Documents"
+    db = EvalDB(Path(tempfile.mkdtemp()) / "e.db")
+    db.save_pool("q1", {moment_id(YT, 60): (["full"], 1)}, 10)
+    assert db.add_to_pool("q1", [(book, 1)], "run:pack") == 1, "private Moments are pooled and graded"
+    labels = {"q1": {moment_id(YT, 60): {"grade": 2, "judges": {}}, book: {"grade": 3, "judges": {}}}}
+    public, private = split_by_visibility(labels, vis)
+    assert list(public["q1"]) == [moment_id(YT, 60)] and list(private["q1"]) == [book]
+    root, overlay = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    (root / "corpus.jsonl").write_text(json.dumps({"_id": book, "title": "Secrets", "text": ""}) + "\n")
+    try:
+        files.write_split(root, "dev", [{"_id": "q1", "text": "q", "split": "dev"}], labels, {}, visibility=vis)
+        raise AssertionError("a private label must be refused by the release")
+    except ValueError as e:
+        assert "private Documents" in str(e)
+    files.write_split(root, "dev", [{"_id": "q1", "text": "q", "split": "dev"}], public, {}, visibility=vis)
+    assert "secrets" not in (root / "corpus.jsonl").read_text(), "an old private row leaves the corpus"
+    assert files.write_private(overlay, "dev", private) and not files.write_private(overlay, "dev", private)
+    assert files.load_split(root, "dev")[1] == {"q1": {moment_id(YT, 60): 2}}
+    assert files.load_split(root, "dev", overlay)[1] == {"q1": {moment_id(YT, 60): 2, book: 3}}, \
+        "one benchmark: the overlay adds the private labels when you score"
+
+
+def test_questions_from_private_sources_join_the_benchmark_only_in_the_overlay():
+    """One benchmark: a question written from a Book is scored with the released ones, graded over
+    every Source, and lives only in the private overlay; the released files never see it."""
+    from ytbrain.eval import build, files, judge
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.visibility import Visibility
+    book_doc = "9780753550304__secrets"
+    book = f"{book_doc}_b00012"
+    vis = Visibility.from_sources([{"doc_id": book_doc, "source_id": "books"}, {"doc_id": YT, "source_id": "yc"}],
+                                  [{"id": "books", "distribute": False}, {"id": "yc"}])
+    root, overlay = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    env = build.Env(ask_fn=None, db=EvalDB(Path(tempfile.mkdtemp()) / "e.db"), root=root, visibility=vis,
+                    private=overlay, judges=["j1", "j2"])
+    rec = {"question": "How do I find a secret?", "stage": [], "creation": {}}
+    env.db.upsert_question("devp-0001", build.PRIVATE_SPLIT, 1, "generated", rec, text=rec["question"], seed_moment=book)
+    env.db.save_pool("devp-0001", {book: (["seed"], 1), moment_id(YT, 60): (["hybrid"], 2)}, 20)
+    env.db.save_grades("devp-0001", "j1", judge.PROMPT_VERSION, {book: 3, moment_id(YT, 60): 2})
+    env.db.save_grades("devp-0001", "j2", judge.PROMPT_VERSION, {book: 3, moment_id(YT, 60): 1})
+    # an older overlay kept private questions under `dev`: the release moves them to their own set
+    files.write_private(overlay, "dev", {"devp-0001": {book: {"grade": 3, "judges": {}}}},
+                        [{"_id": "devp-0001", "split": "dev", "private": True}])
+    res = build.finalize_dev(env, {}, "2026-09-30")
+    assert res["private_questions"] == 1 and res["private_changed"]
+    assert res["splits"][build.PRIVATE_SPLIT]["accepted"] == 1
+    queries, qrels = files.load_split(root, build.PRIVATE_SPLIT, overlay)
+    assert [q["_id"] for q in queries] == ["devp-0001"] and queries[0]["private"] is True
+    assert queries[0]["split"] == build.PRIVATE_SPLIT
+    assert qrels["devp-0001"] == {book: 3, moment_id(YT, 60): 1}, "graded over every Source (lower grade wins)"
+    assert files.load_split(root, "dev", overlay) == ([], {}), "the talk set no longer holds book questions"
+    assert files.load_set(root, "all", overlay)[0] == queries, "`all` scores every set together"
+    assert files.load_split(root, build.PRIVATE_SPLIT) == ([], {}), "never in the released files"
+    assert not build.finalize_dev(env, {}, "2026-09-30")["private_changed"], "idempotent"
+
+
+def test_document_level_ndcg_counts_every_source_kind():
+    from ytbrain.eval.run import DOC_NDCG, doc_qrels, score
+    q = doc_qrels({"q1": {"w-abcdefghijklm_p00004": 3, moment_id(YT, 60): 1, moment_id(YT, 120): 2}})
+    assert q == {"q1": {"w-abcdefghijklm": 3, YT: 2}}, "ids are parsed, never cut at 11 characters"
+    runs = {"q1": {"moments": ["w-abcdefghijklm_p00004"], "talks": ["w-abcdefghijklm", YT]}}
+    r = score([{"_id": "q1"}], {"q1": {"w-abcdefghijklm_p00004": 3, moment_id(YT, 60): 1}}, runs)
+    assert r["summary"][DOC_NDCG]["mean"] == 1.0, "an article ranked first is a hit at Document level"
 
 
 def test_results_map_to_the_latest_moment_start_and_skip_summaries():
@@ -119,6 +198,129 @@ def test_condensed_ndcg_and_the_incomplete_judgment_verdict():
     res["summary"]["judged@10"]["mean"] = 0.95
     assert verdict(res, {"qrels_sha256": "s"}, "pack")[0] == 1
     assert verdict(res, {"qrels_sha256": "other"}, "pack")[0] == 3
+
+
+def test_a_stale_baseline_names_the_command_that_refreshes_it():
+    from ytbrain.eval.run import verdict
+    res = {"split": "dev", "qrels_sha256": "new", "summary": {"judged@10": {"mean": 1.0}},
+           "compare": {}, "compared_with": "full-prebooks"}
+    named = {"qrels_sha256": "old", "rescored_from": "dev-full-2026-09-27T152650.run"}
+    code, v = verdict(res, named, "full")
+    assert code == 3
+    assert ("`ytbrain eval rescore --set dev --config full --run dev-full-2026-09-27T152650.run "
+            "--as full-prebooks --save-baseline`") in v["reasons"][0]
+    res["compared_with"] = "full"
+    _, v = verdict(res, {"qrels_sha256": "old"}, "full")
+    assert "`ytbrain eval rescore --set dev --config full --save-baseline`" in v["reasons"][0]
+    assert "eval run" not in v["reasons"][0], "a re-score needs no new search"
+
+
+def test_build_and_interrupt_hints_name_the_command_to_run():
+    from types import SimpleNamespace
+    from ytbrain.cli import rerun_command
+    from ytbrain.eval.build import next_steps
+    from ytbrain.visibility import Visibility
+    assert rerun_command(["eval", "build", "--set", "dev-private"]) == "ytbrain eval build --set dev-private"
+    assert rerun_command(["eval", "run", "--config", "full", "--compare", "full-prebooks"]) == \
+        "ytbrain eval run --config full --compare full-prebooks"
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.eval.splits import TUNING_SPLITS
+    db = EvalDB(Path(tempfile.mkdtemp()) / "e.db")
+    private = SimpleNamespace(visibility=Visibility(private_docs={"9780307887917__x"}, known_docs=set()), db=db)
+    for s in TUNING_SPLITS:
+        if s != "dev-articles":
+            db.set_target(s, 30, [])
+    every = {"dev": {"accepted": 150}, "dev-articles": {"accepted": 0}, "dev-private": {"accepted": 21}}
+    built = next_steps(private, "dev-private", {"splits": every})
+    assert "eval run --config full" in built[0] and "eval judge --config full" in built[0]
+    assert "--set dev " not in " ".join(built), "the default set (all) includes the new questions"
+    assert "never built: dev-articles -- `ytbrain eval build`" in built[-1]
+    db.set_target("dev-articles", 73, [])
+    assert len(next_steps(private, "dev-private", {"splits": every})) == 2, "nothing left to build"
+    none = {**every, "dev-private": {"accepted": 0}}
+    assert "no question survived" in next_steps(private, "dev-private", {"splits": none})[0]
+    fresh = EvalDB(Path(tempfile.mkdtemp()) / "e.db")
+    fresh.set_target("dev", 150, [])
+    assert not any("dev-private" in line for line in next_steps(SimpleNamespace(
+        visibility=Visibility.everything_public(), db=fresh), "dev", {"splits": {"dev": {"accepted": 150}}})), \
+        "no private Sources: no private set to build"
+
+
+def test_every_source_kind_is_measured_and_gated_on_its_own_questions():
+    from ytbrain.eval.run import compare_kinds, score, verdict
+    assert M.kind_mix([["9780753550304__secrets_b00012", "abcdefghijk_00060"], ["w-x_p00001", "abcdefghijk_00120"]]) \
+        == {"article": 0.25, "chapter": 0.25, "talk": 0.5}
+    assert M.kind_mix([]) == {}
+    qs = [{"_id": f"t{i}", "creation": {"seed_moment": moment_id(YT, 60)}} for i in range(12)] + \
+         [{"_id": "b1", "creation": {"seed_moment": "9780753550304__secrets_b00012"}}]
+    qrels = {q["_id"]: {moment_id(YT, 60): 3} for q in qs}
+    good = {q["_id"]: {"moments": [moment_id(YT, 60)], "talks": []} for q in qs}
+    bad = {q["_id"]: {"moments": ["x_00000"] * 3 + [moment_id(YT, 60)], "talks": []} for q in qs}
+    base, cur = score(qs, qrels, good), score(qs, qrels, bad)
+    assert cur["by"]["seed_kind"]["talk"]["n"] == 12 and cur["by"]["seed_kind"]["chapter"]["n"] == 1
+    assert cur["summary"]["_mix@10"]["talk"] > 0 and "_mix@10" not in cur["per_query"]
+    kinds = compare_kinds(cur, base)
+    assert kinds["talk"]["fails_gate"] and kinds["talk"]["gated"], "12 talk questions dropped: gated"
+    assert not kinds["chapter"]["gated"], "one question is too few to gate"
+    res = {"split": "dev", "qrels_sha256": "s", "summary": {"judged@10": {"mean": 1.0}},
+           "compare": {"ndcg@10": {"fails_gate": False}}, "compare_kinds": kinds, "compared_with": "full"}
+    assert verdict(res, {"qrels_sha256": "s"}, "full")[0] == 1, "a source kind's drop fails the run"
+
+
+def test_any_saved_run_can_become_a_named_baseline():
+    from ytbrain.eval import files
+    from ytbrain.eval.run import rescore, write_trec_run
+    root, out = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    files.write_split(root, "dev", [{"_id": "q1", "text": "q", "split": "dev"}],
+                      {"q1": {moment_id(YT, 60): {"grade": 3, "judges": {}},
+                              moment_id(YT, 600): {"grade": 0, "judges": {}}}}, {})
+    write_trec_run(out / "dev-full-2026-09-27T152650.run", {"q1": {"moments": [moment_id(YT, 60)],
+                                                                     "scores": [1.0], "talks": [YT]}}, "old")
+    write_trec_run(out / "dev-full-2026-09-29T195100.run", {"q1": {"moments": [moment_id(YT, 600)],
+                                                                     "scores": [1.0], "talks": [YT]}}, "new")
+    r, _ = rescore("dev", "full", root=root, out_dir=out, private=None, save_baseline=True,
+                   run=Path("dev-full-2026-09-27T152650.run"), name="full-prebooks")
+    assert r["config"] == "full-prebooks" and r["summary"]["ndcg@10"]["mean"] == 1.0
+    assert (out / "baseline-dev-full-prebooks.json").exists() and not (out / "baseline-dev-full.json").exists()
+    r, code = rescore("dev", "full", root=root, out_dir=out, private=None, baseline="full-prebooks")
+    assert r["summary"]["ndcg@10"]["mean"] == 0.0 and code == 1, "the newest run regressed against it"
+
+
+def test_questions_added_after_a_baseline_are_not_scored_as_zero():
+    """A book question written after the pre-books run is outside the comparison, not a zero:
+    otherwise every new question looks like a gain and hides a drop on the old ones."""
+    from ytbrain.eval import files
+    from ytbrain.eval.run import evaluate, render, rescore, write_trec_run
+    root, out = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    good, bad = moment_id(YT, 60), moment_id(YT, 600)
+    labels = {f"q{i}": {good: {"grade": 3, "judges": {}}, bad: {"grade": 0, "judges": {}}} for i in range(4)}
+    files.write_split(root, "dev", [{"_id": f"q{i}", "text": "q", "split": "dev"} for i in range(4)], labels, {})
+    # the old run was asked q0, q1 only (q2, q3 were written later); both found the good Moment
+    write_trec_run(out / "dev-full-2026-09-27T152650.run",
+                   {q: {"moments": [good], "scores": [1.0], "talks": [YT]} for q in ("q0", "q1")}, "old")
+    r, _ = rescore("dev", "full", root=root, out_dir=out, private=None, save_baseline=True,
+                   run=Path("dev-full-2026-09-27T152650.run"), name="prebooks")
+    assert r["n_questions"] == 2 and r["summary"]["ndcg@10"]["mean"] == 1.0, "not asked is not zero"
+
+    class Store:            # the new run: q0 now worse, q1 same, q2/q3 new and perfect
+        def search(self, *a, **k):
+            return []
+    runs = {"q0": {"moments": [bad], "scores": [1.0], "talks": [YT]}}
+    runs.update({q: {"moments": [good], "scores": [1.0], "talks": [YT]} for q in ("q1", "q2", "q3")})
+    import ytbrain.eval.run as R
+    real = R.run_config
+    R.run_config = lambda *a, **k: runs
+    try:
+        res, _ = evaluate(Store(), None, None, "dev", "full", root=root, out_dir=out,
+                          baseline="prebooks", private=None)
+    finally:
+        R.run_config = real
+    assert res["overlap"] == {"shared": 2, "new": 2, "retired": 0, "new_by_kind": {"(none)": 2}}
+    assert res["compare"]["ndcg@10"]["delta"] == -0.5, "a drop on the shared questions, not +0.25"
+    text = render(res)
+    assert "compared on the 2 question(s) both were asked; 2 new since the baseline" in text
+    saved = sorted(out.glob("dev-full-*.asked"))
+    assert saved and saved[-1].read_text().split() == ["q0", "q1", "q2", "q3"]
 
 
 def test_latest_run_matches_the_exact_config_not_a_prefix():
@@ -350,6 +552,245 @@ def test_sampling_is_stratified_one_per_talk_and_capped_per_speaker():
     assert sum(p["speaker"] == "Same Person" for p in picks) <= G.MAX_PER_SPEAKER
     assert sum(p["topics"][0] == "fundraising" for p in picks) >= 3
     assert G.sample_items(rows, 15) == picks                      # deterministic
+
+
+def test_each_tuning_split_is_seeded_from_its_own_kind_of_source():
+    rows = [{"item_id": f"t{i}", "kind": "advice", "doc_id": f"talk{i:07d}", "evidence": "q", "start_ms": 1000,
+             "text": "x", "topics": ["sales"], "speaker": f"S{i}"} for i in range(6)]
+    rows += [{"item_id": f"a{i}", "kind": "advice", "doc_id": f"w-site{i:09d}", "evidence": "q", "start_ms": 4,
+              "text": "x", "topics": ["sales"], "speaker": f"A{i}", "deep_link": f"https://site/{i}#p4"}
+             for i in range(6)]
+    arts = G.sample_items(rows, 4, kinds=("article",))
+    assert len(arts) == 4 and all(r["doc_id"].startswith("w-") for r in arts)
+    assert all(not r["doc_id"].startswith("w-") for r in G.sample_items(rows, 4, kinds=("talk",)))
+    seed = G.seed_record(arts[0], "deva-0001")
+    assert seed["seed_url"].startswith("https://site/"), "an article seed links to its page, not to YouTube"
+    assert "taken from a startup essay or article" in G.prompt_for(seed)
+    talk = G.seed_record(G.sample_items(rows, 1, kinds=("talk",))[0], "dev-0001")
+    assert talk["seed_url"].startswith("https://www.youtube.com/watch?v=")
+    assert "taken from a startup talk" in G.prompt_for(talk)
+    book = {"seed_kind": "advice", "topic": [], "seed_text": "x", "doc_id": "9780753550304__secrets"}
+    assert "taken from a chapter of a business book" in G.prompt_for(book) and "the book," in G.prompt_for(book)
+
+
+def test_splits_grow_to_20_percent_of_their_documents_and_retire_questions_of_removed_ones():
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from ytbrain.eval import build, splits
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.visibility import Visibility
+    assert splits.target(721) == 144 and splits.target(362) == 72 and splits.target(181) == 36
+    assert splits.target(721, 150) == 150, "released questions are never dropped to fit"
+    assert splits.target(12) == 2 and splits.target(4) == 0 and splits.target(0) == 0, "at most 20%, no floor"
+    assert {"dev", "dev-articles", "dev-chapters", "dev-private"} == set(splits.TUNING_SPLITS)
+
+    def rows(n, start=0):
+        return [{"item_id": f"a{i}", "kind": "advice", "doc_id": f"w-site{i:09d}", "evidence": "q", "start_ms": 4,
+                 "text": f"t{i}", "topics": ["sales"], "speaker": f"A{i}", "deep_link": f"https://s/{i}"}
+                for i in range(start, n)]
+    store = SimpleNamespace(rows=lambda **k: rows(150))
+    gone: set[str] = set()
+    manifest = SimpleNamespace(documents=lambda: [], tombstoned_ids=lambda: gone)
+    env = build.Env(ask_fn=None, store=store, db=EvalDB(Path(tempfile.mkdtemp()) / "e.db"), manifest=manifest,
+                    root=Path(tempfile.mkdtemp()), private=Path(tempfile.mkdtemp()),
+                    visibility=Visibility.everything_public(), judges=["j1", "j2"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        n = build.seed_dev(env, split="dev-articles")
+    assert env.db.target("dev-articles")["target"] == 30 and n == 42, "20% of 150, oversampled"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert build.seed_dev(env, split="dev-articles") == 0, "a rebuild never samples again"
+    for q in env.db.questions("dev-articles")[:25]:
+        env.db.set_status(q["qid"], "accepted")
+    for q in env.db.questions("dev-articles")[25:]:
+        env.db.set_status(q["qid"], "discarded")
+    store.rows = lambda **k: rows(300)                        # 150 new articles indexed
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        added = build.seed_dev(env, split="dev-articles", top_up=True)
+    qs = env.db.questions("dev-articles")
+    assert env.db.target("dev-articles")["target"] == 60 and added == 49, out.getvalue()   # 35 missing x 1.4
+    new = [q for q in qs if q["status"] == "seeded"]
+    assert all(int(q["record"]["doc_id"][-9:]) >= 150 for q in new), "the Documents added since go first"
+    assert len({q["record"]["doc_id"] for q in qs}) == len(qs), "never two questions from one Document"
+    assert new[0]["qid"] == "deva-0043", "ids continue"
+    # a removed Document retires its question at the next decision
+    first = env.db.questions("dev-articles", ("accepted",))[0]
+    gone.add(first["record"]["doc_id"])
+    env.db.save_pool(first["qid"], {first["seed_moment"]: (["seed"], 1)}, 20)
+    res = build._decide(env, "dev-articles")
+    assert res["retired"] == 1 and env.db.questions("dev-articles", ("retired",))[0]["qid"] == first["qid"]
+
+
+def test_ops_runs_only_what_changed_resumes_and_stops_at_a_failed_gate():
+    import contextlib
+    import io
+    from ytbrain import ops
+    from ytbrain.config import EVAL_DATA
+    if ops.STATE.exists():
+        ops.STATE.unlink()
+    base = EVAL_DATA / "runs" / "baseline-all-full.json"
+    if base.exists():
+        base.unlink()
+    calls, fail = [], {}
+
+    def call(argv):
+        calls.append(" ".join(a for a in argv if not a.replace(".", "").isdigit()))
+        for key, code in fail.items():
+            if key in calls[-1]:
+                return code
+        return 0
+
+    def run(**kw):
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = ops.Ops(ops.Options(**{"version": "skip", **kw}), call=call, say=print).run()
+        return code, out.getvalue()
+
+    code, out = run()
+    assert code == 0, out
+    assert calls[:4] == ["sync", "clean", "extract", "verify"] and "index" in calls
+    assert "eval run --config full" in calls and "eval judge --config full --max-cost" in calls
+    assert "eval rescore --config full --save-baseline" in calls, "the first eval becomes the baseline"
+    assert any(c.startswith("script scripts/assemble_plugin.py") for c in calls)
+    assert "eval coach --plugin dist/plugin --max-cost" in calls, "a new build gets its coach eval"
+
+    code, out = run()                                    # nothing changed
+    assert code == 0 and "eval skipped: nothing changed" in out and "plugin skipped: nothing changed" in out
+    assert not any(c.startswith("eval") or c.startswith("pack") for c in calls), calls
+
+    base.parent.mkdir(parents=True, exist_ok=True)
+    base.write_text("{}")
+    fail["eval judge"] = 2                               # stopped mid-eval (spend cap, endpoint)
+    code, out = run(plan="eval", force=True)
+    assert code == 2 and "resumes here" in out
+    fail.clear()
+    code, out = run(plan="eval")                          # resumes at the judge, not the questions
+    assert "resuming the eval run" in out and calls[0] == "eval judge --config full --max-cost", calls
+    assert calls[1:] == ["eval rescore --config full --refresh-baseline",
+                         "eval rescore --config full --compare full",
+                         "eval rescore --config full --save-baseline"]
+    fail["--compare full"] = 1                           # a real regression
+    code, out = run(plan="all", force=True)
+    assert code == 1 and "FAIL" in out and not any(c.startswith("pack") for c in calls), "no plugin after a FAIL"
+    assert "eval rescore --config full --save-baseline" not in calls, "the baseline is kept"
+    fail.clear()
+    code, out = run(plan="plugin")
+    assert "plugin skipped: the current index has no passing eval" in out
+
+
+def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
+    import contextlib
+    import io
+    import json as _json
+    from ytbrain import ops, runstatus
+    from ytbrain.config import EVAL_DATA
+    for f in (ops.STATE, ops.LAST_RUN, EVAL_DATA / "runs" / "baseline-all-full.json"):
+        if f.exists():
+            f.unlink()
+    assert runstatus.classify("HTTP 402: insufficient credits") == "endpoint"
+    assert runstatus.classify("Connection reset by peer") == "network"
+    assert runstatus.classify("HTTP 429 rate limit") == "network" and runstatus.classify("budget") == "budget"
+    calls, script, slept = [], {}, []
+
+    def call(argv):
+        calls.append(" ".join(a for a in argv if not a.replace(".", "").isdigit()))
+        for key, todo in script.items():
+            if key in calls[-1] and todo:
+                reason, code = todo.pop(0)
+                runstatus.record(reason, f"{reason} detail")
+                return code
+        return 0
+
+    versions = {"v": "0.1.0"}
+    fake = type("R", (), {"current_version": staticmethod(lambda root: versions["v"]),
+                          "set_version": staticmethod(lambda root, new: versions.update(v=new))})
+    real_release = ops._release
+    ops._release = lambda: fake
+    answers = []
+
+    def run(**kw):
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            o = ops.Ops(ops.Options(**kw), call=call, say=print, sleep=slept.append,
+                        ask=lambda q, t: answers.pop(0) if answers else None)
+            code = o.run()
+        return code, out.getvalue()
+    try:
+        # the network: sync retried twice, then the run goes on with what is fetched
+        script["sync"] = [("network", 2)] * 3
+        code, out = run(plan="ingest")
+        assert code == 0 and calls.count("sync") == 3 and slept == [60, 300], out
+        assert "continuing with what is already fetched" in out
+        # a refused endpoint stops at once, says what to fix, and resumes there
+        script["extract"] = [("endpoint", 1)]
+        code, out = run(plan="ingest", sync=False)
+        assert code == 1 and calls.count("extract") == 1 and "LLM endpoint refused" in out
+        assert "Resume: ytbrain ops ingest" in ops.LAST_RUN.read_text()
+        code, out = run(plan="ingest", sync=False)
+        assert code == 0 and calls[0] == "extract", "resumes at the extract"
+        # the first eval: a baseline; the plugin asks for a version (minor), the coach hits the plan limit
+        answers.append("m")
+        script["eval coach"] = [("plan_limit", 2)]
+        code, out = run(plan="all", sync=False)
+        assert code == 0 and versions["v"] == "0.2.0", out
+        assert "coach eval pending" in ops.LAST_RUN.read_text(), "the plugin is built; the coach waits for the reset"
+        code, out = run(plan="plugin")
+        assert "eval coach --plugin" in " ".join(calls) and not any(c.startswith("pack") for c in calls), \
+            "only the pending coach eval runs again"
+        # a hand-set version is kept; no answer means patch
+        versions["v"] = "0.5.0"
+        code, out = run(plan="plugin", force=True)
+        assert versions["v"] == "0.5.0" and "set since the last build" in out
+        code, out = run(plan="plugin", force=True)
+        assert versions["v"] == "0.5.1" and "no answer: patch 0.5.1" in out
+        # references: the baseline in force before a change is kept, dated
+        base = EVAL_DATA / "runs" / "baseline-all-full.json"
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(_json.dumps({"at": "2026-09-30T10:00:00", "config": "full"}))
+        state = _json.loads(ops.STATE.read_text())
+        state["kinds"] = ["talk"]                     # as if chapters had never been indexed
+        ops.STATE.write_text(_json.dumps(state))
+        o = ops.Ops(ops.Options(), call=call, say=lambda m: None)
+        o.load()
+        o.indexed_kinds = lambda: {"talk", "chapter"}
+        o.save_references(base)
+        assert (base.parent / "baseline-all-full-2026-09-30.json").exists()
+        assert (base.parent / "baseline-all-full-before-chapter.json").exists()
+    finally:
+        ops._release = real_release
+        runstatus.clear()
+
+
+def test_run_files_of_a_set_with_a_dash_are_found_under_that_set():
+    from ytbrain.eval.run import RUN_NAME, latest_run
+    m = RUN_NAME.fullmatch("dev-articles-full-series3-2026-10-01T101010.run")
+    assert m["split"] == "dev-articles" and m["config"] == "full-series3"
+    assert RUN_NAME.fullmatch("all-full-2026-10-01T101010.run")["split"] == "all"
+    assert RUN_NAME.fullmatch("dev-full-2026-10-01T101010.run")["config"] == "full"
+    with tempfile.TemporaryDirectory() as d:
+        for name in ("dev-full-2026-10-01T101010.run", "dev-articles-full-2026-10-02T101010.run"):
+            (Path(d) / name).write_text("")
+        assert latest_run(Path(d), "dev", "full").name == "dev-full-2026-10-01T101010.run"
+        assert latest_run(Path(d), "dev-articles", "full").name == "dev-articles-full-2026-10-02T101010.run"
+
+
+def test_a_pool_extension_grades_the_new_moments_of_every_split_in_the_run():
+    """`eval judge` used to grade only `dev` questions, so a private question's new Moments were
+    pooled but never graded and the next judge stopped on them forever."""
+    from ytbrain.eval import build
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.eval.llm import Budget
+    env = build.Env(ask_fn=_fake_ask([]), db=EvalDB(Path(tempfile.mkdtemp()) / "e.db"),
+                    root=Path(tempfile.mkdtemp()), private=Path(tempfile.mkdtemp()), judges=["j1", "j2", "j3"])
+    env.moment_text = lambda m: "pricing advice"
+    qs = []
+    for qid, split in (("dev-0001", "dev"), ("devp-0001", build.PRIVATE_SPLIT)):
+        rec = {"question": "How should I do pricing?"}
+        env.db.upsert_question(qid, split, 1, "accepted", rec, text=rec["question"], seed_moment=moment_id(YT, 60))
+        env.db.save_pool(qid, {moment_id(YT, 60): (["seed"], 1)}, 20)
+        qs += env.db.questions(split, ("accepted",))
+    assert build.judge_step(env, "all", Budget(5, 0), questions=qs) is None
+    assert all(not build.decided_labels(env, q["qid"])[1] for q in qs), "both splits' Moments are graded"
 
 
 # --- end to end: build, resume, spend cap, run ------------------------------
@@ -616,6 +1057,73 @@ def test_run_parallel_gives_up_on_a_stuck_call_and_reports_failures():
     assert "2 call(s) failed" in out.getvalue() and "judge skipped" in out.getvalue()
 
 
+def test_run_parallel_asks_a_slow_call_again_and_takes_the_first_answer():
+    import contextlib, io, threading
+    from ytbrain.eval import llm
+    release = threading.Event()
+    calls, seen, lock = {}, [], threading.Lock()
+
+    def work(job):
+        with lock:
+            calls[job] = calls.get(job, 0) + 1
+            n = calls[job]
+        if job == "slow" and n == 1:
+            release.wait(20)                  # the provider hangs on this request, not on the repeat
+        return job.upper()
+
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        stopped = llm.run_parallel(["a", "slow", "b", "c"], work,
+                                   lambda j, r, e: seen.append((j, r, type(e).__name__ if e else None)),
+                                   workers=4, label="t", heartbeat_s=0.2, deadline_s=15.0, hedge_s=0.3)
+    release.set()
+    assert stopped is None
+    assert sorted(seen) == [("a", "A", None), ("b", "B", None), ("c", "C", None), ("slow", "SLOW", None)]
+    assert calls["slow"] == 2 and calls["a"] == 1                  # only the slow one was repeated
+    assert "asking again in parallel" in out.getvalue()
+
+
+def test_run_parallel_does_not_ask_again_while_the_provider_is_rate_limiting():
+    import contextlib, io, threading, time
+    from unittest import mock
+    from ytbrain.eval import llm
+    calls, lock = {}, threading.Lock()
+
+    def work(job):
+        with lock:
+            calls[job] = calls.get(job, 0) + 1
+        if job == "slow":
+            time.sleep(1.0)                   # waiting out 429s, not hung
+        return job
+
+    with contextlib.redirect_stdout(io.StringIO()) as out, \
+            mock.patch.object(llm.runner, "current_rpm", return_value=6.0), \
+            mock.patch.object(llm.runner, "rpm_ceiling", return_value=60.0):
+        llm.run_parallel(["a", "slow"], work, lambda j, r, e: None,
+                         workers=2, label="t", heartbeat_s=0.2, deadline_s=15.0, hedge_s=0.2)
+    assert calls == {"a": 1, "slow": 1}
+    assert "asking again" not in out.getvalue()
+
+
+def test_run_parallel_reports_a_hedged_job_once_when_both_attempts_fail():
+    import contextlib, io, threading, time
+    from ytbrain.eval import llm
+    seen, lock, n = [], threading.Lock(), [0]
+
+    def work(job):
+        if job != "bad":
+            return job
+        with lock:
+            n[0] += 1
+        time.sleep(1.2)                   # long enough for the loop to ask again before this fails
+        raise ValueError("provider said no")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        llm.run_parallel(["ok", "bad"], work, lambda j, r, e: seen.append((j, type(e).__name__ if e else None)),
+                         workers=2, label="t", heartbeat_s=0.2, deadline_s=15.0, hedge_s=0.2)
+    assert sorted(seen) == [("bad", "ValueError"), ("ok", None)]   # settled once, not twice
+    assert n[0] == 2
+
+
 def test_a_paid_call_that_fails_validation_still_counts_against_the_cap():
     from ytbrain.eval import build
     from ytbrain.eval.llm import Budget
@@ -827,7 +1335,7 @@ def test_coach_eval_grades_gates_resumes_and_checks_memory_state():
                                 {"check": "profile", "field": "stage", "equals": "mvp"},
                                 {"check": "goals", "min": 1}]}]}
     real = C.load_cases
-    C.load_cases = lambda g: cases[g]
+    C.load_cases = lambda g, plugin=None: cases[g]
     try:
         with contextlib.redirect_stdout(io.StringIO()) as out:
             summ, code = C.run_gates(env, ["g2", "g4", "g6", "g5"], plugin, runner=run)
@@ -911,7 +1419,7 @@ def test_coach_eval_stops_at_the_hosts_usage_limit_and_keeps_finished_cases():
     cases = {"g4": [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(5)],
              "g6": [{"id": "d1", "prompt": "a and b", "parts": ["a", "b"]}]}
     real = C.load_cases
-    C.load_cases = lambda g: cases[g]
+    C.load_cases = lambda g, plugin=None: cases[g]
     try:
         with contextlib.redirect_stdout(io.StringIO()) as out:
             summ, code = C.run_gates(env, ["g4", "g6"], plugin, runner=run)
@@ -946,7 +1454,7 @@ def test_coach_eval_stops_when_the_plugin_is_rebuilt_mid_run():
     env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
                            "ask": staticmethod(lambda *a, **k: Answer(C.Verdict(passed=True, reason="r"), cost=0))})()
     real = C.load_cases
-    C.load_cases = lambda g: [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(3)]
+    C.load_cases = lambda g, plugin=None: [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(3)]
     try:
         with contextlib.redirect_stdout(io.StringIO()) as out:
             summ, code = C.run_gates(env, ["g4", "g6"], plugin, runner=run)
@@ -966,6 +1474,42 @@ def test_labelled_pack_variants_keep_their_configs_gate():
         raise AssertionError("an unknown name must be refused")
     except RuntimeError as e:
         assert "unknown configuration" in str(e)
+
+def test_coach_citations_are_checked_for_every_source_kind_without_a_judge():
+    from ytbrain.eval import coach as C
+    t = C.Turn(text="")
+    t.tools = [{"name": C.SEARCH, "input": {"query": "people"}, "result":
+                '1. [advice] Keep good people\n   — Jim Collins, "First Who" in Good to Great, PDF p. 47 (2001) · item_id b1\n'
+                '2. [advice] Charge early\n   — Seibel, "Pricing" (2019) · https://www.youtube.com/watch?v=abcdefghijk&t=760s · item_id t1\n'
+                '3. [advice] Write it down\n   — PG, "Essay" (2009) · https://paulgraham.com/x.html#:~:text=write · item_id a1'}]
+    t.text = ("Hire carefully (Jim Collins, Good to Great, PDF p. 47). Charge early "
+              "([Seibel, \"Pricing\", 2019 · 12:40](https://www.youtube.com/watch?v=abcdefghijk&t=760s)). Write it "
+              "down ([PG, Essay](https://paulgraham.com/x.html#:~:text=write)).")
+    assert C.citation_problems(t) == []
+    t.text += " Also ([made up](https://www.youtube.com/watch?v=abcdefghijk&t=999s)) and PDF p. 300."
+    assert C.citation_problems(t) == ["link not returned by a search: https://www.youtube.com/watch?v=abcdefghijk&t=999s",
+                                      "book page not retrieved: PDF p. 300"]
+    assert t.evidence().startswith("[coach_search") and "PDF p. 47" in t.evidence().split("\n\n")[0], \
+        "a cited book hit goes first, like a cited talk"
+
+
+def test_the_g2_sample_asks_questions_from_every_kind_of_source():
+    from ytbrain.eval import coach as C
+    from ytbrain.eval import files
+    root, overlay = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    lab = lambda qs: {q: {moment_id(YT, 60): {"grade": 3, "judges": {}}} for q in qs}
+    talks = [f"dev-{i:04d}" for i in range(40)]
+    arts = [f"deva-{i:04d}" for i in range(10)]
+    files.write_split(root, "dev", [{"_id": q, "text": q, "split": "dev"} for q in talks], lab(talks), {})
+    files.write_split(root, "dev-articles", [{"_id": q, "text": q, "split": "dev-articles"} for q in arts], lab(arts), {})
+    books = [f"devp-{i:04d}" for i in range(10)]
+    files.write_private(overlay, "dev-private", lab(books), [{"_id": q, "text": q, "split": "dev-private"} for q in books])
+    public = C.sample_ask_questions(20, private=False, root=root, overlay=overlay)
+    assert [sum(c["split"] == s for c in public) for s in ("dev", "dev-articles", "dev-private")] == [17, 3, 0]
+    mine = C.sample_ask_questions(20, private=True, root=root, overlay=overlay)
+    assert [sum(c["split"] == s for c in mine) for s in ("dev", "dev-articles", "dev-private")] == [14, 3, 3]
+    assert len({c["id"] for c in mine}) == 20
+
 
 def test_coach_evidence_puts_the_cited_hits_first_and_a_split_goes_to_the_third_judge():
     from ytbrain.eval import coach as C

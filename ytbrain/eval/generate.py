@@ -14,6 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .. import source_kinds
 from .moments import moment_for
 
 STAGES = ("pre-idea", "idea", "mvp", "pmf", "growth", "fundraising", "scaling", "exit")
@@ -42,14 +43,14 @@ class GeneratedQuestion(BaseModel):
 
 PROMPT = """You write evaluation questions for a search engine that coaches early-stage startup founders.
 
-Below is one piece of knowledge taken from a startup talk. Write ONE question that a real founder
+Below is one piece of knowledge taken from a {source}. Write ONE question that a real founder
 might ask a coach, whose best answer is this knowledge.
 
 Rules:
 - Describe the founder's own situation or problem in their words, first person, 8-35 words.
 - Do not restate the knowledge and do not reuse its distinctive words or phrases; a founder asking
   this would not yet know the answer.
-- No names of the speaker, the talk, or companies mentioned in it.
+- No names of the speaker or author, the {source_short}, or companies mentioned in it.
 - question_type: how_to_advice ("how do I..."), conditional_stage (advice for a specific situation
   or stage), or single_fact (what is true or typical).
 - stage: the company stages the question is about (empty if any stage).
@@ -82,15 +83,27 @@ def cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+def eligible(rows: list[dict], private: bool = False, kinds: tuple[str, ...] | None = None) -> list[dict]:
+    """The Advice/Takeaway rows a question may be written from: grounded (a quote and a position),
+    of the wanted visibility and source kinds."""
+    return [r for r in rows
+            if (r.get("visibility") == "private") == private
+            and (not kinds or source_kinds.for_doc(r["doc_id"]).name in kinds)
+            and r.get("kind") in ("advice", "takeaway") and r.get("evidence") and r.get("start_ms", -1) >= 0]
+
+
 def sample_items(rows: list[dict], n: int, caption_kind: dict[str, str] | None = None,
-                 seed: int = 42) -> list[dict]:
+                 seed: int = 42, private: bool = False,
+                 kinds: tuple[str, ...] | None = None) -> list[dict]:
     """Stratified sample of Advice/Takeaway rows: Topics in proportion to the corpus (at least
-    3 each while available), at most one item per Talk and MAX_PER_SPEAKER per speaker,
-    round-robin over Topics so every prefix of the sample stays balanced. Deterministic."""
+    3 each while available), at most one item per Document and MAX_PER_SPEAKER per speaker,
+    round-robin over Topics so every prefix of the sample stays balanced. Deterministic.
+    `kinds` keeps only seeds from those source kinds (a Tuning split per kind of Source)."""
     rng = random.Random(seed)
     by_topic: dict[str, list[dict]] = defaultdict(list)
+    keep = {id(r) for r in eligible(rows, private, kinds)}
     for r in sorted(rows, key=lambda r: r["item_id"]):
-        if r.get("kind") in ("advice", "takeaway") and r.get("evidence") and r.get("start_ms", -1) >= 0:
+        if id(r) in keep:
             by_topic[(r.get("topics") or ["other"])[0]].append(r)
     for items in by_topic.values():
         rng.shuffle(items)
@@ -130,13 +143,23 @@ def seed_record(row: dict, qid: str) -> dict:
             "start_ms": int(row["start_ms"]), "title": row.get("title") or "",
             "speaker": row.get("speaker") or "", "topic": list(row.get("topics") or []),
             "seed_moment": moment_for(row["doc_id"], row["start_ms"]),
-            "seed_url": f"https://www.youtube.com/watch?v={row['doc_id']}&t={int(row['start_ms']) // 1000}s",
+            "seed_url": seed_url(row),
             "qid": qid}
 
 
+def seed_url(row: dict) -> str:
+    """Where a reviewer finds the seed: the talk at its second, else the item's own deep link
+    (an article's paragraph, a book's page)."""
+    if source_kinds.for_doc(row["doc_id"]).name == "talk":
+        return f"https://www.youtube.com/watch?v={row['doc_id']}&t={int(row['start_ms']) // 1000}s"
+    return row.get("deep_link") or ""
+
+
 def prompt_for(seed: dict) -> str:
+    kind = source_kinds.for_doc(seed.get("doc_id") or "")
     return PROMPT.format(kind=seed["seed_kind"], topic=", ".join(seed["topic"]) or "general",
-                         text=seed["seed_text"])
+                         text=seed["seed_text"], source=kind.source_phrase,
+                         source_short=kind.source_phrase.split()[-1])
 
 
 def check_question(q: str, seed: dict, embed=None, accepted_vecs: list | None = None

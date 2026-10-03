@@ -409,6 +409,24 @@ def test_tools_keep_their_order_schemas_and_annotations():
     _with_client(check)
 
 
+def test_a_book_chapter_hit_names_its_book_and_page_and_has_no_link():
+    try:
+        from founder_coach import server as SV
+    except ImportError:
+        return _skipped("the serve extra is not installed")
+    row = {"item_id": "adv:9780753550304__secrets:a01", "kind": "advice", "text": "Look for secrets",
+           "evidence": "every great business is built around a secret", "title": "Secrets",
+           "speaker": "Peter Thiel and Blake Masters", "year": 2014, "deep_link": "", "start_ms": 74002,
+           "source_kind": "chapter", "series": "Zero to One"}
+    h = SV._hit(row, detailed=False)
+    assert (h.source_kind, h.page, h.series, h.start_s) == ("chapter", 74, "Zero to One", None)
+    text = SV._search_text(SV.SearchOut(query="q", mode="semantic", stage_used=None, hits=[h],
+                                        top_similarity=0.9, gap_suspected=False))
+    assert '"Secrets" in Zero to One, PDF p. 74 (2014) · item_id' in text, text
+    talk = SV._hit({**row, "source_kind": "talk", "series": "Startup School", "deep_link": "https://y/t"}, False)
+    assert talk.page is None and talk.series is None, "talks are unchanged"
+
+
 def test_feedback_through_mcp_records_what_the_runtime_knew():
     async def flow(c, tmp):
         r = await c.call_tool("coach_feedback", {"feedback": {

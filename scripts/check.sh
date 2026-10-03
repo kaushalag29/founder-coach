@@ -1,6 +1,6 @@
 #!/bin/sh
 # What CI runs (.github/workflows/ci.yml), on your machine, before you push:
-#   sh scripts/check.sh                 # secret scan, the six offline suites, generated files, plugin validator
+#   sh scripts/check.sh                 # secret scan, the seven offline suites, generated files, plugin validator
 #   PYTHON=/path/to/python sh scripts/check.sh
 # As a git pre-commit hook it runs on every `git commit`; `git commit --no-verify` skips it (docs/release.md).
 #   SKIP_VALIDATE=1 sh scripts/check.sh # without `claude plugin validate`
@@ -19,12 +19,16 @@ export REQUIRE_ALL_TESTS=1 YTBRAIN_DOTENV=0 PYTHONDONTWRITEBYTECODE=1 YTBRAIN_RO
 echo "== secret scan"
 "$PY" scripts/check_secrets.py
 
-for s in core eval pack coach plugin web; do
+for s in core eval pack coach plugin web books; do
   echo "== test_$s"
   "$PY" "tests/test_$s.py" > "$TMP/$s.log" 2>&1 || { grep -v "^  PASS" "$TMP/$s.log" | tail -40; echo "FAILED: test_$s (a 'skipped in CI' line means an extra is missing: uv pip install -e \".[serve,pack,dev,web]\" \"lancedb>=0.39.0\")"; exit 1; }
   tail -1 "$TMP/$s.log"
   if grep -q "(skipped" "$TMP/$s.log"; then echo "FAILED: test_$s skipped tests (install the extras: see AGENTS.md)"; exit 1; fi
 done
+
+echo "== all suites in one process (what \`pytest tests\` does: catches state leaking between suites)"
+"$PY" -m pytest tests -q -p no:cacheprovider > "$TMP/pytest.log" 2>&1 || { tail -40 "$TMP/pytest.log"; echo "FAILED: the suites pass alone but not together"; exit 1; }
+tail -1 "$TMP/pytest.log"
 
 echo "== plugin assembles from a test pack; generated files are fresh"
 before="$(cat founder_coach/product.json founder_coach/playbooks/*.md | cksum)"

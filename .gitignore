@@ -68,6 +68,11 @@ docs/ytbrain-docs/
 .plugin.building-*
 # eval: the benchmark in eval/ is tracked; run results live in data/eval/ (ignored)
 eval/private/
+# Books are copyrighted: a PDF or EPUB never belongs in git (yours live in data/books, already ignored; this
+# catches one dropped anywhere else). The tiny synthetic fixtures the tests build are the exception.
+*.pdf
+*.epub
+!tests/fixtures/**/*.pdf
 # local Claude / agent settings (shared settings.json may be committed)
 .claude/settings.local.json
 .claude/worktrees/

@@ -22,10 +22,14 @@ eval    = ["lancedb>=0.39.0", "sentence-transformers>=3.0", "fastembed>=0.8"]   
 # The Knowledge pack and its ONNX query models (no torch): `ytbrain pack build`,
 # `search --pack`, `eval run --config pack`, and the coach runtime (founder_coach)
 pack    = ["fastembed>=0.8", "numpy>=1.26"]
-dev     = ["pytest>=8.0", "ruff>=0.6"]
+dev     = ["pytest>=8.0", "ruff>=0.6", "pypdfium2>=4.30"]    # pypdfium2: the book probe in the offline tests
 # Website Sources (docs/web-sources-plan.md): main-text extraction and, for JavaScript sites,
 # a headless browser (then run once: playwright install chromium)
 web     = ["trafilatura>=2.2", "playwright>=1.55"]
+# PDF Books (ADR-0014): PDFium only, no model and no download.
+pdf     = ["pypdfium2>=4.30"]                                  # the default, model-free parser
+# Parked (ADR-0014 amendment): Docling's layout models, downloaded once from Hugging Face; torch as in `index`
+pdf-docling = ["docling-slim[format-pdf,convert-core,models-local]>=2.130", "pypdfium2>=4.30"]
 # yt-dlp plugin that supplies YouTube PO tokens; also needs a provider server or
 # script-mode checkout (README: "Optional: a PO-token provider")
 pot     = ["bgutil-ytdlp-pot-provider~=2.0"]   # 2.x, matching the server checkout (branch 2.0.0)
@@ -39,4 +43,4 @@ include = ["ytbrain*", "founder_coach*"]
 
 [tool.setuptools.package-data]
 founder_coach = ["playbooks/*.md", "product.json"]
-ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl"]
+ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl", "books/ligature_words.txt"]
