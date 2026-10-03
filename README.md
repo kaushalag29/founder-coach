@@ -114,11 +114,12 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 | Doc | What's in it |
 |---|---|
 | [CONTEXT.md](CONTEXT.md) | The glossary: Advice, Evidence, Verified, Stage, Commitment, Check-in, Feedback… |
-| [docs/adr/](docs/adr/) | Architecture decisions (14), e.g. [retrieval, not generation](docs/adr/0002-mcp-server-retrieves-host-agent-generates.md), [only Verified knowledge](docs/adr/0004-only-verified-knowledge-reaches-the-coach.md), [one product id](docs/adr/0012-vertical-founder-coach-with-a-build-time-product-id.md) |
+| [docs/adr/](docs/adr/) | Architecture decisions (15), e.g. [retrieval, not generation](docs/adr/0002-mcp-server-retrieves-host-agent-generates.md), [only Verified knowledge](docs/adr/0004-only-verified-knowledge-reaches-the-coach.md), [one product id](docs/adr/0012-vertical-founder-coach-with-a-build-time-product-id.md) |
 | [docs/phase3-plan.md](docs/phase3-plan.md) | The coach: v1 scope, quality gates, MCP surface, skills, store (§11 is the implementation spec) |
 | [docs/phase2-plan.md](docs/phase2-plan.md) | Milestones M0–M6 and the pipeline design |
 | [docs/eval-spec.md](docs/eval-spec.md) | The retrieval benchmark (Tuning and Holdout sets, judges, metrics) |
 | [docs/commands.md](docs/commands.md) | Every command, by phase |
+| [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | Next: one engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); proposed |
 | [docs/ops.md](docs/ops.md) | `ytbrain ops`: the whole loop in one resumable command |
 | [docs/release.md](docs/release.md) | Repos, CI, beta releases, what testers do, renaming |
 | [docs/m3-status.md](docs/m3-status.md) | Where the coach work stands and what's next |

@@ -11,6 +11,7 @@ checkpoint independence, series precedence, and deterministic serialization.
 import json
 import os
 os.environ["YTBRAIN_DOTENV"] = "0"          # hermetic: never read the developer's .env (keys, backend)
+os.environ.setdefault("YTBRAIN_SOURCES_FILE", os.path.join(__import__("tempfile").mkdtemp(prefix="ytbrain-nosources-"), "sources.yaml"))   # hermetic: never read your sources.yaml (the file does not exist)
 import sys
 import tempfile
 from pathlib import Path
@@ -46,6 +47,12 @@ def _skipped(why: str) -> None:
     if os.environ.get("REQUIRE_ALL_TESTS") == "1":
         raise AssertionError(f"skipped in CI: {why}")
     print(f"    (skipped: {why})")
+
+
+def test_the_suites_never_see_a_real_sources_yaml():
+    """A configured machine must fail like CI: a test that needs sources.yaml writes its own."""
+    from ytbrain import cli
+    assert not cli.SOURCES.exists(), f"{cli.SOURCES} exists: tests would read your real sources.yaml"
 
 def test_a_unit_too_long_for_the_embedding_window_is_cut_into_the_fewest_pieces_that_fit():
     from ytbrain.config import EMBED_MAX_SEQ

@@ -57,7 +57,7 @@ knowledge, and is growing into a founder-coach served over MCP.
   pages (ADR-0004).
 - **Given vs generated fields:** Series, provenance, title and dates come from Sources, yt-dlp
   or the page's own metadata, never from the model; change them with `ytbrain refresh`, not re-extraction.
-- **Tests stay offline and hermetic:** stub yt-dlp, LLM calls and HTTP (httpx.MockTransport, a localhost server, a fake browser); tests use `YTBRAIN_ROOT` set to a temp dir, set `YTBRAIN_DOTENV=0` before importing `ytbrain` (so a developer's `.env` never changes their behaviour or spends money; it also stops `founder_coach/settings.py` reading `.env` files) and never read the repo's `sources.yaml` (patch `cli.SOURCES` to a temp file). A clean checkout must pass exactly like a configured machine (CI runs one).
+- **Tests stay offline and hermetic:** stub yt-dlp, LLM calls and HTTP (httpx.MockTransport, a localhost server, a fake browser); tests use `YTBRAIN_ROOT` set to a temp dir, set `YTBRAIN_DOTENV=0` before importing `ytbrain` (so a developer's `.env` never changes their behaviour or spends money; it also stops `founder_coach/settings.py` reading `.env` files) and never read the repo's `sources.yaml` (patch `cli.SOURCES` to a temp file; `scripts/check.sh` sets `YTBRAIN_SOURCES_FILE` to a missing file so a configured machine fails like CI). A clean checkout must pass exactly like a configured machine (CI runs one).
 
 ## Data
 

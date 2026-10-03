@@ -91,8 +91,12 @@ _Avoid_: grounded, validated, checked
 A recommendation consolidated from Advice across several Documents, with its supporting Advice and any dissenting Advice.
 _Avoid_: best practice, rule, consensus
 
+**Fact**:
+A declarative statement drawn from one Document, carrying its own Evidence, that is true or false rather than something to do ("async replication can lose acknowledged writes on failover"). A Post's statement is the Speaker's view, never a Fact.
+_Avoid_: claim, statement, insight
+
 **Knowledge item**:
-Any retrievable unit of knowledge: Advice, a Takeaway, a Passage or a Document summary.
+Any retrievable unit of knowledge: Advice, a Fact, a Takeaway, a Passage or a Document summary.
 _Avoid_: record, entry, result
 
 **Citation**:
@@ -110,6 +114,36 @@ _Avoid_: persona, target user
 **Knowledge pack**:
 A distributable snapshot of the Knowledge items — Advice, Takeaways and Document summaries with their Citations, but no Passages unless built with `--with-passages` for the private beta — that lets the coach run without ingesting anything.
 _Avoid_: dataset, dump, index (the local store)
+
+## Library and Packs
+
+**Library**:
+Everything ingested on this machine, synced, extracted, verified and indexed once, whatever Pack uses it.
+_Avoid_: corpus (when meaning all Packs), database, knowledge base
+
+**Domain**:
+A named subject area (startup, finance, leadership, system design) that Sources and Books belong to, one or several each; a Pack chooses Domains, and a question is routed to Domains before it is searched. Category and Topic live inside a Domain.
+_Avoid_: category, profile, vertical, collection
+
+**Pack**:
+One configured agent over the Library: its Domains, persona, facets, Playbooks, Risk tier and Eval questions. Founder Coach is the Pack `founder`.
+_Avoid_: agent (the host is the agent), plugin (how Packs are installed), profile, Knowledge pack (the file a Pack ships)
+
+**Risk tier**:
+How much harm a wrong answer can do in a Domain (low, medium, high); a Pack takes the highest of its Domains. It sets the evidence a confident answer needs and the gates a Pack must pass.
+_Avoid_: safety level, sensitivity
+
+**Catalog card**:
+A generated description of a Domain, Book, Series, Document or Section (what it covers, key terms, dates), used to route and browse and never cited.
+_Avoid_: summary (a Document summary is Verified knowledge), index entry
+
+**Coverage**:
+How well the Library answers a question, reported with every search as strong, partial or none, from calibrated relevance; none means the coach states a Gap.
+_Avoid_: confidence (the host's), sufficiency score
+
+**Post**:
+A Document whose Source kind is a short social-media post or thread by one Speaker, with the post's URL as its Locator.
+_Avoid_: tweet, update, status
 
 ## Startup
 
@@ -176,6 +210,10 @@ _Avoid_: segment, clip, chunk
 **Eval question**:
 A question with graded labels saying which Moments should come back for it, and a cited reference answer. Out-of-corpus Eval questions expect a Gap instead.
 _Avoid_: test case, query (the text alone), golden question
+
+**Gap question**:
+An out-of-corpus Eval question whose right answer is a Gap; Gap questions measure how often the coach answers when it should decline, and calibrate Coverage.
+_Avoid_: unanswerable question, negative example
 
 **Tuning set**:
 Eval questions generated from the corpus, used to choose search settings and to catch regressions on every change.

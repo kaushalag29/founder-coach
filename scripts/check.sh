@@ -14,7 +14,7 @@ elif [ -x .venv/bin/python ] && .venv/bin/python -c "" 2>/dev/null; then PY=".ve
 else PY="python3"; fi
 echo "python: $PY"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-export REQUIRE_ALL_TESTS=1 YTBRAIN_DOTENV=0 PYTHONDONTWRITEBYTECODE=1 YTBRAIN_ROOT="$TMP/data"
+export REQUIRE_ALL_TESTS=1 YTBRAIN_DOTENV=0 PYTHONDONTWRITEBYTECODE=1 YTBRAIN_ROOT="$TMP/data" YTBRAIN_SOURCES_FILE="$TMP/no-sources.yaml"   # like CI: your sources.yaml is never read
 
 echo "== secret scan"
 "$PY" scripts/check_secrets.py

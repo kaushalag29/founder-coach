@@ -174,7 +174,7 @@ class Ops:
         try:
             from .cli import _visibility
             vis = _visibility()
-        except Exception:                # noqa: BLE001 -- no sources.yaml: everything public
+        except (Exception, SystemExit):  # noqa: BLE001 -- no sources.yaml (the CLI exits, which is not an Exception): everything public
             from .visibility import Visibility
             vis = Visibility.everything_public()
         return {PRIVATE_SPLIT if vis.is_private(d) else source_kinds.for_doc(d).eval_split for d in docs}
@@ -184,7 +184,7 @@ class Ops:
         try:
             from .cli import _visibility
             return bool(_visibility().private_docs)
-        except Exception:                # noqa: BLE001 -- no sources.yaml yet: nothing private
+        except (Exception, SystemExit):  # noqa: BLE001 -- no sources.yaml yet (the CLI exits): nothing private
             return False
 
     def child(self, step: Step) -> int:

@@ -5,6 +5,10 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
 
 ## 2026-10-01 (`ytbrain ops` runs unattended: stop reasons, retries, notices, versions, references)
 
+- **CI fix, and the gap behind it:** `ops` stopped on a missing `sources.yaml` (the CLI's exit is a `SystemExit`, which
+  `except Exception` doesn't catch), a test that passed only where `sources.yaml` existed. Every suite now points
+  `YTBRAIN_SOURCES_FILE` at a missing file before importing `ytbrain`, so it fails the same on your machine as on CI,
+  however it is run (`python tests/test_x.py`, `pytest`, `scripts/check.sh`); a guard test checks it.
 - **No more waiting on the last call:** an eval step (questions, rewrites, grading) that had one call hanging at the
   provider sat at `100/101` for up to 7 minutes until the deadline. A call slower than 5x the median (at least 30 s)
   is now asked again in parallel and the first answer wins; the deadline stays as the last resort.

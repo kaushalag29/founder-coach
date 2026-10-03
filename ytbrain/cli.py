@@ -43,7 +43,7 @@ from .lock import LockBusy, exclusive
 from .manifest import Manifest, StageState
 
 
-SOURCES = Path(__file__).resolve().parents[1] / "sources.yaml"            # yours, git-ignored
+SOURCES = Path(os.environ.get("YTBRAIN_SOURCES_FILE") or Path(__file__).resolve().parents[1] / "sources.yaml")   # yours, git-ignored; the env var points tests at a file that need not exist
 SOURCES_EXAMPLE = SOURCES.with_name("sources.example.yaml")              # tracked template
 SYNC_TYPES = {"youtube": "youtube_playlist", "website": "website", "book": "pdf_books"}   # `sync --type` -> Source type
 
