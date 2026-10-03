@@ -5,6 +5,11 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
 
 ## 2026-10-01 (`ytbrain ops` runs unattended: stop reasons, retries, notices, versions, references)
 
+- **CI fix, second one:** `test_ac3_raising_depth_reopens_the_old_frontier` used a month page of bare links, which
+  trafilatura 2.3.0 (what CI installs fresh) reads as 0 words and 2.2.0 as 2; at 0 words an unrenderable page is
+  `failed` and retried each run, so the "finished pages wait for their re-check" assertion broke on CI only. The
+  page now has a heading, a listing under every release. The local-server CLI test also uses a fresh article text
+  each run, so a reused data root no longer skips it as a duplicate.
 - **CI fix, and the gap behind it:** `ops` stopped on a missing `sources.yaml` (the CLI's exit is a `SystemExit`, which
   `except Exception` doesn't catch), a test that passed only where `sources.yaml` existed. Every suite now points
   `YTBRAIN_SOURCES_FILE` at a missing file before importing `ytbrain`, so it fails the same on your machine as on CI,

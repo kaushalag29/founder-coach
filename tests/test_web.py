@@ -315,6 +315,12 @@ def test_ac3_a_sitemap_listed_inside_a_urlset_is_read_as_a_sitemap():
     assert not any(u.endswith(".xml") for u in q), q
 
 
+# A month page: a heading and a list of links. A page of bare links extracts to 0 words with some trafilatura
+# releases (2.3.0) and 2 with others (2.2.0); at 0 words an unrenderable page is `failed` and retried every
+# run, which is not what this test is about. With a heading it is a listing under every release.
+MONTH_PAGE = ("<html lang='en'><head><title>October 2026</title></head><body><h1>October 2026</h1><ul><li><a href='post.html'>A post</a></li></ul></body></html>")
+
+
 def test_ac3_raising_depth_reopens_the_old_frontier():
     """Also: the start page is fetched every run, even after a skip. Found on blog.samaltman.com: depth 1 from /archive reaches the month pages but not the posts
     they list. Raising `depth` in sources.yaml must reach them on the next run, without waiting a
@@ -322,7 +328,7 @@ def test_ac3_raising_depth_reopens_the_old_frontier():
     if not _needs_web():
         return
     site = Site({"/robots.txt": (404, ""), "/essays/": listing(["month1.html"]),
-                 "/essays/month1.html": "<html lang='en'><body><a href='post.html'>A post</a></body></html>",
+                 "/essays/month1.html": MONTH_PAGE,
                  "/essays/post.html": article("A post")})
     ad, m, _, _ = _env(site)
     _quiet(ad.sync, m, [_src(depth=1)], _args())
@@ -709,7 +715,8 @@ def test_cli_sync_and_clean_over_a_real_local_http_server():
     site = Path(tempfile.mkdtemp())
     (site / "essays").mkdir()
     (site / "essays" / "index.html").write_text(listing(["a.html", "b.html"] + [f"n{i}.html" for i in range(9)]))
-    (site / "essays" / "a.html").write_text(article("Local essay"))
+    # a title no earlier run can have left behind: the same text in a reused data root is a duplicate and is skipped
+    (site / "essays" / "a.html").write_text(article(f"Local essay {os.urandom(4).hex()}"))
     (site / "essays" / "b.html").write_text("<html lang='en'><body><p>Watch.</p>"
                                             "<iframe src='https://www.youtube.com/embed/abcdefghijk'></iframe></body></html>")
     class Quiet(http.server.SimpleHTTPRequestHandler):
