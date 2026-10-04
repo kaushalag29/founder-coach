@@ -1,0 +1,68 @@
+# Domains: the named subject areas of the Library (CONTEXT.md: Domain, docs/library-and-packs-plan.md).
+# A Source says which Domains its Documents belong to (`domains: [...]` in sources.yaml); a Book in a
+# folder named after a Domain (data/books/leadership/...) belongs to it without saying so. The router
+# (M5d) uses `description` and `examples` to decide which Domains a question touches, so write them
+# the way a person would ask. Adding a Domain is adding an entry here and, later, books or Sources.
+#
+#   risk_tier   low | medium | high: how bad a wrong answer is; high tiers answer only from strong evidence
+#   freshness   evergreen | <days>: the half-life of a Document's relevance (markets decay, principles don't)
+#   web_policy  never | when_gap | always_latest: when the host may search the web beside the Library
+default: startup                       # the Domain of a Source that names none
+# Sub-folders of a book folder that only sort files and are not Domains; `ytbrain sync` warns about
+# any other folder that isn't a declared Domain, because its Books would fall back to the default.
+ignore_folders: []
+domains:
+  startup:
+    description: "Starting and running an early-stage startup: ideas, users, product-market fit, growth, hiring, fundraising, founders."
+    examples:
+      - How do I find my first ten customers?
+      - When should I raise a seed round?
+      - How do I split equity with a cofounder?
+    risk_tier: medium
+    freshness: evergreen
+    web_policy: when_gap
+  leadership:
+    description: "Leading and managing people and organizations: management, culture, feedback, hiring and firing, strategy, decision making."
+    examples:
+      - How do I give a hard piece of feedback to a direct report?
+      - How do I build a team culture that lasts as we grow?
+      - When should a founder stop managing and start leading managers?
+    risk_tier: low
+    freshness: evergreen
+    web_policy: when_gap
+  system-design:
+    description: "Software architecture and system design: scalability, data modeling, APIs, reliability, trade-offs, distributed systems."
+    examples:
+      - How should I shard a database that is outgrowing one machine?
+      - When is a message queue better than a direct API call?
+      - How do I design for failure in a distributed system?
+    risk_tier: low
+    freshness: 1825
+    web_policy: when_gap
+  finance:
+    description: "A company's money: accounting basics, reading financial statements, valuation, term sheets and venture deal terms, cap tables, fundraising mechanics."
+    examples:
+      - How is a startup valued at a seed round?
+      - What does a cap table dilution actually do to my share?
+      - What should I negotiate in a venture term sheet?
+    risk_tier: high
+    freshness: 730
+    web_policy: always_latest
+  investment:
+    description: "Investing your own money: stocks, index funds, value investing, risk, asset allocation, the psychology of money and wealth building."
+    examples:
+      - How should I think about index funds versus picking stocks?
+      - What is a margin of safety and how do I apply it?
+      - How do I stop emotions from driving my investing decisions?
+    risk_tier: high
+    freshness: evergreen
+    web_policy: always_latest
+  coding:
+    description: "Writing and maintaining code: clean code, design patterns, refactoring, testing, craftsmanship and professional habits of programmers."
+    examples:
+      - How do I name functions and keep them small?
+      - When is the Strategy pattern better than a conditional?
+      - How do I refactor legacy code safely?
+    risk_tier: low
+    freshness: evergreen
+    web_policy: when_gap

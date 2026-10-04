@@ -1,3 +1,4 @@
+Coverage: strong [provisional thresholds].
 Stage boost: idea · mode semantic
 1. [advice] Talk to users before you build or raise; a plan with no users is a guess about what they want.
    — Jared Friedman, "How to Get Your First Customers" (2022) · https://www.youtube.com/watch?v=BBBBBBBBBB2&t=312s · item_id adv:BBBBBBBBBB2:a03

@@ -45,6 +45,10 @@ CONFIGS = {
     "full-neardup": {"rerank": True, "stage_boost": False, "diversity": "neardup"},
     "pack-series3": {"rerank": False, "stage_boost": False, "backend": "pack", "diversity": "series3"},
     "pack-neardup": {"rerank": False, "stage_boost": False, "backend": "pack", "diversity": "neardup"},
+    # automatic Domain routing (founder_coach.router): adopted (`pack build --route`) only when it doesn't
+    # lower nDCG@10 overall or for any source kind's questions
+    "full-route": {"rerank": True, "stage_boost": False, "route": True},
+    "pack-route": {"rerank": False, "stage_boost": False, "backend": "pack", "route": True},
 }
 PACK_KINDS = ["advice", "takeaway", "summary"]
 # below this share of judged top-10 Moments, a comparison says more about the pool than the
@@ -94,7 +98,7 @@ def run_config(store, embed, reranker, queries: list[dict], config: str) -> dict
     for i, q in enumerate(queries, 1):
         stage = (q.get("stage") or [None])[0] if cfg["stage_boost"] else None
         res = search(store, embed, q["text"], stage=stage, top_k=RESULT_DEPTH, kinds=cfg.get("kinds"),
-                     reranker=reranker if cfg["rerank"] else None,
+                     reranker=reranker if cfg["rerank"] else None, route=bool(cfg.get("route")),
                      diversity=POLICIES[cfg.get("diversity", "default")])
         moments = results_to_moments(res)
         best: dict[str, float] = {}

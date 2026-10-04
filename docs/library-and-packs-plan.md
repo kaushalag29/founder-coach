@@ -1,6 +1,6 @@
 # Library and Packs: from Founder Coach to "your own expert agent from your own sources"
 
-Status: **proposed** (2026-10-03). Decisions settled in a grilling session; research behind them in
+Status: **proposed** (2026-10-03); M5a, M5d and M5e built (2026-10-03), awaiting your corpus to measure them. Decisions settled in a grilling session; research behind them in
 the Project doc `claude/ytbrain-generalization-research.md`. Architecture decision: [ADR-0015](adr/0015-one-engine-many-packs-over-one-library.md).
 
 Goal: a new Source or a new use case is configuration, not code, without losing what makes the coach
@@ -30,7 +30,14 @@ what it doesn't know." Nothing retrains a model (ADR-0012 already says so; X's t
 | 15 | Contextual retrieval for Passages and Chapter items, kept only if the eval gate passes. | Best-evidenced cheap gain (about 2/3 fewer failed lookups) |
 | 16 | New Knowledge item type **Fact**; a trade-off is Advice with a condition. | Domain-neutral without distorting statements into advice |
 | 17 | Per Pack: routing questions and **Gap questions** (out of corpus) gate a release; high tier adds a safety gate. | Declining is a requirement, so it is measured |
+| 20 | **The host chooses Domains first.** `coach_get_context` lists the pack's Domains (name, size, what each is about) when there are several; the skills tell the host to pass `domains` per sub-question. A server-side **router** (each Domain scored by the mean cosine of its 3 closest items, so a small Domain is not drowned by a big one) is built, measured by `ytbrain eval route` and `--config pack-route`, and **off by default per pack** (`pack build --route`) until it shows no loss. | An LLM host routes by meaning at no cost; a similarity router is a backstop that must earn its place with numbers. Centroids were dropped: they blur and favour big Domains |
 | 18 | Targets on a 16 GB M2: 1,000 Books + 2,000 Talks/Articles (~1M items), search p95 <= 1.5 s with no GPU, incremental indexing. | Shapes the index and reranker choices below |
+| 19 | **Multi-domain by construction.** A question may touch several Domains: the router returns a set, search takes any-of, results are merged with a floor per routed Domain, and the host splits a multi-part question and routes each part. Adding books for a new Domain needs no code. | The final agent must answer "how do I raise a seed round and also keep my team motivated" from startup and leadership books together |
+| 21 | **Compound questions are split by the host, not the server** (already in the ask playbook, step 2, and in #19/#20). The server never decomposes: no query-time LLM (#12). `eval route`'s composed set measures that a joined question still reaches both Domains when the host does not split. A server-side splitter is added only if `eval gap` shows compound questions failing where a host split cannot help. | One retrieval per sub-question keeps coverage judgeable per Domain and the citations traceable |
+| 22 | **Sources are not routed; Domains are.** Book-level routing (M5b) waits until one Domain holds about 50 Books or the `eval route` miss analysis shows right-Domain, wrong-Book failures. Sources matter for Citations and the high-tier independence rule only. | At 22 Books the rerank within a Domain does this work; a second routing layer would be unmeasured complexity |
+| 23 | **A Book folder that is not a declared Domain is reported.** `ytbrain sync` warns per folder (`ytbrain ops` runs it with `--strict-domains`, exit 1); `ignore_folders:` in `domains.yaml` lists folders that only sort files. | A typo or an undeclared `coding/` silently tagged Books as `startup` once; tags are configuration, so a bad one should be loud |
+| 24 | **A Document's extra Domains are per-Source or per-Book configuration, added only when `eval gap` shows the need** (for example finance-heavy talks tagged `[startup, finance]`, so a high-tier finance question can find two independent voices). Never classified per Document by an LLM at extraction time. | Keeps "Domain is configuration, never extracted" true and every tag auditable; guessing before the numbers exist would be tuning blind |
+| 25 | **Coverage keeps the provisional cosine curve plus a Gap-tuned border shift; the fitted curve is not shipped yet** (2026-10-04). Fitted on the strict labels (grade >= 2) the curve has a base rate of 0.43 and tops out at p 0.699: with the 0.45 / 0.60 / 0.70 rules it refused 40 % of answerable questions and could never call a high-tier answer strong. With the provisional curve: 0 % wrongful refusals, and the border is tuned on Gap questions (`eval gap --tune`). Near-miss Gap questions (right Domain, wrong specifics) are what top-hit cosine separates worst; the lever for them is a reranker score (M5f), and calibration moves to that signal when it lands. | Asymmetric cost: a refused answerable question is a hard failure, a `partial` Gap is hedged by the host (and declined in a high tier); thresholds are re-based only against the signal that will ship |
 
 ## 2. Design
 
@@ -52,6 +59,12 @@ what it doesn't know." Nothing retrains a model (ADR-0012 already says so; X's t
   Entities (typed, replaces `yc_jargon`). Prompts are templates filled from the Source kind and Domain.
 - **Facets** (Stage for founder; lifecycle and concern for system design) are a separate tagging Step per
   Pack, stored as `(item, facet, value, tagger_version)`, re-runnable without re-extracting.
+- Why it matters now (seen on the first coding and system-design books, 2026-10-04): the 2.2 extraction prompt and its
+  enums are startup-shaped. A database chapter gets `category: product-market-fit`, and a pure software-craft chapter
+  (Clean Code, "Formatting") can come back with takeaways but no Advice because "no startup stage applies", which the
+  verifier flags as "no advice". 3 of 165 non-matter chapters in the new books; their takeaways and summaries are indexed
+  normally. The fix belongs here: a Domain-aware prompt variant for non-startup Domains whose hash leaves the startup
+  prompt's hash untouched (a changed prompt hash marks every extraction stale and costs a full re-extract).
 - Migration: existing Talk and Article records stay (Stage becomes a founder facet). Books re-extract
   under 3.0 to gain Facts (181 Chapters, a few dollars); others re-extract only when a Pack needs it.
 
@@ -65,25 +78,31 @@ what it doesn't know." Nothing retrains a model (ADR-0012 already says so; X's t
 
 ### 2.4 Search: route, retrieve, rerank, report
 
-1. **Route** (no LLM): embed the question, score Domain and Book cards (vector + BM25), return top-3
-   Domains with confidences; inside a Domain with more than 50 Books, also pick the top 10 Books.
-   The host may pass `domains` / `books` instead (hard filter).
+1. **Choose Domains.** Normally the host: it reads the pack's Domains from `coach_get_context` and passes
+   `domains` (any-of, several allowed) for each sub-question. As a backstop the server can **route** (no LLM,
+   no extra model, off unless the pack says so): score each Domain by the mean cosine of its 3 closest items,
+   route the Domains within a margin of the best (at most 3), never a forced single choice. Later (M5b) Domain,
+   Book and Series cards refine the choice inside a Domain with more than 50 Books (top 10 Books).
 2. **Retrieve**: top 40 within the routed set + top 40 from the whole Library, RRF-merged with a routed
-   boost tuned on the eval.
+   boost tuned on the eval. With several routed Domains each is retrieved on its own and merged with a
+   floor (at least 2 slots per routed or explicitly named Domain while its hits clear the relevance floor), so a Domain
+   with many books cannot crowd out the one the question also needs.
 3. **Rerank** the top 30 with a small ONNX cross-encoder (or none, if the eval keeps saying so), then
    recency decay per Domain (`score*(1-w) + w*0.5^(age/half_life)`, `w=0` for evergreen), then the
    DiversityPolicy.
 4. **Report** with every response: `coverage` (strong / partial / none), `domains_routed` with
    confidences, `newest_date`, `stale` per Domain, and per hit a calibrated `p_relevant`.
 
-**Coverage** comes from an isotonic curve fitted on our graded labels (reranker or hybrid score ->
-P(grade >= 2)), shipped in the pack manifest. Thresholds per tier, tuned on the Gap questions:
+**Coverage** comes from an isotonic curve fitted on our graded labels (the hit's cosine similarity ->
+P(grade >= 2); built as the closest-passage cosine because it is available with and without the reranker), shipped in the pack
+manifest; until a fit exists a provisional curve anchored at the old 0.60 Gap cut-off is used and every response says
+`coverage_basis: provisional`. `eval gap --tune` adds a `shift` of the border when the curve is right but the border is not. Thresholds per tier, tuned on the Gap questions:
 
 | Tier | strong | partial |
 |---|---|---|
 | low | >= 2 hits with p >= 0.5 | >= 1 hit with p >= 0.35 |
 | medium | >= 2 hits with p >= 0.6 from >= 2 Documents | >= 1 hit with p >= 0.45 |
-| high | >= 2 hits with p >= 0.7 from >= 2 independent Sources | below strong counts as partial |
+| high | >= 2 hits with p >= 0.7 from >= 2 independent Sources (two Books count as independent; two Chapters of one Book do not) | below strong counts as partial |
 
 ### 2.5 The host's rules (skills)
 
@@ -101,6 +120,10 @@ P(grade >= 2)), shipped in the pack manifest. Thresholds per tier, tuned on the 
 
 - Question sets per source kind as today, each question carrying its seed Document's Domains, so the
   **routing set** comes free (expected Domains = the seed's); accuracy@1 and @3.
+- **Composed questions** test multi-domain routing without new books: two questions from different
+  Domains joined into one prompt ("..., and also ..."), expected Domains = both; measured as set recall
+  (every expected Domain routed) and precision (no more than one extra), plus the answer-side check that
+  hits from both Domains reach the top 8.
 - **Gap questions**: ~30 per Pack, written for topics outside its Domains or from Documents held out,
   pooled and judged to confirm no relevant Moment; measure wrongful answers and wrongful refusals.
 - Coach gates G2/G4/G5/G6 per Pack; high tier adds a safety gate.
@@ -110,16 +133,18 @@ P(grade >= 2)), shipped in the pack manifest. Thresholds per tier, tuned on the 
 
 ### M5 — Library and routing (current corpus; Founder Coach unchanged to its users)
 
-| Step | What | Size |
-|---|---|---|
-| M5a | `domains.yaml`, Source and folder Domain tags, `source_id` / `domains` / `facets` through items, LanceDB, pack, `Filter` | S |
-| M5b | Catalog cards (Document cards from Verified summaries; Book, Series, Domain cards generated), OKF markdown export, `browse` tool | M |
-| M5c | Contextual Passages as eval config `full-ctx`; adopted only on PASS | S-M |
-| M5d | Router + route-and-backfill; routing set from existing questions | M |
-| M5e | Calibration, `coverage` in every response, skill rules for web, stop and decline; Gap questions | M |
-| M5f | Latency: ONNX reranker on the top 30, ANN benchmark, p95 measured | S-M |
+Order changed 2026-10-03: the router (multi-domain) moves up, because it is what the final agent needs.
 
-**Done when:** no nDCG@10 regression on any question set; routing accuracy@3 >= 90 %; wrongful answers
+| Step | What | Size | State |
+|---|---|---|---|
+| M5a | `domains.yaml`, Source and folder Domain tags, `source_id` / `domains` through items, LanceDB, pack, `Filter` (any-of), `coach_search domains`, in-place retag | S | **done** |
+| M5d | Host-driven Domain choice (context lists Domains, skills pass `domains`), router (opt-in per pack), route-and-backfill with a floor per routed Domain, composed-question routing eval (`ytbrain eval route`), `routing` and `domains_searched` in every search response | M | **built; the router stays off until `eval route` and `pack-route` say it is safe (needs your corpus)** |
+| M5e | Calibration, `coverage` in every response, skill rules for web, stop and decline; Gap questions | M | **built (`founder_coach/coverage.py`, `eval calibrate`, `eval gap`); curves stay provisional and the router off until your corpus has books in a second Domain and judged labels** |
+| M5b | Catalog cards (Document cards from Verified summaries; Book, Series, Domain cards generated), OKF markdown export, `browse` tool; Book-level routing | M | |
+| M5c | Contextual Passages as eval config `full-ctx`; adopted only on PASS (paid: LLM call per Passage, capped at $15 for all of M5) | S-M | |
+| M5f | Latency: ONNX reranker on the top 30, ANN benchmark, p95 measured | S-M | |
+
+**Done when:** no nDCG@10 regression on any question set; routing accuracy@3 >= 90 % and composed-question set recall >= 90 %; wrongful answers
 on Gap questions <= 10 % with wrongful refusals <= 15 %; search p95 <= 1.5 s from the plugin.
 
 ### M6 — Engine and Packs
@@ -147,7 +172,8 @@ windows (Graphiti- or GBrain-style); a per-Pack embedding or reranker model.
 
 | Scenario | Handling |
 |---|---|
-| Question spans two Domains or Packs | Router returns both; one server searches both |
+| Question spans two Domains or Packs | Router returns both; one search covers both with a floor per Domain; a multi-part prompt is split by the host and each part routed |
+| A Domain has no books yet (finance) | The router never routes to a Domain with no items; asking for it by name returns a stated Gap, not an error |
 | Router is wrong | Backfill from the whole Library; host can widen with `domains` |
 | Nothing relevant in the Library | `coverage: none` -> state the Gap; web only per `web_policy` |
 | Time-sensitive question (latest tweet, price) | Domain freshness + `stale`; `always_latest` makes the host check the web first |

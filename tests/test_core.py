@@ -424,6 +424,33 @@ def test_only_flagged_records_are_redone():
         assert sorted(m.pending("extract")) == ["bad", "weak"]
 
 
+def test_invalidate_flags_combine_instead_of_one_winning():
+    """`--source X --only-flagged` is the flagged records of X, not all of X (it once re-ran a
+    whole Source's extraction because --source silently won)."""
+    import contextlib
+    import io
+    from ytbrain import cli
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "m.db"
+        m = Manifest(db)
+        for v, src, err in (("a-ok", "A", None), ("a-weak", "A", "flagged: 2 unmatched"),
+                            ("b-weak", "B", "flagged: 1 unmatched"), ("b-ok", "B", None)):
+            m.upsert_document(v, src)
+            m.mark(StageState(v, "extract", "ok"))
+            m.mark(StageState(v, "verify", "ok", error=err))
+        real = cli.MANIFEST_DB
+        cli.MANIFEST_DB = db
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert cli.main(["invalidate", "extract", "--only-flagged", "--source", "A"]) == 0
+            assert Manifest(db).pending("extract") == ["a-weak"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert cli.main(["invalidate", "extract", "--source", "B"]) == 0
+            assert sorted(Manifest(db).pending("extract")) == ["a-weak", "b-ok", "b-weak"]
+        finally:
+            cli.MANIFEST_DB = real
+
+
 def test_rate_pacing_applies_only_to_hosted_endpoints():
     try:
         from ytbrain.extract import runner
@@ -1306,6 +1333,300 @@ def test_diversity_rules_are_source_agnostic_and_compose():
         "a near-duplicate from another Document and source is dropped; the higher rank stays"
     assert POLICIES["default"].apply(rows) == DiversityPolicy((SameQuote(), PerDocumentCap(3))).apply(rows)
     assert POLICIES["series3"].rules[-1] == PerSeriesCap(3, 10)
+
+
+# --- Domains (M5a) -----------------------------------------------------------------------------
+def test_domains_yaml_declares_the_registry_and_a_missing_file_means_startup_only():
+    from ytbrain import domains as D
+    reg = D.load()                                           # the repo's own domains.yaml
+    assert reg.names == ["startup", "leadership", "system-design", "finance", "investment", "coding"] and reg.default == "startup"
+    assert reg.get("finance").risk_tier == "high" and reg.get("finance").web_policy == "always_latest"
+    assert reg.get("startup").half_life_days is None and reg.get("system-design").half_life_days == 1825
+    assert all(d.description and d.examples for d in reg.domains.values()), "the router needs both"
+    only = D.load(Path(tempfile.mkdtemp()) / "none.yaml")
+    assert only.names == ["startup"] and only.default == "startup"
+
+
+def test_domains_yaml_errors_say_what_to_fix():
+    from ytbrain import domains as D
+    bad = {
+        "no domains": {"default": "x"},
+        "bad name": {"domains": {"Not Ok": {}}},
+        "bad tier": {"domains": {"a": {"risk_tier": "scary"}}},
+        "bad policy": {"domains": {"a": {"web_policy": "sometimes"}}},
+        "bad freshness": {"domains": {"a": {"freshness": "soon"}}},
+        "zero days": {"domains": {"a": {"freshness": 0}}},
+        "unknown key": {"domains": {"a": {"colour": "red"}}},
+        "examples": {"domains": {"a": {"examples": "one question"}}},
+        "default": {"default": "b", "domains": {"a": {}}},
+    }
+    for label, doc in bad.items():
+        try:
+            D.parse(doc)
+        except D.DomainConfigError as e:
+            assert "domains.yaml" in str(e), (label, str(e))
+        else:
+            raise AssertionError(f"{label}: should be refused")
+    ok = D.parse({"domains": {"a": {"freshness": 30, "risk_tier": "high"}, "b": None}})
+    assert ok.default == "a" and ok.get("a").half_life_days == 30 and ok.get("b").risk_tier == "low"
+    p = Path(tempfile.mkdtemp()) / "domains.yaml"
+    p.write_text("domains: [unclosed")
+    try:
+        D.load(p)
+    except D.DomainConfigError as e:
+        assert "not valid YAML" in str(e)
+    else:
+        raise AssertionError("broken YAML must be a DomainConfigError")
+
+
+def test_stray_book_folders_are_named_and_ignore_folders_silences_a_sorting_folder():
+    from ytbrain import domains as D
+    reg = D.load()
+    root = Path("/library/books")
+    files = [root / "system-desing" / "A.pdf", root / "system-desing" / "B.pdf", root / "finance" / "C.pdf",
+             root / "to-read" / "D.pdf", root / "Top.pdf", root / "leadership" / "misc" / "E.pdf",
+             root / "typo" / "Own.pdf"]
+    src = {"id": "b", "books": {"Own.pdf": {"domains": ["finance"]}}}
+    assert D.stray_folders(reg, src, files, [root]) == {"system-desing": 2, "to-read": 1}
+    quiet = D.parse({"domains": {"startup": {}, "finance": {}, "leadership": {}}, "ignore_folders": ["to-read"]})
+    assert D.stray_folders(quiet, src, files, [root]) == {"system-desing": 2}
+    assert quiet.ignore_folders == ("to-read",)
+    try:
+        D.parse({"domains": {"startup": {}}, "ignore_folders": "to-read"})
+        raise AssertionError("ignore_folders must be a list")
+    except D.DomainConfigError as e:
+        assert "ignore_folders" in str(e)
+
+
+def test_stray_folders_are_found_when_the_books_folder_is_reached_through_a_symlink():
+    """macOS: a temp dir is /var/... but resolves to /private/var/...; a linked books folder does the same."""
+    import tempfile
+
+    from ytbrain import domains as D
+    with tempfile.TemporaryDirectory() as t:
+        real = Path(t).resolve() / "real" / "books"
+        (real / "sytem-design").mkdir(parents=True)
+        (real / "finance").mkdir()
+        files = [(real / "sytem-design" / "X.pdf").resolve(), (real / "finance" / "Y.pdf").resolve()]
+        link = Path(t) / "link"
+        link.symlink_to(real.parent, target_is_directory=True)
+        assert D.stray_folders(D.load(), {"id": "b"}, files, [link / "books"]) == {"sytem-design": 1}
+
+
+def test_a_documents_domains_come_from_its_book_then_its_folder_then_its_source_then_the_default():
+    from ytbrain import domains as D
+    reg = D.load()
+    src = {"id": "books", "domains": ["startup"],
+           "books": {"Odd.pdf": {"domains": ["finance", "leadership"]}}}
+    root = Path("/library/books")
+    assert D.resolve(reg, src, root / "leadership" / "High Output.pdf", [root]) == ["leadership"]     # the folder
+    assert D.resolve(reg, src, root / "finance" / "Odd.pdf", [root]) == ["finance", "leadership"]      # the book wins
+    assert D.resolve(reg, src, root / "misc" / "Other.pdf", [root]) == ["startup"]                     # the Source
+    assert D.resolve(reg, {"id": "b"}, root / "misc" / "Other.pdf", [root]) == ["startup"]            # the default
+    assert D.resolve(reg, {"id": "w", "domains": ["leadership"]}) == ["leadership"]
+    assert D.resolve(reg) == ["startup"]
+    # a parent directory above the Source's own folder never counts
+    assert D.resolve(reg, {"id": "b"}, Path("/home/finance/books/Other.pdf"), [Path("/home/finance/books")]) == ["startup"]
+    assert D.folder_domain(Path("/x/system-design/deep/dive/Book.pdf"), reg, [Path("/x")]) == "system-design"
+    assert D.folder_domain(Path("/x/leadership/finance/Book.pdf"), reg, [Path("/x")]) == "finance", "the nearest folder"
+    assert D.folder_domain(Path("/elsewhere/leadership/Book.pdf"), reg, [Path("/x")]) is None, "outside the Source"
+    # the repo was moved after the plan was written: the Source's folder still matches by its last two parts
+    assert D.folder_domain(Path("/Users/old/repo/data/books/finance/Book.pdf"), reg, [Path("/new/repo/data/books")]) == "finance"
+    assert D.folder_domain(Path("/Users/old/finance/data/books/Book.pdf"), reg, [Path("/new/repo/data/books")]) is None
+    try:
+        D.resolve(reg, {"id": "w", "domains": ["cooking"]})
+    except D.DomainConfigError as e:
+        assert "cooking" in str(e) and "finance" in str(e), str(e)
+    else:
+        raise AssertionError("an undeclared Domain must be refused, naming the declared ones")
+
+
+def test_sources_take_domains_and_books_may_override_them():
+    from ytbrain import domains as D
+    from ytbrain import sources as S
+    reg = D.load()
+    w = S.normalize({"type": "website", "url": "https://ex.com/essays/", "domains": "leadership"})
+    assert w["domains"] == ["leadership"]
+    w2 = S.normalize({"type": "website", "url": "https://ex.com/", "domains": ["startup", "startup", "finance"]})
+    assert w2["domains"] == ["startup", "finance"]
+    assert "domains" not in S.normalize({"type": "website", "url": "https://ex.com/"})
+    b = S.normalize({"type": "pdf_books", "path": "data/books", "domains": ["leadership"],
+                     "books": {"A.pdf": {"domains": "finance"}}})
+    assert b["domains"] == ["leadership"] and b["books"]["A.pdf"]["domains"] == ["finance"]
+    D.check_sources(reg, [w, w2, b])
+    for entry in ({"type": "website", "url": "https://ex.com/", "domains": []},
+                  {"type": "website", "url": "https://ex.com/", "domains": [3]},
+                  {"type": "pdf_books", "path": "x", "books": {"A.pdf": {"domains": []}}}):
+        try:
+            S.normalize(entry)
+        except S.SourceConfigError as e:
+            assert "domains" in str(e)
+        else:
+            raise AssertionError(f"{entry} should be refused")
+    try:
+        D.check_sources(reg, [S.normalize({"type": "website", "url": "https://ex.com/", "domains": ["cooking"]})])
+    except D.DomainConfigError as e:
+        assert "cooking" in str(e)
+    else:
+        raise AssertionError("an undeclared Domain in sources.yaml must be refused")
+
+
+def test_items_carry_their_documents_domains_and_source():
+    from ytbrain.knowledge.items import build_items
+    rec = {"doc_id": "dom000000001", "title_raw": "T", "summary": "A summary.", "source_kind": "talk",
+           "advice_atoms": [], "highlights": []}
+    plain = build_items(rec, None)
+    assert plain and all(i["domains"] == ["startup"] and i["source_id"] == "" for i in plain)
+    tagged = build_items(rec, None, ["leadership", "startup"], "books_x")
+    assert all(i["domains"] == ["leadership", "startup"] and i["source_id"] == "books_x" for i in tagged)
+
+
+def test_the_index_is_retagged_in_place_filters_by_domain_and_upgrades_an_old_table():
+    try:
+        import lancedb  # noqa: F401
+        import pyarrow as pa
+    except ImportError:
+        return _skipped("the index extra is not installed")
+    from founder_coach.search import Filter
+    from ytbrain.knowledge import store as KS
+    d = Path(tempfile.mkdtemp())
+    old = [c for c in KS.STRING_COLS if c != "source_id"]
+    lists = [c for c in KS.LIST_COLS if c != "domains"]
+    fields = [pa.field(c, pa.string()) for c in old] + [pa.field(c, pa.list_(pa.string())) for c in lists] \
+        + [pa.field(c, pa.int64()) for c in KS.INT_COLS] + [pa.field("vector", pa.list_(pa.float32(), 2))]
+    t = lancedb.connect(str(d)).create_table("k", schema=pa.schema(fields))
+    base = {**{c: ["a"] for c in lists}, **{c: 1 for c in KS.INT_COLS}}
+    row = lambda doc, n, v: {**{c: f"{doc}-{n}" for c in old}, **base, "doc_id": doc, "item_id": f"{doc}:{n}", "vector": v,
+                             "kind": "advice", "source_kind": "talk"}
+    t.add([row("old1", 1, [1.0, 0.0]), row("old1", 2, [0.9, 0.1]), row("old2", 1, [0.0, 1.0])])    # a table from before Domains
+    ks = KS.KnowledgeStore(d, "k")
+    ks._upgrade()
+    f = lambda *doms: sorted(r["doc_id"] for r in ks.vector_search([1.0, 0.0], Filter(domains=doms), 10))
+    assert f("startup") == ["old1", "old1", "old2"], "untagged items are startup, never silently dropped"
+    assert f("leadership") == []
+    assert {tuple(r["domains"]) for r in ks.rows()} == {("startup",)}
+    assert ks.retag({"old1": (["leadership", "startup"], "books_x"), "old2": (["startup"], "yt"), "gone": (["x"], "y")}) == 2
+    assert f("leadership") == ["old1", "old1"] and f("startup") == ["old1", "old1", "old2"] and f("finance") == []
+    assert f("leadership", "finance") == ["old1", "old1"]
+    got = {r["doc_id"]: (sorted(r["domains"]), r["source_id"]) for r in ks._t.to_arrow().to_pylist()}
+    assert got == {"old1": (["leadership", "startup"], "books_x"), "old2": (["startup"], "yt")}, got
+    assert ks.count() == 3 and ks.retag({"old1": (["startup", "leadership"], "books_x")}) == 0, "same tags: nothing rewritten"
+    assert ks.retag({"old1": (["startup"], "books_x")}) == 1 and f("leadership") == []
+    assert KS.where_clause(domains=["a", "b'c"]).startswith("(array_has(domains, 'a') OR array_has(domains, 'b''c'))")
+    assert "domains IS NULL" in KS.where_clause(domains=["startup"]) and "IS NULL" not in KS.where_clause(domains=["finance"])
+
+
+def _tagged_store(n_docs, per=2):
+    from ytbrain.knowledge import store as KS
+    ks = KS.KnowledgeStore(Path(tempfile.mkdtemp()), "k")
+    for i in range(n_docs):
+        rows = [{**{c: f"{i}-{j}" for c in KS.STRING_COLS}, **{c: ["a"] for c in KS.LIST_COLS},
+                 **{c: 1 for c in KS.INT_COLS}, "doc_id": f"d{i}", "item_id": f"d{i}:{j}", "kind": "advice",
+                 "vector": [1.0 - i / 10, i / 10], "domains": ["startup"], "source_id": "s"} for j in range(per)]
+        ks.replace_document(f"d{i}", rows, 2)
+    return ks
+
+
+def test_an_interrupted_retag_keeps_every_vector_and_the_old_tags_and_a_rerun_finishes():
+    try:
+        import lancedb  # noqa: F401
+    except ImportError:
+        return _skipped("the index extra is not installed")
+    from ytbrain.knowledge import store as KS
+    ks = _tagged_store(5)
+    dup = [{k: v for k, v in r.items() if not k.startswith("_")} for r in ks.document_items("d2")][:1]
+    ks._t.add(dup)                                # the real index has a few repeated item ids; retag must not care
+    tags = {f"d{i}": (["leadership"], "s2") for i in range(5)}
+    real, calls = ks._t, []
+
+    class Dies:                                   # the second batch's commit fails
+        def __getattr__(self, k):
+            return getattr(real, k)
+
+        def update(self, *a, **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt()
+            return real.update(*a, **k)
+    old, KS.RETAG_BATCH = KS.RETAG_BATCH, 2
+    try:
+        ks._t = Dies()
+        try:
+            ks.retag(tags)
+            raise AssertionError("the interruption should reach the caller")
+        except KeyboardInterrupt:
+            pass
+        ks._t = real
+        assert ks.count() == 11, "no item was lost"
+        assert all(len(r["vector"]) == 2 for r in ks._t.to_arrow().to_pylist())
+        done = {r["doc_id"]: r["domains"] for r in ks._t.to_arrow().to_pylist()}
+        assert sorted(d for d, v in done.items() if v == ["leadership"]) == ["d0", "d1"], done   # batch one landed whole
+        assert ks.retag(tags) == 3 and ks.retag(tags) == 0, "a rerun tags only what is left"
+        assert {tuple(r["domains"]) for r in ks._t.to_arrow().to_pylist()} == {("leadership",)}
+        assert ks.count() == 11 and len(calls) >= 2
+    finally:
+        KS.RETAG_BATCH = old
+
+
+def test_index_tags_each_document_from_sources_domains_and_book_folders():
+    from ytbrain import cli
+    from ytbrain.config import BOOKS_PLANS, ROOT
+    from ytbrain.manifest import Manifest
+    tmp = Path(tempfile.mkdtemp())
+    m = Manifest(tmp / "manifest.db")
+    books = ROOT / "books-library"
+    (BOOKS_PLANS).mkdir(parents=True, exist_ok=True)
+    for doc, src in (("vid00000001", "yt_a"), ("web00000001", "site_a"), ("web00000002", "site_b"),
+                     ("9780000000001__go", "books_all"), ("9780000000002__lead", "books_all"),
+                     ("9780000000003__misc", "books_all"), ("orphan000001", "gone_source")):
+        m.upsert_document(doc, src)
+    for isbn, folder, name in (("9780000000001", "finance", "Go.pdf"), ("9780000000002", "leadership", "Lead.pdf"),
+                               ("9780000000003", "misc", "Misc.pdf")):
+        (BOOKS_PLANS / f"{isbn}.json").write_text(json.dumps({"format": 1, "path": str(books / folder / name)}))
+    sources = tmp / "sources.yaml"
+    sources.write_text(f"""sources:
+- {{id: yt_a, kind: playlist, playlist_id: PL1}}
+- {{id: site_a, type: website, url: "https://a.example.com/", domains: leadership}}
+- {{id: site_b, type: website, url: "https://b.example.com/", domains: [startup, finance]}}
+- {{id: books_all, type: pdf_books, path: {books}, domains: [startup]}}
+""")
+    real = cli.SOURCES
+    cli.SOURCES = sources
+    try:
+        tags = cli._doc_tags(m, ["vid00000001", "web00000001", "web00000002", "9780000000001__go",
+                                 "9780000000002__lead", "9780000000003__misc", "orphan000001", "unknown0001"])
+        assert tags == {"vid00000001": (["startup"], "yt_a"), "web00000001": (["leadership"], "site_a"),
+                        "web00000002": (["startup", "finance"], "site_b"),
+                        "9780000000001__go": (["finance"], "books_all"),       # the folder names the Domain
+                        "9780000000002__lead": (["leadership"], "books_all"),
+                        "9780000000003__misc": (["startup"], "books_all"),     # no such folder: the Source's Domains
+                        "orphan000001": (["startup"], "gone_source"),          # its Source left sources.yaml
+                        "unknown0001": (["startup"], "")}, tags
+        sources.write_text(sources.read_text().replace("domains: leadership", "domains: cooking"))
+        try:
+            cli._doc_tags(m, ["web00000001"])
+        except SystemExit as e:
+            assert "cooking" in str(e) and "sources.yaml" in str(e), str(e)
+        else:
+            raise AssertionError("an undeclared Domain must stop the index with a message")
+        cli.SOURCES = tmp / "missing.yaml"                    # no sources.yaml: the index still builds, all startup
+        assert cli._doc_tags(m, ["web00000001"]) == {"web00000001": (["startup"], "site_a")}
+    finally:
+        cli.SOURCES = real
+
+
+def test_every_package_data_pattern_matches_a_shipped_file():
+    """A data file the code reads at run time (the Gap-question starter, coach cases, playbooks) must be
+    declared in pyproject's package-data, or an installed wheel lacks it while the editable install works."""
+    import tomllib
+    root = Path(__file__).resolve().parents[1]
+    declared = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["package-data"]
+    for pkg, patterns in declared.items():
+        for pat in patterns:
+            assert list((root / pkg).glob(pat)), f"package-data {pkg}/{pat} matches no file"
+    for needed in ("eval/gap_questions.txt", "eval/golden.example.jsonl"):
+        assert needed in declared["ytbrain"], needed
+    assert "playbooks/*.md" in declared["founder_coach"]
 
 
 if __name__ == "__main__":

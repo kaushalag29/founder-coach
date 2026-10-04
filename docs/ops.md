@@ -20,9 +20,14 @@ when you start it; it isn't scheduled (the 03:15 launchd job still runs only `yt
 
 | Plan | Steps (each an ordinary `ytbrain` command, with its own resume) | When |
 |---|---|---|
-| ingest | `sync` → `clean` → `extract` → `verify` → one more extract + verify for Documents verify newly flagged → `index` | every run (sync is how new talks, pages and books are found) |
+| ingest | `sync` → `clean` → `extract` → `verify` → one more extract + verify for Documents verify newly flagged → `index` | every run (sync is how new talks, pages and books are found; `ops` runs it with `--strict-domains`, so a book folder that is not a declared Domain stops the plan with exit 1 and a warning naming the folder) |
 | eval | `eval build --set <split> --top-up` for every split with Documents → `eval run --config full` → `eval judge --config full` → gate | the index or the labels changed since the last eval, or its verdict wasn't a pass |
-| plugin | `pack build` → assemble `dist/plugin` (+ zip) → with private Sources, `pack build --include-private` → `dist/plugin-private` (+ zip) → `claude plugin validate` → `eval coach` | the last eval passed on the current index, and the index or the plugin's code changed; the coach eval once per new build |
+| plugin | `pack build` → assemble `dist/plugin` (+ zip) → with private Sources, `pack build --include-private` → `dist/plugin-private` (+ zip) → `eval gap` on the shipped pack (a report: it never stops the run) → `claude plugin validate` → `eval coach` | the last eval passed on the current index, and the index or the plugin's code changed; the coach eval once per new build |
+
+`eval gap` prints how often the coach would wrongly answer a Gap question or refuse an answerable one, so each plugin build
+shows whether coverage is honest. It is a report because with few judged questions it can only say "inconclusive", and
+because `eval calibrate` and `eval gap --tune` change what founders see: run those yourself when the report says to
+(docs: README, "Coverage").
 
 The gate re-scores the saved baseline (`eval rescore --refresh-baseline`) on the labels the judge just
 released, compares the new run with it, and saves the new run as the baseline only on PASS. FAIL or
@@ -39,11 +44,14 @@ what runs. Flagged Documents are retried once each (the list is kept), never on 
 ## When something stops
 
 A command that stops early writes why (`data/ops/last-stop.json`: budget, endpoint, network, plan_limit,
-interrupted); the runner acts on it:
+interrupted, auth, books, config); the runner acts on it:
 
 | Reason | What happens |
 |---|---|
 | network (sync, a slow provider) | the step is retried twice, after 1 and 5 minutes; a sync that still fails is skipped and the run goes on with what is fetched |
+| auth (the Claude host's login expired) | the run stops at once with `run claude, /login`; the plugin is already built, and the next `ytbrain ops plugin` resumes at the coach eval |
+| books (a PDF refused or unparsable) | not retried: the run goes on with the Books that registered and names the files (`skip: true` in sources.yaml silences one) |
+| config (a book folder that is not a declared Domain) | the run stops at once and names the folder; fix `domains.yaml` or the folder, then re-run |
 | endpoint refused (key, credits, model, quota) | stop; the notice says to fix `.env` and re-run |
 | spend cap | stop; the notice says to raise `--max-cost` |
 | gate FAIL or INCONCLUSIVE | stop before the plugin; the baseline is kept |

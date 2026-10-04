@@ -462,6 +462,9 @@ Claude plan by default**, set up to use as little of its limits as possible:
 - **Haiku** unless you ask for another model (`--model sonnet`; `YTBRAIN_COACH_MODEL` changes the default);
 - `eval coach` caps each call at 12 turns (`--max-turns`) and runs every case in a scratch folder
   outside the repo, so the repo's CLAUDE.md/AGENTS.md never ride along; each gate prints the tokens it used;
+- a case that errors (a turn cap, a host hiccup) is not cached and does not fail the gate by itself: when the rest pass,
+  the gate is **incomplete** (exit 2) and re-running the same command retries only those cases; if the Claude login has
+  expired the run stops at the first case and says to run `claude`, then `/login`;
 - `claude plugin eval` with `--runs 1 --ablation none` while iterating (3 runs, with the
   without-plugin comparison, before a release).
 
@@ -469,7 +472,7 @@ Claude plan by default**, set up to use as little of its limits as possible:
 ytbrain claude -- --plugin-dir dist/plugin                    # a live session with the plugin (Haiku)
 python scripts/assemble_plugin.py --pack data/pack --with-evals --out dist/plugin-eval   # the eval build (never shipped)
 ytbrain claude -- plugin eval dist/plugin-eval --runs 1 --ablation none   # the mocked skill checks
-ytbrain eval coach                                            # the gates (Haiku, on your plan)
+ytbrain eval coach                                            # the gates (Haiku, on your plan); exit 0 pass, 1 FAIL, 2 incomplete
 ytbrain eval coach --model sonnet                             # sign a release off on the model founders use
 ```
 
@@ -486,6 +489,31 @@ reached): `ytbrain claude --openrouter -- …` or `ytbrain eval coach --host ope
 is git-ignored (your list stays private);
 start from `cp sources.example.yaml sources.yaml`, then build it interactively with
 `discover` or edit it by hand. `discover` creates it if it doesn't exist.
+
+### Domains: which subject a Source belongs to
+
+`domains.yaml` (committed) declares the **Domains** of the Library: `startup`, `leadership`,
+`system-design`, `finance`, `investment`, `coding`, each with a description, example questions, a risk tier, a freshness
+half-life and a web policy. Tag a Source with `domains: [leadership]` in `sources.yaml`; a Book in a folder
+named after a Domain (`data/books/leadership/…`) belongs to it with no tag, and `books: {"X.pdf": {domains: [...]}}`
+overrides one Book. A Source or Book with none is `startup`. A Book folder that is not a declared Domain
+(a typo such as `system-desing/`) is reported by `ytbrain sync`, and `ytbrain sync --strict-domains` (what `ytbrain ops` runs)
+exits 1 on it; `ignore_folders: [to-read]` in `domains.yaml` lists folders that only sort files. A Document may belong to several Domains, and
+`coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them.
+Tags are configuration: after editing them run `ytbrain index`, which re-tags existing items in place
+(no re-embedding, no re-extraction). The coach learns the Domains from `coach_get_context` and passes the ones a
+question touches; an automatic router exists too but is off until you have measured it on your corpus:
+`ytbrain eval route` (accuracy on single and composed questions), `ytbrain eval run --config pack-route
+--compare pack-no-rerank` (no nDCG loss), then `ytbrain pack build --route`. Adding a Domain is one entry in `domains.yaml` and its books or Sources.
+
+**Coverage.** Every `coach_search` answer says `coverage`: `strong` (answer with Citations), `partial` (answer what is
+covered and say what is not) or `none` (state a Gap; the coach goes to the web only when the Domain's `web_policy`
+allows it). Thresholds follow the Domain's `risk_tier`, and `coverage_basis` says whether the curve behind them is
+`calibrated` on your labels or `provisional`. To calibrate: build the benchmark and judge it (`ytbrain ops eval`), then
+`ytbrain eval calibrate --pack data/pack-private`, rebuild the pack, and check `ytbrain eval gap --pack data/pack-private`
+(add your own out-of-corpus questions to `data/eval/gap-questions.txt`, one per line, or `question | domain` for one that
+is a Gap only while that Domain is empty; `--tune` saves the best border). `ytbrain ops` prints this report for the
+shipped pack on every plugin build but never stops on it.
 
 ### Discover playlists with yt-dlp (no API key)
 
@@ -689,7 +717,7 @@ only the talks whose records changed.
 |---|---|---|
 | `ops [ingest\|eval\|plugin]` | The whole loop in one resumable, change-detecting command: ingest, then eval when the index changed, then the plugin when it passed; asks the plugin version, handles retries and stop reasons, notifies ([docs/ops.md](docs/ops.md)) | `--dry-run`, `--max-cost`, `--max-extract`, `--no-sync`, `--skip-coach`, `--restart`, `--force`, `--version patch\|minor\|skip`, `--no-notify` |
 | `discover` | Build/extend `sources.yaml` | `--method ytdlp\|api`, `--channel` |
-| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
+| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--strict-domains` (exit 1 on a Book folder that is not a Domain), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
 | `clean` | Caption file → deduplicated, ~10–25 s timestamped utterances; web page → numbered paragraphs | `--limit N`, `--retry-failed` |
 | `extract` | One LLM call per Document → structured record | `--limit N`, `--workers N`, `--retry-failed`, `--doc PREFIX` (e.g. a Book's ISBN) |
 | `verify` | Locate every evidence quote in the transcript; write pages | `--limit N`, `--retry-failed`, `--doc PREFIX` |
@@ -697,8 +725,11 @@ only the talks whose records changed.
 | `index` | Build the Knowledge index (advice, takeaways, summaries, transcript passages) with local embeddings; only Verified knowledge | `--limit N`, `--device auto\|mps\|cpu\|cuda`, `--retry-failed` |
 | `search "question"` | Hybrid search (vector + full-text, reranked) with deep-link citations | `--stage`, `--require-stage`, `--kind`, `--topic`, `--top-k`, `--no-rerank`, `--device`, `--json`, `--pack [PATH]` |
 | `eval build` | Build or resume the eval benchmark ([docs/eval-spec.md](docs/eval-spec.md)): one Tuning question set per source kind (Talks, Articles, public Books, your private Sources), each at most 20 % of its Documents; generated questions, pooled candidates, two-judge grading; resumable and spend-capped | `--set dev\|dev-articles\|dev-chapters\|dev-private\|test` (default: every split), `--top-up` (only questions for new Documents), `--max-cost`, `--workers`, `--limit`, `--device` |
-| `eval run` | Score a search configuration: nDCG@10, recall, MRR with 95 % intervals; compare with a baseline and apply the regression gate (0.03 nDCG@10 for pack configs) | `--set` (default `all`: every Tuning split, one nDCG row per source kind), `--config full\|no-rerank\|stage-boost\|pack\|pack-no-rerank\|full-no-passages`, `--save-baseline`, `--compare CONFIG`, `--pack PATH`, `--label NAME` (a variant saved as `<config>-NAME`), `--smoke`, `--device` |
-| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--include-private` (your Books; never released), `--out DIR` |
+| `eval run` | Score a search configuration: nDCG@10, recall, MRR with 95 % intervals; compare with a baseline and apply the regression gate (0.03 nDCG@10 for pack configs) | `--set` (default `all`: every Tuning split, one nDCG row per source kind), `--config full\|no-rerank\|stage-boost\|pack\|pack-no-rerank\|full-no-passages\|full-route\|pack-route`, `--save-baseline`, `--compare CONFIG`, `--pack PATH`, `--label NAME` (a variant saved as `<config>-NAME`), `--smoke`, `--device` |
+| `eval route` | Score the Domain router with no LLM: single questions (is the best Domain one of the seed Document's?) and composed two-Domain prompts (is every Domain routed?), swept over the margin | `--set`, `--pack PATH`, `--composed N`, `--device` |
+| `eval calibrate` | Fit the curve that turns a hit's similarity into the probability it is relevant (isotonic, on your judged hits), check it on held-out questions and save `data/eval/calibration.json` if it beats the provisional curve; `pack build` ships it | `--set`, `--pack PATH`, `--k N`, `--force`, `--no-save` |
+| `eval gap` | Measure whether `coverage` is honest, no LLM: wrongful answers on Gap questions (target <= 10 %), wrongful refusals on answerable ones (<= 15 %), swept over the border; exit 0 pass, 1 fail, 3 inconclusive | `--set`, `--pack PATH`, `--questions FILE`, `--tune` |
+| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--include-private` (your Books; never released), `--route` (turn on the server's automatic Domain routing for this pack), `--out DIR` |
 | `pack info` | Describe the pack and verify its checksum | `--out DIR` |
 | `eval judge` | Grade the Moments a saved run retrieved that no judge has seen (pool extension), then re-release the labels as a new minor version; resumable and spend-capped | `--config C` (repeatable), `--set`, `--depth`, `--max-cost`, `--workers` |
 | `eval rescore` | Score a saved run again against the current labels, without searching (seconds); only the questions the run was asked | `--config`, `--set`, `--compare`, `--save-baseline`, `--refresh-baseline`, `--run FILE --as NAME` |
@@ -1176,12 +1207,14 @@ CONTEXT.md, docs/         glossary, ADRs, plans, eval spec, commands, release ru
 product.toml              the product's id, display name, SEO description and repos (ADR-0012)
 .env.example              template for .env (copy, fill in; .env is git-ignored)
 sources.example.yaml      template for sources.yaml (your playlist list; git-ignored)
+domains.yaml              the Library's Domains: description, example questions, risk tier, freshness, web policy
 .github/workflows/ci.yml  tests, secret scan, assembled plugin, claude plugin validate
 eval/                     the released retrieval benchmark (queries, qrels, moments; CHECKSUMS)
 ops/                      all.sh, ingest.sh, eval.sh, plugin.sh (`ytbrain ops`), the launchd plist, log rotation, probe_models.py
 ytbrain/                  the pipeline
   cli.py                  all commands
   sources.py              sources.yaml entries and the adapter per Source type (ADR-0013)
+  domains.py              domains.yaml: the Domain registry, and which Domains a Document belongs to
   web/                    the website adapter: urls (ids, scope), http (robots, pacing, retries),
                           render (Playwright), page (metadata, main text, page type), state, crawl
   source_kinds.py         the SourceKind registry: Talk, Article, Chapter (labels, links, Moments, question prefixes)
@@ -1260,7 +1293,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 288 tests, no network
+for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 327 tests, no network
 pytest tests/                                                                        # the same under pytest
 ```
 

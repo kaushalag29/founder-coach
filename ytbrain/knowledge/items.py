@@ -11,6 +11,7 @@ Unverified Advice/Takeaways are never items [ADR-0004].
 from __future__ import annotations
 
 from .. import locators
+from founder_coach.search import DEFAULT_DOMAIN
 from ..config import EVIDENCE_MIN_JACCARD
 from ..index import chunk_transcript
 
@@ -58,8 +59,11 @@ def _verified(item: dict, threshold: float) -> bool:
     return bool(item.get("evidence_span")) and score is not None and score >= threshold
 
 
-def build_items(record: dict, transcript: dict | None) -> list[dict]:
-    """Knowledge items for one verified record (no vectors yet)."""
+def build_items(record: dict, transcript: dict | None, domains: list[str] | None = None,
+                source_id: str = "") -> list[dict]:
+    """Knowledge items for one verified record (no vectors yet). `domains` and `source_id` come
+    from configuration (ytbrain/domains.py, the manifest), not from the record: re-tagging a Document
+    never needs it re-extracted."""
     doc_id = record["doc_id"]
     ver = (record.get("extraction_meta") or {}).get("verification") or {}
     threshold = ver.get("threshold", EVIDENCE_MIN_JACCARD)
@@ -72,7 +76,7 @@ def build_items(record: dict, transcript: dict | None) -> list[dict]:
         or record.get("title_raw") or "", "speaker": record.get("speaker") or "",
         "provenance": record.get("provenance") or "",
         "published_at": record.get("published_at") or "", "year": _year(record.get("published_at")),
-        "topics": topics,
+        "topics": topics, "domains": list(domains or [DEFAULT_DOMAIN]), "source_id": source_id or "",
         # a Private Source's items never leave this machine (pack, released eval) [ADR-0014]
         "visibility": "private" if record.get("private") else "public",
     }

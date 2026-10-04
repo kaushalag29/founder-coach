@@ -9,6 +9,22 @@
   "description": "Search Verified advice, takeaways and talk summaries from YC talks. Each hit has an item_id\nto cite, the speaker, talk, year, a deep link to the exact second, and a verbatim quote. Split a\nmulti-part question and search once per part. When gap_suspected is true, tell the Founder\nthe corpus doesn't cover it rather than answering from memory.",
   "input": {
    "properties": {
+    "domains": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "restrict to these Domains (startup, leadership, ...); several = any of them. Leave out to search all; coach_corpus_status lists the Domains this pack covers",
+     "title": "Domains"
+    },
     "kinds": {
      "anyOf": [
       {
@@ -120,6 +136,22 @@
        "default": null,
        "title": "Doc Id"
       },
+      "domains": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "the Domains this item belongs to (startup, leadership, ...)",
+       "title": "Domains"
+      },
       "item_id": {
        "description": "cite this",
        "title": "Item Id",
@@ -128,6 +160,19 @@
       "kind": {
        "title": "Kind",
        "type": "string"
+      },
+      "p_relevant": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "description": "how likely this hit is relevant to the question (0 to 1, semantic mode; calibrated once the pack carries a fitted curve)",
+       "title": "P Relevant"
       },
       "page": {
        "anyOf": [
@@ -264,8 +309,70 @@
     }
    },
    "properties": {
+    "coverage": {
+     "default": "none",
+     "description": "how well the Library answers this: strong = answer with Citations; partial = answer what is covered and say what is not; none = state a Gap. With several Domains it is the weakest one's. A Domain with a higher risk tier needs closer, more independent evidence to count as strong",
+     "enum": [
+      "strong",
+      "partial",
+      "none"
+     ],
+     "title": "Coverage",
+     "type": "string"
+    },
+    "coverage_basis": {
+     "default": "provisional",
+     "description": "calibrated: the pack carries a curve fitted on graded labels; provisional: default thresholds, treat the borders as soft; keyword: no embeddings, closeness unknown",
+     "enum": [
+      "calibrated",
+      "provisional",
+      "keyword"
+     ],
+     "title": "Coverage Basis",
+     "type": "string"
+    },
+    "coverage_by_domain": {
+     "anyOf": [
+      {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "coverage of each Domain searched, when the search covers two or more",
+     "title": "Coverage By Domain"
+    },
+    "domain_scores": {
+     "anyOf": [
+      {
+       "additionalProperties": {
+        "type": "number"
+       },
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "how close the question is to each Domain (automatic routing only)",
+     "title": "Domain Scores"
+    },
+    "domains_searched": {
+     "description": "the Domains these results favour or are limited to; empty: the whole Library",
+     "items": {
+      "type": "string"
+     },
+     "title": "Domains Searched",
+     "type": "array"
+    },
     "gap_suspected": {
-     "description": "true when nothing in the corpus is close to the question",
+     "description": "true when coverage is none: nothing in the corpus is close to the question",
      "title": "Gap Suspected",
      "type": "boolean"
     },
@@ -285,6 +392,19 @@
      "title": "Mode",
      "type": "string"
     },
+    "newest_year": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "year of the newest relevant result",
+     "title": "Newest Year"
+    },
     "note": {
      "anyOf": [
       {
@@ -301,6 +421,17 @@
      "title": "Query",
      "type": "string"
     },
+    "routing": {
+     "default": "none",
+     "description": "auto: the server picked the Domains from the question; explicit: the caller's `domains`; none: the whole Library (one Domain, or keyword mode)",
+     "enum": [
+      "auto",
+      "explicit",
+      "none"
+     ],
+     "title": "Routing",
+     "type": "string"
+    },
     "stage_used": {
      "anyOf": [
       {
@@ -311,6 +442,14 @@
       }
      ],
      "title": "Stage Used"
+    },
+    "stale_domains": {
+     "description": "Domains whose relevant results are older than the Domain's freshness half-life: say so",
+     "items": {
+      "type": "string"
+     },
+     "title": "Stale Domains",
+     "type": "array"
     },
     "top_similarity": {
      "anyOf": [
@@ -482,7 +621,7 @@
    "open_world_hint": false,
    "read_only_hint": true
   },
-  "description": "Start here: today's date and ISO week, the Founder profile (stale facts flagged), active Goals,\nthis week's and overdue Commitments, the last Check-in, recent Decisions, and what's due (Nudges).\nRecord ids here are what coach_update takes.",
+  "description": "Start here (and add coach_search in the same message when the Founder shares a plan or claim to judge): today's date and ISO week, the Founder profile (stale facts flagged), active Goals,\nthis week's and overdue Commitments, the last Check-in, recent Decisions, and what's due (Nudges),\nand, when the knowledge covers several subjects (Domains), what each is about.\nRecord ids here are what coach_update takes.",
   "input": {
    "properties": {
     "response_format": {
@@ -520,6 +659,20 @@
       }
      ],
      "title": "Last Checkin"
+    },
+    "library": {
+     "anyOf": [
+      {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "the Domains the knowledge pack covers (name, items, what it is about); present only when there are several",
+     "title": "Library"
     },
     "nudges": {
      "items": {
@@ -1121,6 +1274,12 @@
   "name": "coach_corpus_status",
   "output": {
    "properties": {
+    "calibration": {
+     "additionalProperties": true,
+     "description": "what coverage is calibrated on",
+     "title": "Calibration",
+     "type": "object"
+    },
     "gap_similarity": {
      "title": "Gap Similarity",
      "type": "number"

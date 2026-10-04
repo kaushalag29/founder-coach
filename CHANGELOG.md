@@ -3,6 +3,117 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-03 (Book folders that are not Domains are reported; `invalidate` flags combine)
+
+- **`ytbrain sync` warns about a book folder that is not a declared Domain** (`system-desing/`, an undeclared
+  `coding/`): its Books silently took the default Domain. `ytbrain sync --strict-domains` exits 1 on it (the Books
+  are still registered) and `ytbrain ops` runs sync with it. `ignore_folders: [...]` in `domains.yaml` lists
+  folders that only sort files. A Book that sets its own `domains`, or sits under a declared Domain folder, never warns.
+  The check also works when the books folder is reached through a symlink (it silently found nothing on macOS temp
+  folders, where `/var` is `/private/var`).
+- **Fix: `ytbrain invalidate <stage> --only-flagged --source ID`** re-ran every Document of the Source: `--source` won
+  and `--only-flagged` was ignored. The two now narrow each other (the flagged Documents of that Source).
+- **Fix: a refused or unparsable PDF no longer makes `ytbrain ops` retry the whole sync.** `sync` exited 1 and `ops`
+  read that as a network failure: three syncs and a 6-minute wait. A refused PDF is now its own stop reason
+  (`books`): `ops` carries on with the Books that did register and names the files; a book-folder configuration
+  problem (`config`) stops the run at once.
+- **`eval calibrate` no longer saves a curve that makes a risk tier unable to reach `strong`.** Fitted on this
+  Library's strict labels (a hit counts only if judged relevant, grade >= 2) the curve tops out at p = 0.67, below the
+  high tier's 0.70, and puts the Gap border (p 0.45) at cosine 0.69 instead of 0.60: `eval gap` then refused 40 % of
+  answerable questions. It now says so and keeps the provisional curve; `--force` overrides.
+- **`eval gap --tune` recommends the shift that refuses the fewest answerable questions** among those meeting both
+  targets (it used to pick the one with the most headroom, which on 30 Gap questions traded 27 refused answerable
+  questions for one hedged Gap answer). Plan decision #25.
+- **`ytbrain eval coach` stops at the first case when the Claude host is not signed in** (an expired login used to
+  fail all 20 cases one by one). It says to run `claude` and `/login`, counts nothing as failed, and records the stop
+  as `auth`: `ytbrain ops` stops with that fix and the next `ytbrain ops plugin` does only the coach eval.
+- **`eval coach`: a gate whose only problem is errored cases is "incomplete", not FAIL.** G2 was 92 % (gate 90 %) and
+  still failed because one case hit the turn cap (`error_max_turns`). It now exits 2 ("re-run to retry"; finished cases
+  are cached, so only the errored ones run again). A rate under the gate is still FAIL.
+- **`ytbrain ops plugin` no longer forgets a coach eval that did not pass.** A failed or stopped coach eval used to be
+  recorded as "already ran on this build", so the next run skipped it silently. It now runs again (cached cases cost
+  nothing) and reports the same FAIL until it passes.
+- **Decisions recorded** (docs/library-and-packs-plan.md #21-#24): the host splits compound questions, Sources are not routed,
+  Book-level routing waits for about 50 Books per Domain, and extra Domains for talks are per-Source configuration added
+  once `eval gap` shows the need. New term: Compound question (CONTEXT.md).
+- **check-in skill: "the first one" means the position in `coach_get_context`.** A coach eval run asked the Founder
+  "which one?" instead of proposing statuses, and then lost the "carry the second, drop the rest" instruction. The skill
+  now resolves positions itself, shows each match as id and action, and lets the Founder correct it.
+- **Fix: `eval coach` case failing with `AttributeError: 'str' object has no attribute 'get'`.** The host stream parser read
+  `message.content` on every event, and a host notice can carry `message` as plain text. An unexpected case error now
+  also names where it was raised (`ERROR KeyError: ... (coach.py:231)`), so a one-line failure can be traced.
+- **Plugin skills tightened for the small host model** (coach eval on haiku: two sycophancy answers never searched, one
+  persona saved an unrequested Decision for dropped Commitments, one answered "record them" with a walkthrough instead of
+  the save). `coach` sends `coach_search` in the first message when there is a plan or claim to judge; `check-in` records a
+  Decision only when the Founder presents one; `weekly-focus` answers a yes with the `coach_record` call in the same reply.
+  The search reminder is also in the `coach_get_context` tool description and the server instructions, which the host reads
+  when it picks tools; `check-in` puts every write of a Check-in in one proposal, so one yes saves it all.
+
+## 2026-10-03 (Coverage: every search says how well the Library answers, and the claim is measured)
+
+- **`coverage` in every search response:** `strong`, `partial` or `none`, with `coverage_basis` (`calibrated`,
+  `provisional` or `keyword`), `coverage_by_domain` when two or more Domains were searched, `stale_domains`,
+  `newest_year`, and `p_relevant` per hit. `none` is a Gap: the coach says so (and goes to the web only when the
+  Domain's `web_policy` allows it). It replaces the old single similarity cut-off, which a startup-only pack still
+  matches exactly (a closest hit under 0.60 is a Gap).
+- **Rules by risk tier** (`domains.yaml`): low needs two hits at p >= 0.5, medium two hits at p >= 0.6 from two
+  Documents, high two hits at p >= 0.7 from two independent Sources; below that it is `partial`. A question that
+  needs several Domains is judged per Domain and is only `strong` if every Domain is; a declared Domain with no
+  items counts as `none`. Keyword-only search (no embeddings) is `partial` with basis `keyword`: it cannot say how close.
+- **Calibrated from your labels:** `ytbrain eval calibrate` fits cosine similarity -> P(relevant) (isotonic) on the
+  judged hits, checks it on held-out questions against the provisional curve and saves
+  `data/eval/calibration.json` only if it is better (`--force` overrides); `pack build` ships the curve when it was
+  fitted for the same embedding model. Until then the provisional curve is used and every response says so.
+- **Gap questions:** `ytbrain eval gap` measures wrongful answers (a Gap question answered; target <= 10 %) and wrongful
+  refusals (an answerable question called a Gap; target <= 15 %) with Wilson intervals, sweeps where the border sits
+  and `--tune` saves the best shift. Questions come from the benchmark's out-of-corpus items, a starter list
+  shipped with ytbrain (`question | domain` retires itself once the Library has items in that Domain) and your own
+  `data/eval/gap-questions.txt`. Fewer than 20 Gap or 30 answerable questions is "inconclusive", not a pass.
+- **Two more Domains, `investment` and `coding`,** for the new book folders (`data/books/investment/`, `data/books/coding/`);
+  `finance` now means a company's money (statements, valuation, term sheets). A folder under `data/books` that is not a
+  declared Domain is ignored and its books fall back to `startup`: declare the Domain in `domains.yaml` first.
+- **Books are independent evidence:** for a high-tier Domain "two independent Sources" counts each Book as its own
+  (all owned Books share one Source id, which would have capped a books-only finance Domain at `partial` forever);
+  two Chapters of one Book still count once.
+- **`library` in `coach_get_context`** lists every declared Domain with its item count (0 for an empty one), shown only
+  when two or more Domains have items, so the public startup pack is unchanged. The ask/coach skills now say when to
+  state a Gap, when to search the web, and when to decline-and-refer on a high-tier Domain.
+- **`ytbrain ops`** reports coverage of the shipped pack (`plugin:coverage`) before it validates the plugin: report
+  only, it never stops a build. Calibrating and tuning stay manual because they change behaviour.
+- Tests: 327 (was 315): coverage rules and fitting, the Gap eval, both commands end to end, the ops step, and a
+  check that every data file the code reads ships in the wheel.
+
+## 2026-10-03 (Domains: every item knows which subject it belongs to, and search can take several)
+
+- **`domains.yaml`** declares the Domains (startup, leadership, system-design, finance: description, example
+  questions, risk tier, freshness, web policy). A Source says `domains: [...]` in `sources.yaml`; a Book in a
+  folder named after a Domain (`data/books/leadership/`) belongs to it without saying so, and a Book can override
+  both. Without any of these everything is `startup`, as before.
+- **Re-tagging is cheap:** Domains are configuration, not content. `ytbrain index` fills them on existing items in
+  place (no re-embedding, no re-extraction), and only for Documents whose tags changed. Run it once after pulling.
+- **Search takes several Domains:** `coach_search` has a `domains` argument (any of them); every hit says its
+  Domains; `coach_corpus_status` counts items per Domain. A Domain the pack has nothing in is a stated Gap, not an
+  error. Packs built before this open as all-startup.
+- **The coach picks Domains per question:** `coach_get_context` lists the pack's Domains (name, size, what each is
+  about) when there are several, and the ask/coach skills pass `domains` for each part of a question (a question
+  about a raise and a hard conversation touches two). Results say `routing` and `domains_searched`.
+- **A router, measured before it is trusted:** `founder_coach/router.py` scores each Domain by its three closest
+  items (a few leadership books are not drowned by thousands of talks), routes the Domains near the best, and
+  search favours them while still looking everywhere, keeping at least two results for each routed Domain.
+  Off unless the pack says so (`ytbrain pack build --route`, or `FOUNDER_COACH_ROUTE=1`): `ytbrain eval route`
+  scores it on single and composed two-Domain questions and `eval run --config pack-route` checks nDCG.
+
+- **Naming several Domains keeps each in the answer:** a question that names two Domains used to be one filtered
+  search, so the big Domain (talks and essays, about 22,000 items) could fill every slot and leave the small one
+  (a few leadership books, about 1,000) out. Each named Domain now has its own ranking and at least two results
+  while its hits clear the relevance floor, the same guarantee a routed Domain gets. Found by a dry run on the real index.
+- **Re-tagging can't lose vectors:** it is now an in-place update of the Domains and Source id columns (it used to
+  delete and re-add a Document's rows, so an interruption between the two would have forced a paid re-embed), one
+  commit per batch of 200 Documents, and it tolerates the few repeated item ids in the real index. Dry run on a copy
+  of the real index: 39,596 items kept, 53 Documents tagged leadership, a second run changes nothing.
+- **Domain names are forgiving:** `Leadership` or ` leadership ` match `leadership`; blank names mean no Domain was
+  asked for; the "nothing in ..." note is capped. Tests: 315.
+
 ## 2026-10-01 (`ytbrain ops` runs unattended: stop reasons, retries, notices, versions, references)
 
 - **CI fix, second one:** `test_ac3_raising_depth_reopens_the_old_frontier` used a month page of bare links, which

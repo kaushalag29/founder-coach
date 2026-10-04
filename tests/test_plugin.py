@@ -395,6 +395,10 @@ def test_release_commits_tags_refuses_a_released_version_and_maps_a_renamed_id()
             shutil.copytree(PLUGIN, repo / "plugin")
             shutil.copy2(ROOT / "product.toml", repo / "product.toml")
             shutil.copytree(ROOT / "founder_coach", repo / "founder_coach", ignore=A.IGNORE)
+            cur = R.current_version(repo)       # the repo's own version moves with every `ytbrain ops plugin`: start this copy at 0.1.0
+            for path in R.version_files(repo).values():
+                path.write_text(path.read_text(encoding="utf-8").replace(f'"{cur}"', '"0.1.0"'), encoding="utf-8")
+            assert R.current_version(repo) == "0.1.0"
             pack = tmp / "pack"
             _build(pack, emb=HashEmbed())
             mk = tmp / "marketplace"

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "{{id}}"
-version = "0.1.0"
+version = "0.1.2"
 description = "{{display_name}}: an MCP server with a Y Combinator Knowledge pack and a private local founder store"
 requires-python = ">=3.11"
 license = { text = "{{license}}" }

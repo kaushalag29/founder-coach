@@ -56,11 +56,23 @@ HOST_LIMIT = re.compile(r"hit your (session|usage|weekly)[\w -]* limit|usage lim
                         r"\blimit\b.{0,40}\bresets\b|rate_limit_error|credit balance is too low", re.I)
 
 
+# the host not being signed in (an expired Claude login, a bad key): every further case would fail the same
+# way until a person signs in, so the run stops at the first one
+HOST_AUTH = re.compile(r"failed to authenticate|oauth (session|token)[\w ]*expired|authentication_error|"
+                       r"invalid (x-)?api[- ]?key|please run /login|not logged in", re.I)
+
+
 class HostLimit(RuntimeError):
     """The host stopped answering until its usage limit resets."""
 
 
+class HostAuth(RuntimeError):
+    """The host is not signed in: nothing runs until someone does `/login`."""
+
+
 def _check_host(turn: "Turn") -> None:
+    if turn.error and HOST_AUTH.search(turn.error):
+        raise HostAuth(turn.error)
     if turn.error and HOST_LIMIT.search(turn.error):
         raise HostLimit(turn.error)
 
@@ -119,6 +131,13 @@ class Turn:
         return "\n\n".join(out)
 
 
+def _where(e: BaseException) -> str:
+    """` (file.py:123)`: where an unexpected error was raised, so a one-line ERROR can be traced."""
+    import traceback
+    frames = traceback.extract_tb(e.__traceback__)
+    return f" ({Path(frames[-1].filename).name}:{frames[-1].lineno})" if frames else ""
+
+
 def parse_stream(lines) -> Turn:
     """Parse `claude -p --output-format stream-json --verbose` output."""
     turn, pending = Turn(), {}
@@ -133,7 +152,8 @@ def parse_stream(lines) -> Turn:
         kind = ev.get("type")
         if kind == "system" and ev.get("session_id"):
             turn.session_id = turn.session_id or ev["session_id"]
-        content = (ev.get("message") or {}).get("content") or []
+        msg = ev.get("message")
+        content = (msg.get("content") if isinstance(msg, dict) else None) or []     # a notice's `message` is plain text
         if kind == "assistant":
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -608,10 +628,10 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                     break
                 try:
                     r = _run_case(gate, case, runner, env, spend, fresh_home, say)
-                except HostLimit:
+                except (HostLimit, HostAuth):
                     raise
                 except Exception as e:                   # noqa: BLE001 -- one case, not the run
-                    r = {"id": case["id"], "error": f"{type(e).__name__}: {str(e)[:300]}"}
+                    r = {"id": case["id"], "error": f"{type(e).__name__}: {str(e)[:300]}{_where(e)}"}
                 if host and r.get("host_cost_usd"):     # paid per token on OpenRouter: part of the cap
                     spend(f"host:{label}", float(r["host_cost_usd"]))
                 if "error" not in r:
@@ -647,12 +667,25 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                 + f" -> {'PASS' if s['passed'] else 'FAIL'}")
             if code == 2:
                 break
+            if s["errors"] and not s["passed"] and s["rate"] >= s["threshold"]:
+                # the finished cases clear the gate and only errored ones are missing: that is an incomplete run
+                # to retry (finished cases are cached), not a failed gate
+                say(f"eval coach {gate}: incomplete: {s['errors']} case(s) errored, the rest pass the gate. "
+                    f"Re-run the same command to retry only those.")
+                code = 2
+                break
             code = code or (0 if s["passed"] else 1)
     except HostLimit as e:
         from .. import runstatus
         runstatus.record("plan_limit", str(e))
         say(f"eval coach: stopped: the host hit its usage limit ({str(e)[:160]}). Finished cases are "
             f"saved; re-run the same command after the reset to continue.")
+        code = 2
+    except HostAuth as e:
+        from .. import runstatus
+        runstatus.record("auth", str(e))
+        say(f"eval coach: stopped: the Claude host is not signed in ({str(e)[:160]}). Run `claude`, type /login, then "
+            f"re-run the same command: finished cases are saved and no case was counted as failed.")
         code = 2
     except KeyboardInterrupt:
         say("\neval coach: interrupted. Finished cases are saved; re-run the same command to continue "

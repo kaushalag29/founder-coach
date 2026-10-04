@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from founder_coach import pack as P
+from founder_coach.search import DEFAULT_DOMAIN
 
 from . import __version__
 from .pages import atomic_write_text
@@ -75,6 +76,7 @@ def _clean(row: dict) -> dict:
         out[c] = int(v) if v is not None else -1
     for c in P.LIST_COLS:
         out[c] = [str(x) for x in (row.get(c) or [])]
+    out["domains"] = out["domains"] or [DEFAULT_DOMAIN]       # an index from before Domains
     return out
 
 
@@ -88,6 +90,7 @@ def corpus_stats(rows: list[dict]) -> dict:
     return {"items": len(rows), "by_kind": dict(sorted(Counter(r["kind"] for r in rows).items())),
             "talks": len(talks),
             "series": {k: len(v) for k, v in sorted(series.items(), key=lambda kv: -len(kv[1]))},
+            "domains": dict(sorted(Counter(d for r in rows for d in r["domains"]).items())),
             "years": [min(years), max(years)] if years else [],
             "speakers": len({r["speaker"] for r in rows if r["speaker"]})}
 
@@ -171,12 +174,37 @@ def _check(tmp: Path, rows: list[dict], matrix, embedder) -> None:
         store.close()
 
 
+def domain_info(rows: list[dict], registry=None) -> dict:
+    """What every declared Domain is about (description, risk tier, example questions, freshness half-life,
+    web policy), from domains.yaml, whether the pack has items in it or not: the host reads it to choose
+    Domains when it searches, and a declared Domain with no items is how it learns that the Library has
+    nothing there (a Gap, stated) rather than answering from another Domain. Domains the pack has items in
+    that domains.yaml doesn't declare are left out."""
+    from . import domains as D
+    reg = registry or D.load()
+    out = {}
+    for name in reg.names:
+        dom = reg.get(name)
+        info = {"description": dom.description, "risk_tier": dom.risk_tier,
+                "examples": list(dom.examples)[:3], "web_policy": dom.web_policy}
+        if dom.half_life_days:
+            info["freshness_days"] = dom.half_life_days
+        out[name] = info
+    return out
+
+
 def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
                kinds: tuple[str, ...] = P.KINDS, batch: int = 64, say=print,
-               source_info: dict | None = None, include_private: bool = False) -> dict:
+               source_info: dict | None = None, include_private: bool = False,
+               route: dict | None = None, calibration: dict | None = None) -> dict:
     """Build out_dir/knowledge.sqlite + pack.json from `source.rows(kinds=...)`.
     A Private Source's items (your own Books, ADR-0014) are left out unless `include_private`:
-    such a pack is for your own coach only, and `scripts/release.py` refuses it. Returns the manifest."""
+    such a pack is for your own coach only, and `scripts/release.py` refuses it. `route` (settings such as
+    {"margin": 0.05}, or {}) turns the server's automatic Domain routing on for this pack (off by default:
+    the host chooses Domains until `ytbrain eval run --config pack-route` shows routing doesn't lose).
+    `calibration` is a curve fitted by `ytbrain eval calibrate` for this pack's embedding model: it turns
+    similarity into P(relevant) for the `coverage` every search reports; without one a provisional curve is used.
+    Returns the manifest."""
     import numpy as np
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob(f".{P.PACK_FILE}.tmp-*"):        # left by a killed build
@@ -212,7 +240,14 @@ def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
             "rerank_model": rerank_model or "none",
             "source": source_info or {},
             "private_items": len(private) if include_private else 0,
+            "domain_info": domain_info(rows),
+            "router": {"enabled": route is not None, **(route or {})},
             **corpus_stats(rows)}
+    if calibration and calibration.get("embed_model") == embedder.name and (calibration.get("points") or "shift" in calibration):
+        meta["calibration"] = calibration
+    elif calibration:
+        say(f"pack: ignoring the saved calibration (fitted for {calibration.get('embed_model')}, this pack "
+            f"embeds with {embedder.name}); coverage stays provisional")
     final = out_dir / P.PACK_FILE
     tmp = out_dir / f".{P.PACK_FILE}.tmp-{os.getpid()}"
     try:

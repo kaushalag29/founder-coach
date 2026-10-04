@@ -205,6 +205,7 @@ LANCE_DIR = DATA / "lancedb"
 # --- eval benchmark (docs/eval-spec.md) ---
 EVAL_DIR = ROOT / "eval"                      # released benchmark files (committed)
 EVAL_DATA = DATA / "eval"                     # working state: eval.db, raw downloads, run results
+CALIBRATION_FILE = EVAL_DATA / "calibration.json"   # `ytbrain eval calibrate`: similarity -> P(relevant), for the pack
 EVAL_PRIVATE = EVAL_DATA / "private"          # labels on private Sources' Moments: never released (ADR-0014)
 # Knowledge pack [ADR-0009]: what the coach plugin ships (built by `ytbrain pack build`)
 from founder_coach.models import DEFAULT_EMBED_MODEL as _PACK_EMBED  # noqa: E402

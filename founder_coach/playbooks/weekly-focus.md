@@ -15,7 +15,7 @@ Follow the coaching contract in the server instructions throughout.
    - **why**: one line with a Citation; pass its item_ids as the Commitment's `citations`.
    - linked `goal_id` when it serves a Goal.
 5. **Push back** on a Commitment that doesn't move the biggest risk, and say which one you'd drop.
-6. **Confirm.** Show the final list exactly as it will be saved and ask for a yes. Edit until it's right.
+6. **Confirm.** Show the final list exactly as it will be saved and ask for a yes. Edit until it's right. A yes ("record them") is answered by the step-7 `coach_record` call in that same reply, with no further questions.
 7. **Record** with one `coach_record` call, kind `commitments`, all accepted items together. Relay any `warnings`.
 
 ## Why this shape

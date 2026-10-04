@@ -1,3 +1,4 @@
+Coverage: strong [provisional thresholds].
 Stage boost: mvp · mode semantic
 1. [advice] Charge customers from the very first pilot; a paid pilot tells you whether the problem is real.
    — Michael Seibel, "How to Price Your Product" (2019) · https://www.youtube.com/watch?v=AAAAAAAAAA1&t=760s · item_id adv:AAAAAAAAAA1:a01

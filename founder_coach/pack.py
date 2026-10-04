@@ -1,7 +1,8 @@
 """The Knowledge pack: every Verified Knowledge item in one read-only SQLite file
 [ADR-0009]. Built by `ytbrain pack build`, read by the coach runtime.
 
-Layout (FORMAT_VERSION 1):
+Layout (FORMAT_VERSION 1; `domains` and `source_id` columns were added later, and a pack without them
+opens as all-startup):
   meta       key -> JSON value: format, models and their prefixes, corpus statistics
   items      one row per item; column `n` (1..N) is also its row in the vector matrix
   items_fts  FTS5 over `indexable` (porter stemming), contentless view of `items`
@@ -21,7 +22,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .search import Filter
+from .search import DEFAULT_DOMAIN, Filter
 from . import product
 
 FORMAT_VERSION = 1
@@ -32,9 +33,9 @@ ALL_KINDS = KINDS + ("passage",)                    # (private beta only: ADR-00
 
 TEXT_COLS = ("item_id", "kind", "doc_id", "text", "evidence", "deep_link", "title", "speaker",
              "series", "provenance", "published_at", "stage_origin", "source_kind",
-             "context_header", "indexable")
+             "context_header", "indexable", "source_id")
 INT_COLS = ("start_ms", "end_ms", "year")
-LIST_COLS = ("stages", "topics")
+LIST_COLS = ("stages", "topics", "domains")
 COLUMNS = TEXT_COLS + INT_COLS + LIST_COLS
 
 DDL = [
@@ -163,12 +164,14 @@ class PackStore:
             have = {r[1] for r in self._db.execute("PRAGMA table_info(items)")}
             cols = [c for c in COLUMNS if c in have]
             missing = {c: (-1 if c in INT_COLS else "[]" if c in LIST_COLS else "") for c in COLUMNS if c not in have}
+            missing["domains"] = json.dumps([DEFAULT_DOMAIN])      # a pack from before Domains: all startup
             cur = self._db.execute(f"SELECT n, {', '.join(cols)} FROM items ORDER BY n")
             self._rows: list[dict] = []
             for rec in cur:
                 row = {**missing, **dict(zip(cols, rec[1:]))}
                 for c in LIST_COLS:
                     row[c] = json.loads(row[c] or "[]")
+                row["domains"] = row["domains"] or [DEFAULT_DOMAIN]
                 self._rows.append(row)
             if [r for r in self._db.execute("SELECT n FROM items ORDER BY n LIMIT 1")] not in ([], [(1,)]):
                 raise RuntimeError(f"{self.path}: item numbering must start at 1")
@@ -228,6 +231,36 @@ class PackStore:
         if flt is None or flt.empty:
             return None
         return np.fromiter((flt.matches(r) for r in self._rows), dtype=bool, count=len(self._rows))
+
+    def _domain_rows(self) -> dict:
+        """Domain -> the row numbers of its items (an item in two Domains is in both)."""
+        import numpy as np
+        if getattr(self, "_dom_rows", None) is None:
+            idx: dict[str, list[int]] = {}
+            for i, r in enumerate(self._rows):
+                for d in r["domains"]:
+                    idx.setdefault(d, []).append(i)
+            self._dom_rows = {d: np.asarray(v, dtype=np.int64) for d, v in sorted(idx.items())}
+        return self._dom_rows
+
+    def domain_counts(self) -> dict[str, int]:
+        return {d: int(len(v)) for d, v in self._domain_rows().items()}
+
+    def domain_scores(self, vector, top_n: int = 3) -> dict[str, float]:
+        """Per Domain with items: the mean cosine of its `top_n` closest items (the router's signal)."""
+        import numpy as np
+        q = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if q.shape[0] != self.dim:
+            raise RuntimeError(f"query vector has {q.shape[0]} dimensions, the pack {self.dim} "
+                               f"(built with {self.embed_model()})")
+        norm = float(np.linalg.norm(q))
+        sims = self._m @ (q / norm if norm else q)
+        out = {}
+        for d, idx in self._domain_rows().items():
+            part = sims[idx]
+            k = min(top_n, part.size)
+            out[d] = float(np.partition(part, part.size - k)[part.size - k:].mean())
+        return out
 
     def vector_search(self, vector, flt: Filter | None, limit: int) -> list[dict]:
         import numpy as np

@@ -689,6 +689,37 @@ def _book_env(t: Path):
 IDS = ["9780000000002__start-with-the-customer", "9780000000002__hire-slowly", "9780000000002__charge-early"]
 
 
+def test_book_sync_warns_about_a_folder_that_is_not_a_domain_and_strict_makes_it_exit_1():
+    from types import SimpleNamespace
+
+    from ytbrain import sources as S
+    from ytbrain.books.adapter import BookAdapter
+    from ytbrain.manifest import Manifest
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        (t / "books" / "sytem-design").mkdir(parents=True)
+        (t / "books" / "finance").mkdir()
+        (t / "books" / "sytem-design" / "X.pdf").write_bytes(b"%PDF-1.4 not a book")
+        (t / "books" / "finance" / "Y.pdf").write_bytes(b"%PDF-1.4 not a book")
+        src = S.normalize({"path": "books"})
+        said: list[str] = []
+        ad = BookAdapter(say=said.append, root=t, parsed_dir=t / "p", plans_dir=t / "pl", transcripts=t / "tr")
+        assert ad._stray(src, S.book_files(src, t)) == {"sytem-design": 1}
+        m = Manifest(t / "m.db")
+        from ytbrain import runstatus
+        real_status, runstatus.STATUS = runstatus.STATUS, t / "stop.json"      # never your data/ops
+        try:
+            for strict in (False, True):
+                said.clear()
+                res = ad.sync(m, [src], SimpleNamespace(strict_domains=strict))
+                assert any("sytem-design/" in line and "declared Domain" in line for line in said), said
+                assert not any("finance/" in line and "declared Domain" in line for line in said)
+                assert res["code"] == 1, "the unreadable test PDFs are refused either way"
+            assert (runstatus.read() or {}).get("reason") == "config", "strict tells `ops` to stop, not to retry the network"
+        finally:
+            runstatus.STATUS = real_status
+
+
 def test_book_sync_registers_one_document_per_chapter_and_isolates_a_refused_pdf():
     if not HAVE_PDFIUM:
         return _skipped("pypdfium2 not installed")

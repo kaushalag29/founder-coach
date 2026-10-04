@@ -122,8 +122,15 @@ Everything ingested on this machine, synced, extracted, verified and indexed onc
 _Avoid_: corpus (when meaning all Packs), database, knowledge base
 
 **Domain**:
-A named subject area (startup, finance, leadership, system design) that Sources and Books belong to, one or several each; a Pack chooses Domains, and a question is routed to Domains before it is searched. Category and Topic live inside a Domain.
+A named subject area (startup, finance, leadership, system design) that Sources and Books belong to, one or several each; a Pack chooses Domains, and a question is routed to one or several Domains before it is searched (a question can span two). A Document's Domains are configuration (sources.yaml, or the Book's folder), never extracted; a Book folder that is not a declared Domain is reported at sync, because its Books would fall back to the default. Category and Topic live inside a Domain.
 _Avoid_: category, profile, vertical, collection
+
+**Routing**:
+Choosing which Domains a question touches (one, or several when it spans subjects) so search can favour them while still looking in the whole Library. Normally the host's choice, from what each Domain is about; the server can do it from the question's similarity to each Domain's items when the pack turns that on.
+
+**Compound question**:
+A question that asks about separate things ("when to raise and how to read a term sheet"). The host splits it into parts, searches each part with the Domains that part touches, and answers or declines each part on its own Coverage; the server never splits it.
+_Avoid_: multi-part query, multi-hop question (that is one thing needing a chain of facts, not several things)
 
 **Pack**:
 One configured agent over the Library: its Domains, persona, facets, Playbooks, Risk tier and Eval questions. Founder Coach is the Pack `founder`.
@@ -212,7 +219,7 @@ A question with graded labels saying which Moments should come back for it, and 
 _Avoid_: test case, query (the text alone), golden question
 
 **Gap question**:
-An out-of-corpus Eval question whose right answer is a Gap; Gap questions measure how often the coach answers when it should decline, and calibrate Coverage.
+An out-of-corpus Eval question whose right answer is a Gap; Gap questions measure how often the coach answers when it should decline, and calibrate Coverage. One tied to a Domain stops being a Gap question once the Library holds items in that Domain.
 _Avoid_: unanswerable question, negative example
 
 **Tuning set**:

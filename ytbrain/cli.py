@@ -81,10 +81,123 @@ def _all_sources() -> list[dict]:
     """Every Source in sources.yaml, normalized (ytbrain/sources.py); exits on a config error."""
     from . import sources as S
     _sources()                                    # the friendly "sources.yaml not found" exit
+    from . import domains as D
     try:
-        return S.load(SOURCES)
-    except S.SourceConfigError as e:
+        srcs = S.load(SOURCES)
+        D.check_sources(D.load(), srcs)
+        return srcs
+    except (S.SourceConfigError, D.DomainConfigError) as e:
         sys.exit(f"sources.yaml: {e}")
+
+
+def _eval_coverage(args, store, embed) -> int:
+    """`eval gap` and `eval calibrate`: is `coverage` honest? (ytbrain/eval/coverage.py)"""
+    import datetime as dt
+    from .config import CALIBRATION_FILE, EVAL_DATA, EVAL_DIR, EVAL_PRIVATE
+    from .eval import coverage as CV
+    from .eval import route as R
+    from .eval.files import load_set
+    from .pages import atomic_write_text
+    meta = getattr(store, "meta", None) or {}
+    queries, qrels = load_set(EVAL_DIR, args.set, EVAL_PRIVATE)
+    say = lambda m: print(m, flush=True)
+    if args.eval_cmd == "calibrate":
+        rows = CV.pairs(store, embed, queries, qrels, k=args.k, say=say)
+        try:
+            res = CV.calibrate(rows)
+        except ValueError as e:
+            print(f"eval calibrate: {e}. Judge more questions first (`ytbrain eval judge`), or widen --set.", file=sys.stderr)
+            return 1
+        save = (args.force or (res["better"] and not res["unreachable"])) and not args.no_save
+        if save:
+            payload = {**res["curve"].as_meta(), "embed_model": meta.get("embed_model"),
+                       "fitted_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "set": args.set}
+            atomic_write_text(CALIBRATION_FILE, json.dumps(payload, indent=1))
+        print(CV.render_calibration(res, CALIBRATION_FILE if save else None))
+        if save:
+            print("next: `ytbrain pack build` (or `ytbrain ops plugin`) puts the curve in the pack; then `ytbrain eval gap`")
+        return 0
+    have = set(meta.get("domains") or ["startup"])
+    mine = Path(args.questions) if args.questions else EVAL_DATA / "gap-questions.txt"
+    if args.questions and not mine.exists():
+        print(f"eval gap: --questions {mine}: no such file", file=sys.stderr)
+        return 1
+    try:
+        probes = CV.gap_questions(mine, queries)
+    except ValueError as e:
+        print(f"eval gap: {e}", file=sys.stderr)
+        return 1
+    gap, retired = CV.active_gap(probes, have)
+    answerable = [CV.Probe(i.qid, i.text, expected=i.expected) for i in R.questions(queries, R.doc_domains(store))]
+    if not gap or not answerable:
+        print("eval gap: need Gap questions and answerable questions in this pack "
+              f"({len(gap)} Gap, {len(answerable)} answerable)", file=sys.stderr)
+        return 1
+    print(f"eval gap: {len(gap)} Gap questions, {len(answerable)} answerable", flush=True)
+    rep = CV.report(store, gap, answerable, CV.observe(store, embed, gap, say=say),
+                    CV.observe(store, embed, answerable, say=say), retired)
+    print(CV.render(rep))
+    if args.tune:
+        shift = rep["recommended_shift"]
+        if shift is None:
+            print("eval gap: no shift meets both targets; nothing saved", file=sys.stderr)
+        else:
+            try:
+                saved = json.loads(CALIBRATION_FILE.read_text(encoding="utf-8")) if CALIBRATION_FILE.exists() else {}
+            except (OSError, ValueError):
+                saved = {}
+            if saved.get("embed_model") not in (None, meta.get("embed_model")):
+                saved = {}                                 # a curve for another embedding model says nothing about this pack
+            saved.update({"embed_model": meta.get("embed_model"), "shift": shift})
+            atomic_write_text(CALIBRATION_FILE, json.dumps(saved, indent=1))
+            print(f"eval gap: saved shift {shift:+.2f} to {CALIBRATION_FILE}; `ytbrain pack build` applies it")
+    return CV.exit_code(rep)
+
+
+def _saved_calibration() -> dict | None:
+    """The curve `ytbrain eval calibrate` saved, if there is a readable one (a damaged file is no curve)."""
+    from .config import CALIBRATION_FILE
+    try:
+        return json.loads(CALIBRATION_FILE.read_text(encoding="utf-8")) if CALIBRATION_FILE.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _domains():
+    """The Domain registry (domains.yaml); exits on a config error."""
+    from . import domains as D
+    try:
+        return D.load()
+    except D.DomainConfigError as e:
+        sys.exit(str(e))
+
+
+def _doc_tags(m, doc_ids) -> dict[str, tuple[list[str], str]]:
+    """doc_id -> (Domains, Source id), from domains.yaml, sources.yaml and the manifest. A Book's
+    folder is read from its plan (data/books/plans). Without a sources.yaml every Document is
+    in the default Domain: tags are configuration and the index must still build."""
+    from . import domains as D
+    from .config import BOOKS_PLANS
+    reg = _domains()
+    srcs = {s["id"]: s for s in _all_sources()} if SOURCES.exists() else {}
+    out = {}
+    for doc_id in doc_ids:
+        row = m.get_document(doc_id)
+        sid = (row["source_id"] if row is not None else None) or ""
+        src = srcs.get(sid)
+        book = roots = None
+        if src and src["type"] == "pdf_books":
+            try:
+                book = json.loads((BOOKS_PLANS / f"{doc_id.split('__', 1)[0]}.json").read_text(encoding="utf-8")).get("path")
+            except (OSError, ValueError):
+                book = None
+            roots = [(Path(p).expanduser() if Path(p).expanduser().is_absolute() else ROOT / p)
+                     for p in src.get("paths") or [src["path"]]]
+        try:
+            out[doc_id] = (D.resolve(reg, src, book, roots or ()), sid)
+        except D.DomainConfigError as e:
+            sys.exit(str(e))
+    return out
 
 
 def _visibility():
@@ -1320,6 +1433,9 @@ def cmd_index(args) -> int:
         store.db.drop_table(store.name)
         store._t = None
         todo = sorted(candidates, key=lambda d: order.get(d, 10**9))
+    tags = _doc_tags(m, candidates)
+    if (n_tagged := store.retag(tags)):          # Domains and Source ids are configuration: no re-embedding
+        print(f"index: re-tagged {n_tagged} Document(s) with their Domains", flush=True)
     if not todo:
         removed = store.delete_documents_except(candidates)
         if removed:
@@ -1358,7 +1474,7 @@ def cmd_index(args) -> int:
         transcript = None if _unreadable_json(tpath, "utterances") else json.loads(tpath.read_text())
         _item(i, len(todo), doc_id, record.get("title_raw"))
         try:
-            rows = _index_rows(record, transcript, build_items, embed, store, EMBED_MODEL)
+            rows = _index_rows(record, transcript, build_items, embed, store, EMBED_MODEL, tags)
         except Exception as e:                       # noqa: BLE001 -- isolate one bad talk
             _step_failed(m, "index", doc_id, e)
             errors += 1
@@ -1389,9 +1505,10 @@ def cmd_index(args) -> int:
     return 0
 
 
-def _index_rows(record, transcript, build_items, embed, store, model: str) -> list[dict]:
+def _index_rows(record, transcript, build_items, embed, store, model: str, tags=None) -> list[dict]:
     """Embed one Document's items and replace them in the index (one unit: delete + add)."""
-    rows = build_items(record, transcript)
+    domains, source_id = (tags or {}).get(record["doc_id"], (None, ""))
+    rows = build_items(record, transcript, domains, source_id)
     vectors = embed([r["indexable"] for r in rows]) if rows else []
     for r, v in zip(rows, vectors):
         r["vector"], r["embed_model"] = v, model
@@ -1581,6 +1698,8 @@ def cmd_pack(args) -> int:
                       "scripts/release.py refuses this pack (ADR-0014)", flush=True)
             manifest = build_pack(store, embedder, out, rerank_model=rerank, batch=args.batch, kinds=kinds,
                                   include_private=args.include_private,
+                                  route={} if args.route else None,
+                                  calibration=_saved_calibration(),
                                   say=lambda m: print(m, flush=True),
                                   source_info={"index_items": store.count(),
                                                "index_embed_model": store.embed_model() or EMBED_MODEL})
@@ -1715,7 +1834,12 @@ def cmd_eval(args) -> int:
         return build.judge_runs(env, args.set, paths, depth=args.depth, max_cost=args.max_cost,
                                 talk_info=_talk_info(), freeze_date=freeze)
     try:
-        if args.eval_cmd == "run" and CONFIGS[args.config].get("backend") == "pack":
+        if args.eval_cmd in ("gap", "calibrate"):
+            store, embed, reranker = _load_pack(args.pack, rerank=False)     # coverage is the pack's behaviour
+        elif args.eval_cmd == "route":
+            store, embed, reranker = (_load_pack(args.pack, rerank=False) if args.pack
+                                      else _load_search(args.device, rerank=False))
+        elif args.eval_cmd == "run" and CONFIGS[args.config].get("backend") == "pack":
             if not args.pack:
                 index_at, built = _knowledge_times()
                 for n in _staleness_notes(args.set, args.config, None, index_at, built):
@@ -1727,6 +1851,24 @@ def cmd_eval(args) -> int:
     except RuntimeError as e:
         print(f"eval: {e}", file=sys.stderr)
         return 1
+    if args.eval_cmd in ("gap", "calibrate"):
+        return _eval_coverage(args, store, embed)
+    if args.eval_cmd == "route":
+        from .eval import route as R
+        from .eval.files import load_set
+        queries, _ = load_set(EVAL_DIR, args.set, EVAL_PRIVATE)
+        single = R.questions(queries, R.doc_domains(store))
+        if len({d for it in single for d in it.expected}) < 2:
+            print("eval route: the questions' Documents are all in one Domain; there is nothing to route yet "
+                  "(add Sources or books in a second Domain, then `ytbrain index`)", file=sys.stderr)
+            return 1
+        composed = R.compose(single, args.composed)
+        print(f"eval route: {len(single)} questions, {len(composed)} composed prompts", flush=True)
+        say = lambda m: print(m, flush=True)
+        rep = R.report(single, R.collect(store, embed, single, say=say), composed,
+                       R.collect(store, embed, composed, say=say))
+        print(R.render(rep))
+        return 0
     smoke = EVAL_DATA / "smoke"            # --limit / --smoke: a scratch benchmark, never released
     if args.eval_cmd == "run":
         from .eval.run import evaluate, render
@@ -2068,16 +2210,18 @@ def cmd_status(args) -> int:
 def cmd_invalidate(args) -> int:
     """Mark one stage stale (all docs, or --only-flagged) so only it re-runs."""
     m = Manifest(MANIFEST_DB)
-    if getattr(args, "source", None):
-        ids = [r["doc_id"] for r in m.db.execute("SELECT doc_id FROM documents WHERE source_id=?", (args.source,))]
-        n = m.invalidate_docs(args.stage, ids, args.reason or f"re-run: source {args.source}")
-        print(f"marked {n} document(s) of {args.source} stale at '{args.stage}' -- re-run `ytbrain {args.stage}`")
-        return 0
-    if args.only_flagged:
-        ids = m.flagged_ids()
-        n = m.invalidate_docs(args.stage, ids, args.reason or "re-run: verify flagged it")
-        print(f"marked {n} flagged/failed document(s) stale at '{args.stage}' -- "
-              f"re-run `ytbrain {args.stage}` (then `ytbrain verify`)")
+    source = getattr(args, "source", None)
+    if source or args.only_flagged:
+        # --source and --only-flagged narrow each other: both given = the flagged ones of that source
+        ids = [r["doc_id"] for r in m.db.execute("SELECT doc_id FROM documents WHERE source_id=?", (source,))] \
+            if source else None
+        if args.only_flagged:
+            flagged = m.flagged_ids()
+            ids = flagged if ids is None else sorted(set(ids) & set(flagged))
+        what = " ".join(x for x in (f"of {source}" if source else "", "flagged/failed" if args.only_flagged else "") if x)
+        n = m.invalidate_docs(args.stage, ids, args.reason or f"re-run: {what}")
+        print(f"marked {n} document(s) {what} stale at '{args.stage}' -- re-run `ytbrain {args.stage}`"
+              + (" (then `ytbrain verify`)" if args.only_flagged else ""))
         return 0
     n = m.invalidate_stage(args.stage, args.reason or "manual")
     print(f"marked {n} documents stale at '{args.stage}' — re-run that stage only")
@@ -2187,6 +2331,9 @@ def main(argv=None) -> int:
         sp.add_argument("--type", default=None, choices=SYNC_TYPES, dest="source_type",
                         help="only YouTube playlists or only websites (the sync step)")
         if name == "sync":
+            sp.add_argument("--strict-domains", action="store_true",
+                            help="exit 1 when a book folder is not a declared Domain (the books are still "
+                                 "registered; `ytbrain ops` sets it)")
             sp.add_argument("--backfill", action="store_true",
                             help="only retry videos whose caption fetch failed (e.g. HTTP 429), "
                                  "slowly, without listing playlists")
@@ -2290,6 +2437,24 @@ def main(argv=None) -> int:
     er.add_argument("--label", default=None, metavar="NAME",
                     help="name this variant (e.g. arctic-passages): results are saved as <config>-<NAME>, "
                          "so `eval rescore --config pack-no-rerank-arctic-passages` finds them")
+    ert = esub.add_parser("route", help="score the Domain router on single and composed (two-Domain) questions, "
+                                        "with a margin sweep (read-only, no LLM)")
+    ert.add_argument("--set", choices=list(_eval_sets), default="all")
+    ert.add_argument("--pack", default=None, metavar="PATH", help="score a Knowledge pack instead of the full index")
+    ert.add_argument("--composed", type=int, default=100, metavar="N", help="composed prompts to build (default 100)")
+    ecal = esub.add_parser("calibrate", help="fit the curve that turns similarity into P(relevant) from your graded labels, "
+                                             "so `coverage` means something (read-only apart from data/eval/calibration.json; no LLM)")
+    ecal.add_argument("--set", choices=list(_eval_sets), default="all")
+    ecal.add_argument("--pack", default=None, metavar="PATH", help="the Knowledge pack to fit for (default data/pack)")
+    ecal.add_argument("--k", type=int, default=10, help="top hits per question to use (default 10)")
+    ecal.add_argument("--no-save", action="store_true", help="report only")
+    ecal.add_argument("--force", action="store_true", help="save even if the fitted curve is not better than the provisional one")
+    egap = esub.add_parser("gap", help="how often coverage is wrong: Gap questions the coach would answer, answerable "
+                                       "questions it would call a Gap, and where to move the border (no LLM)")
+    egap.add_argument("--set", choices=list(_eval_sets), default="all")
+    egap.add_argument("--pack", default=None, metavar="PATH", help="the Knowledge pack to measure (default data/pack)")
+    egap.add_argument("--questions", default=None, metavar="FILE", help="your Gap questions (default data/eval/gap-questions.txt)")
+    egap.add_argument("--tune", action="store_true", help="save the recommended shift for the next `pack build`")
     esub.add_parser("status", help="progress and spend of each split")
     ec = esub.add_parser("coach", help="gates G2/G4/G5/G6: the coach's answers and memory through the real host "
                                         "(`claude -p` with the assembled plugin), graded by the judges")
@@ -2379,10 +2544,13 @@ def main(argv=None) -> int:
                     help="also ship Passages (transcript excerpts, ~2x the size): private beta only (ADR-0009)")
     pb.add_argument("--include-private", action="store_true",
                     help="also pack private Sources (your own Books): for your own coach only, never released")
+    pb.add_argument("--route", action="store_true",
+                    help="turn on the server's automatic Domain routing for this pack (off by default: the host "
+                         "chooses Domains until `eval run --config pack-route` shows it doesn't lose)")
     pi = psub.add_parser("info", help="describe the pack and verify its checksum")
     for x in (pb, pi):
         x.add_argument("--out", default=None, metavar="DIR", help="pack folder (default data/pack)")
-    for e in (eb, er):
+    for e in (eb, er, ert):
         e.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"])
 
     args = p.parse_args(argv)
@@ -2395,7 +2563,7 @@ def main(argv=None) -> int:
         signal.signal(signal.SIGHUP, _term)
     # reading commands never wait for (or block) a long build: `eval status`, and `eval rescore`
     # (scores a saved run; its result file is written atomically)
-    read_only = args.cmd == "eval" and getattr(args, "eval_cmd", "") in ("status", "rescore", "coach") \
+    read_only = args.cmd == "eval" and getattr(args, "eval_cmd", "") in ("status", "rescore", "coach", "route", "gap", "calibrate") \
         and not getattr(args, "save_baseline", False) and not getattr(args, "refresh_baseline", False)
     if args.cmd not in MUTATING or read_only:
         return args.func(args)

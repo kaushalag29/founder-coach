@@ -43,4 +43,4 @@ include = ["ytbrain*", "founder_coach*"]
 
 [tool.setuptools.package-data]
 founder_coach = ["playbooks/*.md", "product.json"]
-ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl", "books/ligature_words.txt"]
+ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl", "eval/gap_questions.txt", "books/ligature_words.txt"]

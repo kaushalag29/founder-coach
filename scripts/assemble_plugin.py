@@ -152,6 +152,7 @@ def prompt_text(skill_body: str, prod: dict | None = None) -> str:
     prod = prod or load_product()
     t = skill_body
     t = t.replace("the coaching contract of the coach skill", "the coaching contract in the server instructions")
+    t = t.replace("the coverage rules of the coach skill", "the coverage rule in the server instructions")
     t = t.replace("the coach skill's stages reference", "the Stage list in coach_update_profile")
     t = re.sub(r'uvx --from "\$\{CLAUDE_SKILL_DIR\}/\.\./\.\." \{\{id\}\}', "{{id}}", t)
     t = t.replace("$ARGUMENTS", "{arguments}")

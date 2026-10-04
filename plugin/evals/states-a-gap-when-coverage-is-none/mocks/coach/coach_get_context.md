@@ -1,0 +1,4 @@
+Today 2026-10-05 (2026-W41), time zone America/New_York.
+Profile: company Clinicly · one_liner an AI receptionist for dental clinics · customer dental clinics · stage mvp · team_size 3 · key_metrics {}
+Active Goals: none. This week's Commitments: none. Overdue: none. Last Check-in: none. Nudges: none.
+Library (Domains the knowledge covers): startup (22092 items, risk medium; how to start and run a startup); leadership (982 items, risk low; managing people, culture, feedback); finance (0 items, risk high, web always_latest; money, valuation, investing); system-design (0 items, risk low; architecture, databases, scaling). Use: pass `domains` to coach_search with the Domains a question touches (several allowed); a Domain with items: 0 has no material: say that Gap instead of answering it from another Domain. Act on `coverage` in every search result.

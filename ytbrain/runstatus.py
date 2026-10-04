@@ -12,7 +12,7 @@ from .config import DATA
 from .pages import atomic_write_text
 
 STATUS = DATA / "ops" / "last-stop.json"
-REASONS = ("budget", "endpoint", "network", "plan_limit", "interrupted", "unknown")
+REASONS = ("budget", "endpoint", "network", "plan_limit", "auth", "interrupted", "config", "books", "unknown")
 _NETWORK = re.compile(r"timed? ?out|timeout|connection|network|unreachable|temporar|reset by peer|"
                       r"name resolution|\b5\d\d\b|\b429\b|rate.?limit|too many requests|slow provider", re.IGNORECASE)
 _ENDPOINT = re.compile(r"\b40[0-3]\b|credit|api key|\bkey\b|quota|refused|forbidden|unauthori[sz]ed|"

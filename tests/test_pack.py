@@ -79,11 +79,11 @@ class Source:
         return [dict(r) for r in self._rows if not kinds or r["kind"] in kinds]
 
 
-def _build(out, rows=ROWS, emb=None, batch=64):
+def _build(out, rows=ROWS, emb=None, batch=64, route=None, calibration=None):
     emb = emb or HashEmbed()
     with contextlib.redirect_stdout(io.StringIO()):
         return build_pack(Source(rows), emb, out, rerank_model="none", batch=batch,
-                          say=lambda m: None), emb
+                          say=lambda m: None, route=route, calibration=calibration), emb
 
 
 def test_pack_builds_verifies_and_searches_like_the_index():
@@ -366,6 +366,197 @@ def test_a_build_killed_between_the_two_swaps_still_verifies_and_bad_manifests_a
             raise AssertionError("an unreadable manifest must be refused, not crash")
         except RuntimeError as e:
             assert "unreadable" in str(e)
+
+
+# --- Domains (M5a): items carry the Domains of their Document; search takes several -------------
+def _dom_rows():
+    return [
+        {**_row("adv:SSSSSSSSSS1:a01", "advice", "SSSSSSSSSS1", "talk to users every week before you build"), "domains": ["startup"]},
+        {**_row("adv:LLLLLLLLLL2:a01", "advice", "LLLLLLLLLL2", "give feedback early and in private to your team"),
+         "domains": ["leadership"], "source_id": "books_x"},
+        {**_row("adv:BOTHBOTHBO3:a01", "advice", "BOTHBOTHBO3", "hire slowly and give clear feedback to new hires"),
+         "domains": ["startup", "leadership"]},
+        {**_row("adv:NODOMAINNN4:a01", "advice", "NODOMAINNN4", "charge money for the product on day one")},   # an index from before Domains
+    ]
+
+
+def test_domains_travel_into_the_pack_and_a_filter_matches_any_of_them():
+    out = Path(tempfile.mkdtemp())
+    manifest, emb = _build(out, rows=_dom_rows())
+    assert manifest["domains"] == {"leadership": 2, "startup": 3}, manifest["domains"]    # the untagged row is startup
+    store = P.PackStore(out, verify=True)
+    ids = lambda flt: sorted(r["item_id"] for r in store.vector_search(emb(["feedback hire users"])[0], flt, 10))
+    assert len(ids(None)) == 4
+    assert ids(Filter(domains=("leadership",))) == ["adv:BOTHBOTHBO3:a01", "adv:LLLLLLLLLL2:a01"]
+    assert ids(Filter(domains=("startup",))) == ["adv:BOTHBOTHBO3:a01", "adv:NODOMAINNN4:a01", "adv:SSSSSSSSSS1:a01"]
+    assert len(ids(Filter(domains=("startup", "leadership")))) == 4                        # a question across two Domains
+    assert ids(Filter(domains=("finance",))) == []
+    assert {r["item_id"] for r in store.text_search("feedback", Filter(domains=("leadership",)), 10)} == \
+        {"adv:LLLLLLLLLL2:a01", "adv:BOTHBOTHBO3:a01"}
+    hits = search(store, emb, "feedback for my team", domains=["leadership"], top_k=5)
+    assert hits and all("leadership" in h["domains"] for h in hits)
+    both = search(store, emb, "talk to users and give feedback", domains=["startup", "leadership"], top_k=5)
+    assert {d for h in both for d in h["domains"]} == {"startup", "leadership"}
+    assert store.get("adv:NODOMAINNN4:a01")["domains"] == ["startup"] and store.get("adv:LLLLLLLLLL2:a01")["source_id"] == "books_x"
+    assert Filter.of(domains=["a", "a", "b"]).domains == ("a", "b") and Filter.of(domains=[]) is None
+
+
+def test_a_pack_built_before_domains_opens_as_all_startup():
+    out = Path(tempfile.mkdtemp())
+    _build(out, rows=ROWS)
+    db = sqlite3.connect(out / P.PACK_FILE)
+    for col in ("domains", "source_id"):
+        db.execute(f"ALTER TABLE items DROP COLUMN {col}")
+    db.commit()
+    db.close()
+    store = P.PackStore(out)                                   # (no verify: the file changed)
+    assert all(r["domains"] == ["startup"] and r["source_id"] == "" for r in store.rows())
+    assert store.vector_search(HashEmbed()(["pricing"])[0], Filter(domains=("startup",)), 5)
+    assert not store.vector_search(HashEmbed()(["pricing"])[0], Filter(domains=("leadership",)), 5)
+
+
+# --- the Domain router (M5d) -----------------------------------------------------------------------
+class AxisEmbed(HashEmbed):
+    """Four axes, so scores are exact: price -> 0, feedback -> 1, equity -> 2, anything else -> 3."""
+    name, dim = "axis-4", 4
+
+    def _vec(self, t):
+        import math
+        w = t.lower().split()
+        v = [float(w.count("price")), float(w.count("feedback")), float(w.count("equity")), 0.01 * (1 + w.count("misc"))]
+        n = math.sqrt(sum(x * x for x in v))
+        return [x / n for x in v]
+
+
+def _axis_rows():
+    rows = []
+    for i in range(30):          # a big Domain whose items lean toward the other Domain's subject too
+        rows.append({**_row(f"adv:S{i:010d}:a01", "advice", f"S{i:010d}", f"price price feedback n{i}"), "domains": ["startup"]})
+    for i in range(3):           # a small one
+        rows.append({**_row(f"adv:L{i:010d}:a01", "advice", f"L{i:010d}", f"feedback feedback l{i}"), "domains": ["leadership"]})
+    for i in range(2):
+        rows.append({**_row(f"adv:F{i:010d}:a01", "advice", f"F{i:010d}", f"equity equity f{i}"), "domains": ["finance"]})
+    return rows
+
+
+def _axis_store():
+    out = Path(tempfile.mkdtemp())
+    manifest, emb = _build(out, rows=_axis_rows(), emb=AxisEmbed())
+    return P.PackStore(out), emb, manifest
+
+
+def test_the_router_scores_each_domain_by_its_closest_items_and_routes_those_near_the_best():
+    from founder_coach import router as R
+    store, emb, manifest = _axis_store()
+    assert store.domain_counts() == {"finance": 2, "leadership": 3, "startup": 30}
+    sc = store.domain_scores(emb(["feedback"])[0], 3)
+    assert abs(sc["leadership"] - 1.0) < 1e-3 and abs(sc["startup"] - 1 / 5 ** .5) < 1e-3 and sc["finance"] < 0.02, sc
+    # a small Domain is not drowned by a large one: it scores on its own best items
+    assert R.route(store, emb(["feedback"])[0]).domains == ("leadership",)
+    assert R.route(store, emb(["equity"])[0]).domains == ("finance",)
+    both = emb(["price feedback"])[0]
+    assert R.route(store, both).domains == ("startup",), "the default margin is narrow: startup is 0.24 ahead here"
+    assert R.route(store, both, margin=0.3).domains == ("startup", "leadership")
+    three = emb(["feedback feedback equity"])[0]                 # leadership .89, finance .45, startup .40
+    assert R.route(store, three, margin=2.0, max_domains=2).domains == ("leadership", "finance")
+    assert R.route(store, three, margin=2.0).domains == ("leadership", "finance", "startup")
+    assert R.route(store, three, margin=0.0).domains == ("leadership",)
+    assert R.route(store, both, margin=0.3).as_list()[0] == {"domain": "startup", "score": round(R.route(store, both).scores[0][1], 3)}
+    # one Domain in the Library: nothing to choose between
+    one = Path(tempfile.mkdtemp())
+    _build(one, rows=ROWS, emb=AxisEmbed())
+    assert R.route(P.PackStore(one), emb(["price"])[0]).domains == () and not R.route(P.PackStore(one), emb(["price"])[0]).routed
+    assert R.route(object(), emb(["price"])[0]).domains == (), "a store with no domain_scores routes nothing"
+    assert R.choose({}).domains == () and R.choose({"a": 0.5}).domains == ()
+
+
+def test_routing_favours_the_routed_domains_and_a_floor_keeps_every_routed_domain_in_the_answer():
+    store, emb, _ = _axis_store()
+    ids = lambda res: [r["item_id"][4] for r in res]
+    q = "price feedback"
+    assert ids(search(store, emb, q, top_k=5)).count("L") == 0, "unrouted, the big Domain crowds the small one out"
+    info = {}
+    res = search(store, emb, q, top_k=5, route={"margin": 0.3}, info=info)
+    assert info["routing"].domains == ("startup", "leadership")
+    assert ids(res).count("L") == 2 and ids(res).count("S") == 3 and ids(res).count("F") == 0, ids(res)
+    assert [r["score"] for r in res] == sorted((r["score"] for r in res), reverse=True)
+    assert len({r["item_id"] for r in res}) == 5
+    # one routed Domain: no floor, and the same results as an unrouted search of that question
+    plain = search(store, emb, "price", top_k=5)
+    assert [r["item_id"] for r in search(store, emb, "price", top_k=5, route=True)] == [r["item_id"] for r in plain]
+    # explicit domains win: no routing is made and results are limited to them
+    info = {}
+    res = search(store, emb, q, top_k=5, domains=["leadership"], route=True, info=info)
+    assert "routing" not in info and set(ids(res)) == {"L"}
+    # a floor never pulls in a Domain whose items are far less relevant than the best result
+    res = search(store, emb, "price price price feedback", top_k=5, route={"margin": 2.0})
+    assert ids(res).count("S") >= 3
+    # no route requested: nothing changes for anyone
+    info = {}
+    search(store, emb, q, top_k=5, info=info)
+    assert "routing" not in info
+
+
+def test_naming_several_domains_guarantees_each_a_share_so_a_big_domain_cannot_crowd_a_small_one_out():
+    store, emb, _ = _axis_store()
+    ids = lambda res: [r["item_id"][4] for r in res]
+    q = "price feedback"
+    both = search(store, emb, q, top_k=5, domains=["startup", "leadership"])
+    assert ids(both).count("L") >= 2 and ids(both).count("S") >= 2 and "F" not in ids(both), ids(both)
+    assert [r["score"] for r in both] == sorted((r["score"] for r in both), reverse=True) and len({r["item_id"] for r in both}) == 5
+    assert ids(search(store, emb, q, top_k=5, domains=["startup", "leadership", "startup"])) == ids(both), "repeats don't count twice"
+    # one Domain (even named twice): a plain filtered search, no floor, same as before
+    one = search(store, emb, q, top_k=5, domains=["leadership"])
+    assert set(ids(one)) == {"L"} and ids(search(store, emb, q, top_k=5, domains=["leadership", "leadership"])) == ids(one)
+    # the floor still never pads with results far less relevant than the best
+    far = search(store, emb, "price price price price", top_k=5, domains=["startup", "leadership"])
+    assert ids(far).count("S") >= 3, ids(far)
+    # no routing is made for explicit Domains
+    info = {}
+    search(store, emb, q, top_k=5, domains=["startup", "leadership"], route=True, info=info)
+    assert "routing" not in info
+
+
+def test_a_pack_records_what_each_domain_is_about_and_whether_the_server_routes():
+    out = Path(tempfile.mkdtemp())
+    manifest, _ = _build(out, rows=_dom_rows())
+    assert manifest["router"] == {"enabled": False}, "off until the eval says otherwise"
+    from ytbrain import domains as D
+    info = manifest["domain_info"]
+    assert set(info) == set(D.load().names), "every Domain declared, items or not"
+    assert info["leadership"]["risk_tier"] == "low" and info["finance"]["risk_tier"] == "high"
+    assert info["leadership"]["description"] and info["startup"]["examples"]
+    assert info["finance"]["web_policy"] == "always_latest" and info["finance"]["freshness_days"] == 730
+    assert "freshness_days" not in info["startup"], "evergreen Domains carry no half-life"
+    assert manifest["domains"] == {"leadership": 2, "startup": 3}, "counts stay the Domains with items"
+    with contextlib.redirect_stdout(io.StringIO()):
+        on = build_pack(Source(_dom_rows()), HashEmbed(), Path(tempfile.mkdtemp()), rerank_model="none",
+                        say=lambda m: None, route={"margin": 0.07})
+    assert on["router"] == {"enabled": True, "margin": 0.07}
+
+
+def test_domain_scores_and_routed_search_agree_between_the_lance_index_and_the_pack():
+    try:
+        import lancedb  # noqa: F401
+    except ImportError:
+        return
+    from ytbrain.knowledge.store import KnowledgeStore
+    tmp = Path(tempfile.mkdtemp())
+    emb, rows = AxisEmbed(), _axis_rows()
+    lance = KnowledgeStore(path=tmp / "lance")
+    for r in rows:
+        lance.replace_document(r["doc_id"], [{**r, "vector": emb([r["indexable"]])[0], "embed_model": emb.name}], emb.dim)
+    _build(tmp / "pack", rows=rows, emb=emb)
+    pack = P.PackStore(tmp / "pack")
+    assert lance.domain_names() == ["finance", "leadership", "startup"] == sorted(pack.domain_counts())
+    for q in ("price", "feedback", "price feedback", "equity feedback feedback", "unrelated words misc"):
+        v = emb([q])[0]
+        a, b = lance.domain_scores(v, 3), pack.domain_scores(v, 3)
+        assert a.keys() == b.keys() and all(abs(a[d] - b[d]) < 2e-3 for d in a), (q, a, b)
+    ids = lambda res: [r["item_id"][4] for r in res]
+    from_lance = search(lance, emb, "price feedback", top_k=5, route={"margin": 0.3})
+    assert ids(from_lance).count("L") == 2 and ids(from_lance) == ids(search(pack, emb, "price feedback", top_k=5, route={"margin": 0.3}))
+
 
 if __name__ == "__main__":
     import inspect

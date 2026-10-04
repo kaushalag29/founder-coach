@@ -1,0 +1,35 @@
+# Gap questions: questions the Library should NOT be able to answer, one per line (`ytbrain eval gap`).
+# `question`                 a Gap for every pack
+# `question | domain`        a Gap only while the pack holds nothing in that Domain (domains.yaml); once you add
+#                            books there, the question retires itself.
+# Add your own (topics nobody in your Library covers) to data/eval/gap-questions.txt in the same format.
+How do I get a liquor license in Ohio for a pop-up bar?
+What is the best way to cook a medium-rare steak in a cast-iron pan?
+How do I tune a PID controller for a quadcopter?
+Which antibiotics are used to treat a urinary tract infection?
+How do I file a French income tax return as a US citizen?
+What stretching routine is best after running a marathon?
+How do I change a flat tire on a road bike?
+How do I grow tomatoes on a small balcony?
+What caused the fall of the Western Roman Empire?
+How do I write a sonnet in iambic pentameter?
+How should I treat a sprained ankle at home?
+What should I check when buying a used car?
+Which guitar chords belong to the key of D major?
+How do I train a puppy to stop barking at night?
+How does CRISPR gene editing work?
+How do I set up VLANs on a home network?
+What is the capital gains tax rate on cryptocurrency in Germany?
+How do I learn conversational Spanish in three months?
+How do I get a green card through marriage?
+What is a safe ibuprofen dose for a six-year-old?
+What discount rate should I use in a DCF of a regulated utility? | finance
+How does the 10-year treasury yield react when the Fed cuts rates? | finance
+How do I hedge currency risk on a euro receivable? | finance
+Should I rebalance a 60/40 portfolio quarterly or yearly? | finance
+How do I read a bank's net interest margin? | finance
+How do I shard a Postgres database across regions? | system-design
+When should I pick Kafka over SQS for an event pipeline? | system-design
+How do I design a rate limiter for a public API? | system-design
+What is the difference between eventual and strong consistency? | system-design
+How do I design a URL shortener that handles 10,000 writes per second? | system-design

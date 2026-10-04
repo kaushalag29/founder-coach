@@ -18,7 +18,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .. import pages
+from .. import pages, runstatus
 from ..manifest import StageState
 from .chapters import detect
 from .inspect import cached_parse
@@ -81,11 +81,19 @@ class BookAdapter:
     def sync(self, m, sources: list[dict], args, say=None) -> dict:
         from ..sources import book_files
         say = say or self.say
-        code, chapters = 0, 0
+        code, chapters, config_stop, bad = 0, 0, False, []
         for si, src in enumerate(sources, 1):
             files = book_files(src, self.root)
             say(f"[{si}/{len(sources)}] {src['id']}: {len(files)} PDF(s) in {src['path']} (private)")
             seen: set[str] = set()
+            for folder, n in self._stray(src, files).items():
+                say(f"  warning: {n} Book(s) in {folder}/ are not in a declared Domain, so they take "
+                    f"{', '.join(src.get('domains') or ['the default Domain'])}: declare `{folder}` in domains.yaml, "
+                    f"set `domains:` on the Book, or list it under `ignore_folders`")
+                if getattr(args, "strict_domains", False):
+                    code = code or 1
+                    config_stop = True
+                    runstatus.record("config", f"book folder {folder}/ is not a declared Domain")   # ops stops, no retry
             for fi, pdf in enumerate(files, 1):
                 try:
                     res = self.sync_book(m, src, pdf)
@@ -95,14 +103,29 @@ class BookAdapter:
                 seen |= res["keep"]
                 chapters += res["chapters"]
                 code = code or (1 if res["status"] != "ok" else 0)
+                if res["status"] != "ok":
+                    bad.append(pdf.name)
                 say(f"  [{fi}/{len(files)}] {res['line']}")
                 for w in res["notes"]:
                     say(f"        {w}")
             gone = m.tombstone_missing(src["id"], seen)
             if gone:
                 say(f"  {len(gone)} Chapter(s) of books no longer in {src['path']} (or refused) leave the index")
+        if bad and not config_stop:
+            # a refused or unparsable PDF is a problem with that file, not the network: `ops` must not
+            # retry the whole sync for it, and the other Books are already registered
+            runstatus.record("books", f"{len(bad)} PDF(s) refused or failed: {', '.join(bad[:5])}")
         say(f"sync: {chapters} Chapter(s) registered from books")
         return {"code": code, "videos": 0}
+
+    def _stray(self, src: dict, files) -> dict[str, int]:
+        from .. import domains as D
+        roots = [(Path(p).expanduser() if Path(p).expanduser().is_absolute() else self.root / p)
+                 for p in src.get("paths") or [src["path"]]]
+        try:
+            return D.stray_folders(D.load(), src, files, roots)
+        except D.DomainConfigError:
+            return {}                                    # a broken domains.yaml is reported where it is read
 
     def sync_book(self, m, src: dict, pdf: Path) -> dict:
         """Register one PDF's Chapters. Returns {status, line, notes, keep (doc ids to keep), chapters}."""

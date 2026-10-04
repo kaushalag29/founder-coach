@@ -344,8 +344,11 @@ def test_hook_prints_session_start_json_only_when_due_and_never_fails():
 
 # --- the MCP server -----------------------------------------------------------
 
-def _pack(tmp: Path) -> Path:
+def _pack(tmp: Path, rows=None, route=None, emb=None, calibration=None) -> Path:
     from test_pack import ROWS, HashEmbed, _build
+    if rows is not None:
+        _build(tmp / "pack", rows=rows, emb=emb or HashEmbed(), route=route, calibration=calibration)
+        return tmp / "pack"
     rows = [dict(r) for r in ROWS] + [
         dict(ROWS[0], item_id="adv:DDDDDDDDDD4:a01", doc_id="DDDDDDDDDD4", text="talk to users every week",
              indexable="From Talk D\ntalk to users every week", evidence="talk to your users every single week")]
@@ -354,17 +357,17 @@ def _pack(tmp: Path) -> Path:
 
 
 class _Models:
-    def __init__(self, sim_query_like=True):
+    def __init__(self, embed=None):
         from test_pack import HashEmbed
         self.state, self.error, self.rerank = "ready", None, False
-        self.embed, self.reranker = HashEmbed(), None
+        self.embed, self.reranker = embed or HashEmbed(), None
 
     @property
     def ready(self):
         return True
 
 
-def _with_client(fn, models=None, clock=None):
+def _with_client(fn, models=None, clock=None, rows=None, route=None, emb=None, calibration=None):
     try:
         import anyio
         from mcp import Client
@@ -373,7 +376,7 @@ def _with_client(fn, models=None, clock=None):
         return False
     from founder_coach.server import create_server
     tmp = Path(tempfile.mkdtemp())
-    srv = create_server(pack=_pack(tmp), home=tmp / "home", clock=clock, models=models, start_models=False)
+    srv = create_server(pack=_pack(tmp, rows, route, emb, calibration), home=tmp / "home", clock=clock, models=models, start_models=False)
 
     async def main():
         async with Client(srv) as c:
@@ -1066,6 +1069,303 @@ def test_backlog_a_store_replaced_under_a_running_session_is_reopened_before_the
     assert fresh.profile()["stage"]["value"] == "mvp" and fresh.profile()["company"]["value"] == "Acme"
     fresh.close()
     live.close()
+
+
+def test_search_takes_domains_names_a_domain_the_pack_lacks_and_status_lists_them():
+    from test_pack import _dom_rows
+
+    async def flow(c, tmp):
+        r = await c.call_tool("coach_search", {"query": "give feedback to my team", "domains": ["leadership"]})
+        sc = r.structured_content
+        assert not r.is_error and sc["hits"] and all("leadership" in h["domains"] for h in sc["hits"])
+        r = await c.call_tool("coach_search", {"query": "talk to users and give feedback", "top_k": 8,
+                                               "domains": ["startup", "leadership"]})
+        assert {d for h in r.structured_content["hits"] for d in h["domains"]} == {"startup", "leadership"}
+        # a Domain the pack has nothing in is a stated Gap, not an error and not a silent empty list
+        r = await c.call_tool("coach_search", {"query": "how is a seed round valued", "domains": ["finance"]})
+        sc = r.structured_content
+        assert not r.is_error and sc["hits"] == [] and sc["gap_suspected"]
+        assert "nothing in finance" in sc["note"] and "leadership" in sc["note"] and "startup" in sc["note"]
+        # one known and one unknown: the known one is searched, the unknown one is named
+        r = await c.call_tool("coach_search", {"query": "feedback", "domains": ["leadership", "finance"]})
+        sc = r.structured_content
+        assert sc["hits"] and "nothing in finance" in sc["note"]
+        st = (await c.call_tool("coach_corpus_status", {})).structured_content
+        assert st["pack"]["domains"] == {"leadership": 2, "startup": 3}
+    _with_client(flow, models=_Models(), rows=_dom_rows())
+    _with_client(flow, rows=_dom_rows())                                # keyword mode takes the same filter
+
+
+def test_domain_names_match_ignoring_case_and_padding_and_blank_names_mean_none_asked():
+    from founder_coach.server import _match_domains
+    have = {"startup", "leadership"}
+    assert _match_domains(["Leadership", " STARTUP ", "leadership"], have) == (["leadership", "startup"], [])
+    assert _match_domains(["", "  "], have) == ([], []), "all blank: no Domain asked for"
+    found, missing = _match_domains(["finance", "x" * 500, "a", "b", "c", "d", "e"], have)
+    assert found == [] and len(missing) == 5 and all(len(m) <= 40 for m in missing), "the note stays short"
+
+    async def flow(c, tmp):
+        for asked in (["Leadership"], [" leadership "]):
+            sc = (await c.call_tool("coach_search", {"query": "give feedback to my team", "domains": asked})).structured_content
+            assert sc["hits"] and sc["routing"] == "explicit" and sc["domains_searched"] == ["leadership"] \
+                and "nothing in" not in (sc["note"] or ""), sc
+        sc = (await c.call_tool("coach_search", {"query": "give feedback to my team", "domains": [""]})).structured_content
+        assert sc["hits"] and "nothing in" not in (sc["note"] or ""), "a blank name is no Domain, not a Gap"
+        sc = (await c.call_tool("coach_search", {"query": "feedback", "domains": ["x' OR 1=1 --"]})).structured_content
+        assert sc["hits"] == [] and sc["gap_suspected"] and "nothing in x' OR 1=1 --" in sc["note"]
+    from test_pack import _dom_rows
+    _with_client(flow, models=_Models(), rows=_dom_rows())
+    _with_client(flow, rows=_dom_rows())
+
+
+def test_a_pack_without_domain_counts_reports_everything_as_startup():
+    async def flow(c, tmp):
+        st = (await c.call_tool("coach_corpus_status", {})).structured_content
+        assert list(st["pack"]["domains"]) == ["startup"]
+    _with_client(flow)
+
+
+def _routing_flow(models_embed, rows, route, env=None):
+    """Run one `coach_search "price feedback"` against a pack built with `route`; returns the structured result."""
+    got = {}
+
+    async def flow(c, tmp):
+        r = await c.call_tool("coach_search", {"query": "price feedback", "top_k": 5})
+        got["sc"], got["text"] = r.structured_content, r.content[0].text
+        r = await c.call_tool("coach_search", {"query": "price feedback", "top_k": 5, "domains": ["leadership"]})
+        got["explicit"], got["explicit_text"] = r.structured_content, r.content[0].text
+        got["ctx"] = (await c.call_tool("coach_get_context", {})).structured_content
+        got["status"] = (await c.call_tool("coach_corpus_status", {})).structured_content
+    name = product.env_name("ROUTE")
+    old = os.environ.get(name)
+    if env is not None:
+        os.environ[name] = env
+    try:
+        from test_pack import AxisEmbed
+        _with_client(flow, models=_Models(AxisEmbed() if models_embed else None), rows=rows, route=route,
+                     emb=AxisEmbed() if models_embed else None)
+    finally:
+        if env is not None:
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+    return got
+
+
+def test_auto_routing_is_off_until_the_pack_or_the_setting_turns_it_on():
+    from test_pack import _axis_rows
+    rows = _axis_rows()
+    off = _routing_flow(True, rows, None)["sc"]
+    assert off["routing"] == "none" and off["domains_searched"] == [] and "Domains:" not in "".join(off["note"] or "")
+    on = _routing_flow(True, rows, {"margin": 0.3})
+    sc = on["sc"]
+    assert sc["routing"] == "auto" and sc["domains_searched"] == ["startup", "leadership"]
+    assert sum("leadership" in h["domains"] for h in sc["hits"]) >= 2, "the floor keeps the small Domain in the answer"
+    assert "Domains: favouring startup, leadership." in on["text"]
+    assert on["status"]["pack"]["auto_routing"] is True
+    ex = on["explicit"]
+    assert ex["routing"] == "explicit" and ex["domains_searched"] == ["leadership"]
+    assert ex["hits"] and all(h["domains"] == ["leadership"] for h in ex["hits"])
+    assert "Domains: limited to leadership." in on["explicit_text"]
+    # the setting beats the pack, both ways; the default margin is narrow, so only startup is routed
+    assert _routing_flow(True, rows, None, env="1")["sc"]["domains_searched"] == ["startup"]
+    assert _routing_flow(True, rows, {"margin": 0.3}, env="0")["sc"]["routing"] == "none"
+
+
+def test_the_context_tells_the_host_which_domains_the_pack_covers_only_when_there_are_several():
+    from test_pack import _axis_rows
+    many = _routing_flow(True, _axis_rows(), None)
+    lib = many["ctx"]["library"]
+    assert [d["name"] for d in lib["domains"]][:3] == ["startup", "leadership", "finance"] and "domains" in lib["use"]
+    assert {d["name"]: d["items"] for d in lib["domains"]} == {"finance": 2, "leadership": 3, "startup": 30, "system-design": 0,
+                                                              "investment": 0, "coding": 0}, "declared but empty is listed, with 0"
+    assert "Gap" in lib["use"]
+    lead = next(d for d in lib["domains"] if d["name"] == "leadership")
+    assert lead["description"] and lead["risk_tier"] == "low", "the host chooses Domains by what they are about"
+    from ytbrain import domains as D
+    info = many["status"]["pack"]["domain_info"]
+    assert set(info) == set(D.load().names), "every declared Domain, items or not"
+
+    async def single(c, tmp):
+        ctx = (await c.call_tool("coach_get_context", {})).structured_content
+        assert ctx["library"] is None, "a single-Domain pack changes nothing for the Founder"
+    _with_client(single)
+
+
+def _hit_row(iid, doc, sim, domains=("startup",), year=2024, source="yt", series=None):
+    return {"item_id": iid, "doc_id": doc, "similarity": sim, "domains": list(domains), "published_at": f"{year}-01-01",
+            "source_id": source, "series": series}
+
+
+def test_the_provisional_curve_keeps_the_old_gap_line_and_a_damaged_curve_is_no_curve():
+    from founder_coach import coverage as C
+    cal = C.Calibration()
+    assert cal.provisional and abs(cal.p(0.60) - 0.45) < 1e-9, "a medium-tier Domain still calls 0.60 the edge of a Gap"
+    ps = [cal.p(x / 100) for x in range(0, 101)]
+    assert ps == sorted(ps) and ps[0] == 0.0 and ps[-1] == 1.0 and cal.p(None) is None
+    moved = C.Calibration.from_meta({}, gap_similarity=0.70)
+    assert abs(moved.p(0.70) - 0.45) < 1e-9 and moved.provisional, "an operator's GAP_SIMILARITY still means what it says"
+    good = C.Calibration.from_meta({"calibration": {"signal": "cosine", "points": [[0.3, 0.0], [0.8, 1.0]], "n": 120}})
+    assert not good.provisional and abs(good.p(0.55) - 0.5) < 1e-9 and good.fitted_on == {"n": 120}
+    for bad in ({"points": [[0.8, 1.0], [0.3, 0.0]]}, {"points": [[0.3, 0.9], [0.8, 0.1]]}, {"points": "x"}, {"points": [[1]]}, {}):
+        assert C.Calibration.from_meta({"calibration": bad}).provisional, bad
+
+
+def test_a_curve_is_fitted_from_judged_hits_monotone_and_refused_when_there_is_too_little_to_fit():
+    import random
+    from founder_coach import coverage as C
+    rnd = random.Random(7)
+    pairs = []
+    for _ in range(600):
+        x = rnd.uniform(0.35, 0.9)
+        pairs.append((x, 1 if rnd.random() < max(0.0, min(1.0, (x - 0.45) / 0.4)) else 0))
+    cal = C.fit(pairs)
+    pts = cal.points
+    assert not cal.provisional and 2 <= len(pts) <= 16 and cal.fitted_on["n"] == 600
+    assert all(b[0] > a[0] and b[1] >= a[1] for a, b in zip(pts, pts[1:])), "monotone in both"
+    assert cal.p(0.40) < 0.25 < 0.6 < cal.p(0.85), "close hits are more likely relevant than far ones"
+    assert abs(C.Calibration.from_meta({"calibration": cal.as_meta()}).p(0.7) - cal.p(0.7)) < 1e-3, "survives the pack manifest"
+    for bad, why in (([(0.5, 1)] * 10, "at least"), ([(i / 100, 1) for i in range(60)], "same label"),
+                     ([(0.5, i % 2) for i in range(60)], "alike")):
+        try:
+            C.fit(bad)
+            raise AssertionError("should refuse")
+        except ValueError as e:
+            assert why in str(e), e
+
+
+def test_coverage_needs_closer_and_more_independent_evidence_as_the_risk_tier_rises():
+    from founder_coach import coverage as C
+    cal = C.Calibration()
+    two_docs = [_hit_row("a", "d1", 0.68), _hit_row("b", "d2", 0.68)]
+    one_doc = [_hit_row("a", "d1", 0.68), _hit_row("b", "d1", 0.68)]
+    run = lambda hits, tier, **kw: C.assess(hits, calibration=cal, tiers={"startup": tier}, **kw)
+    assert run(two_docs, "low").level == "strong" and run(one_doc, "low").level == "strong", "low: two good hits are enough"
+    assert run(two_docs, "medium").level == "strong"
+    assert run(one_doc, "medium").level == "partial", "medium: from two Documents"
+    assert run(two_docs, "high").level == "partial", "high: closer hits are needed ..."
+    near = [_hit_row("a", "d1", 0.78, source="s1"), _hit_row("b", "d2", 0.78, source="s1")]
+    assert run(near, "high").level == "partial", "... and from two independent Sources"
+    assert run([near[0], _hit_row("b", "d2", 0.78, source="s2")], "high").level == "strong"
+    one_book = [_hit_row("a", "c1", 0.78, source="books", series="Book A"), _hit_row("b", "c2", 0.78, source="books", series="Book A")]
+    two_books = [one_book[0], _hit_row("b", "c3", 0.78, source="books", series="Book B")]
+    assert run(one_book, "high").level == "partial", "two chapters of one Book are one voice"
+    assert run(two_books, "high").level == "strong", "two Books are independent even though they share the Source id"
+    far = [_hit_row("a", "d1", 0.40), _hit_row("b", "d2", 0.45)]
+    assert run(far, "low").level == "none" and run([], "low").level == "none"
+    assert run(far, "low", top_similarity=0.66).level == "partial", "the search's own closest item counts for none vs partial"
+    assert run(two_docs, "medium").basis == "provisional"
+    assert C.assess(two_docs, calibration=C.fit([(0.3 + i / 200, int(i > 60)) for i in range(120)]), tiers={}).basis == "calibrated"
+    kw = C.assess([{"item_id": "a", "doc_id": "d", "domains": ["startup"]}], calibration=cal, semantic=False)
+    assert (kw.level, kw.basis) == ("partial", "keyword"), "without embeddings: matches exist, closeness unknown"
+    assert C.assess([], calibration=cal, semantic=False).level == "none"
+    assert C.assess([_hit_row("a", "d", 0.9, domains=("zzz",))], calibration=cal, tiers={}).level == "partial", \
+        "a Domain nobody described is treated as medium: one Document is not strong"
+
+
+def test_a_question_that_needs_several_domains_is_judged_on_each_and_is_strong_only_if_all_are():
+    from founder_coach import coverage as C
+    cal = C.Calibration()
+    tiers = {"startup": "medium", "leadership": "low", "finance": "high"}
+    both = [_hit_row("a", "d1", 0.70), _hit_row("b", "d2", 0.70), _hit_row("c", "d3", 0.66, domains=("leadership",)),
+            _hit_row("d", "d4", 0.66, domains=("leadership",))]
+    cov = C.assess(both, calibration=cal, tiers=tiers, focus=("startup", "leadership"))
+    assert cov.level == "strong" and cov.by_domain == {"startup": "strong", "leadership": "strong"} and cov.weak == []
+    thin = [h for h in both if h["item_id"] != "d"]
+    cov = C.assess(thin, calibration=cal, tiers=tiers, focus=("startup", "leadership"))
+    assert cov.by_domain["leadership"] == "partial" and cov.level == "partial" and cov.weak == ["leadership"]
+    cov = C.assess(both[:2], calibration=cal, tiers=tiers, focus=("startup", "leadership"))
+    assert cov.by_domain == {"startup": "strong", "leadership": "none"} and cov.level == "partial" and cov.weak == ["leadership"], \
+        "one Domain strong and one empty: answer what is covered, name the rest"
+    cov = C.assess([_hit_row("a", "d1", 0.3)], calibration=cal, tiers=tiers, focus=("startup", "leadership"))
+    assert cov.level == "none", "nothing anywhere is a Gap for the whole question"
+    # a hit in two Domains counts for both
+    cov = C.assess([_hit_row("a", "d1", 0.7, domains=("startup", "leadership")), _hit_row("b", "d2", 0.7, domains=("startup", "leadership"))],
+                   calibration=cal, tiers=tiers, focus=("startup", "leadership"))
+    assert cov.level == "strong"
+    # a Domain the Library declares but holds nothing in is `none`, and the answer is at best partial
+    one = C.assess(both[:2], calibration=cal, tiers=tiers, focus=("startup",))
+    assert one.by_domain == {} and one.level == "strong"
+    cov = C.with_empty(one, ["finance"], ("startup",))
+    assert cov.by_domain == {"startup": "strong", "finance": "none"} and cov.level == "partial" and cov.weak == ["finance"]
+    only = C.with_empty(C.assess([], calibration=cal, focus=()), ["finance"], ())
+    assert only.level == "none" and only.by_domain == {"finance": "none"}
+    assert C.with_empty(one, [], ("startup",)) is one
+
+
+def test_stale_domains_are_named_when_their_newest_relevant_result_is_older_than_the_half_life():
+    import datetime as dt
+    from founder_coach import coverage as C
+    cal = C.Calibration()
+    old = [_hit_row("a", "d1", 0.8, domains=("finance",), year=2022), _hit_row("b", "d2", 0.8, domains=("finance",), year=2021)]
+    kw = dict(calibration=cal, tiers={"finance": "high"}, freshness={"finance": 730}, today=dt.date(2026, 10, 3))
+    cov = C.assess(old, focus=("finance",), **kw)
+    assert cov.stale == ["finance"] and cov.newest_year == 2022
+    assert C.assess(old + [_hit_row("c", "d3", 0.8, domains=("finance",), year=2026)], focus=("finance",), **kw).stale == []
+    assert C.assess(old, focus=("finance",), **{**kw, "freshness": {"finance": None}}).stale == [], "evergreen never goes stale"
+    assert C.assess([_hit_row("a", "d", 0.3, domains=("finance",), year=2010)], focus=("finance",), **kw).stale == [], \
+        "only results that are relevant at all can be stale"
+
+
+def _lead_rows():
+    from test_pack import _row
+    mk = lambda iid, doc, text, dom, **kw: {**_row(iid, "advice", doc, text, **kw), "domains": dom}
+    return [mk("adv:LLLLLLLLLL1:a01", "LLLLLLLLLL1", "give feedback early and in private to your team", ["leadership"]),
+            mk("adv:LLLLLLLLLL2:a01", "LLLLLLLLLL2", "give feedback early and in private to each team member", ["leadership"]),
+            mk("adv:SSSSSSSSSS3:a01", "SSSSSSSSSS3", "talk to users every week before you build", ["startup"]),
+            mk("adv:SSSSSSSSSS4:a01", "SSSSSSSSSS4", "talk to users every week and write down what they say", ["startup"])]
+
+
+def test_search_reports_coverage_per_hit_and_per_domain_and_names_a_declared_domain_with_no_items_as_a_gap():
+    async def flow(c, tmp):
+        ask = lambda **a: c.call_tool("coach_search", {"top_k": 6, **a})
+        sc = (await ask(query="give feedback early and in private to your team", domains=["leadership"])).structured_content
+        assert sc["coverage"] == "strong" and sc["coverage_basis"] == "provisional" and not sc["gap_suspected"], sc
+        assert sc["coverage_by_domain"] is None and sc["hits"][0]["p_relevant"] > 0.9 and sc["domain_scores"] is None
+        text = (await ask(query="give feedback early and in private to your team", domains=["leadership"])).content[0].text
+        assert text.startswith("Coverage: strong [provisional thresholds].")
+        # two Domains the Library has: each judged, the answer as strong as both
+        sc = (await ask(query="give feedback early and in private and talk to users every week",
+                        domains=["leadership", "startup"])).structured_content
+        assert set(sc["coverage_by_domain"]) == {"leadership", "startup"} and sc["coverage"] in ("strong", "partial")
+        # a Domain that is declared but has no items: a Gap, stated, with the covered part still answered
+        sc = (await ask(query="how should we value this company with a DCF", domains=["finance"])).structured_content
+        assert sc["hits"] == [] and sc["coverage"] == "none" and sc["gap_suspected"] and sc["coverage_by_domain"] == {"finance": "none"}
+        assert "nothing in finance yet" in sc["note"] and "state that Gap" in sc["note"]
+        sc = (await ask(query="give feedback early and in private to your team", domains=["leadership", "finance"])).structured_content
+        assert sc["hits"] and sc["coverage"] == "partial" and sc["coverage_by_domain"]["finance"] == "none"
+        assert sc["coverage_by_domain"]["leadership"] == "strong" and "nothing in finance yet" in sc["note"]
+        # a name no Domain has: said differently, and still not an error
+        sc = (await ask(query="feedback", domains=["cooking"])).structured_content
+        assert sc["hits"] == [] and "nothing in cooking (not a Domain of this pack)" in sc["note"] and sc["coverage"] == "none"
+        # nothing close: a Gap, and the hits shown are weak
+        sc = (await ask(query="volcano saxophone telescope", top_k=3)).structured_content
+        assert sc["coverage"] == "none" and sc["gap_suspected"]
+        st = (await c.call_tool("coach_corpus_status", {})).structured_content
+        assert st["gap_threshold_provisional"] and st["calibration"]["basis"] == "provisional"
+    _with_client(flow, models=_Models(), rows=_lead_rows())
+
+
+def test_without_embeddings_coverage_says_matches_exist_but_not_how_close_and_a_fitted_curve_is_reported():
+    async def keyword(c, tmp):
+        sc = (await c.call_tool("coach_search", {"query": "give feedback to your team"})).structured_content
+        assert sc["mode"] == "keyword" and sc["coverage"] == "partial" and sc["coverage_basis"] == "keyword" and not sc["gap_suspected"]
+        assert all(h["p_relevant"] is None for h in sc["hits"])
+        sc = (await c.call_tool("coach_search", {"query": "zebra quantum harpsichord"})).structured_content
+        assert sc["hits"] == [] and sc["coverage"] == "none" and sc["gap_suspected"]
+    _with_client(keyword, rows=_lead_rows())
+
+    import test_pack as TP
+
+    async def fitted(c, tmp):
+        sc = (await c.call_tool("coach_search", {"query": "give feedback early and in private to your team"})).structured_content
+        assert sc["coverage_basis"] == "calibrated"
+        st = (await c.call_tool("coach_corpus_status", {})).structured_content
+        assert not st["gap_threshold_provisional"] and st["calibration"] == {"basis": "calibrated", "points": 2, "n": 99, "base_rate": 0.4,
+                                                                                  "embed_model": TP.HashEmbed.name}
+    _with_client(fitted, models=_Models(), rows=_lead_rows(),
+                 calibration={"embed_model": TP.HashEmbed.name, "points": [[0.2, 0.0], [0.9, 1.0]], "n": 99, "base_rate": 0.4})
 
 
 if __name__ == "__main__":

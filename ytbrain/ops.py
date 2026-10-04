@@ -51,7 +51,10 @@ FIX = {"budget": "the spend cap is used up: re-run with a higher --max-cost",
        "endpoint": "the LLM endpoint refused (key, credits, model or quota in .env): fix it, then re-run",
        "network": "the network kept failing: check the connection, then re-run",
        "plan_limit": "your Claude plan's usage limit: the coach eval resumes on the next run after the reset",
+       "auth": "the Claude host is not signed in (its login expired): run `claude`, type /login, then re-run the same `ytbrain ops` command, which resumes at the coach eval",
        "interrupted": "interrupted: re-run to continue",
+       "books": "a PDF was refused or failed to parse (see the sync output): fix or `skip: true` it, then re-run",
+       "config": "a configuration problem (see the warning above, e.g. a book folder that is not a declared Domain): fix it, then re-run",
        "gate": "the regression gate: read the per-kind lines (`ytbrain eval rescore --config full --compare full`)",
        "unknown": "see the output above"}
 
@@ -218,7 +221,7 @@ class Ops:
     def ingest_steps(self) -> list[Step]:
         steps = []
         if self.opts.sync:
-            steps.append(Step("ingest:sync", ["sync"]))
+            steps.append(Step("ingest:sync", ["sync", "--strict-domains"]))
         steps += [Step("ingest:clean", ["clean"]),
                   Step("ingest:extract", ["extract", *(["--limit", str(self.opts.max_extract)]
                                                          if self.opts.max_extract else [])],
@@ -336,12 +339,28 @@ class Ops:
                       Step("plugin:assemble-private", ["scripts/assemble_plugin.py", "--pack", str(DATA / "pack-private"),
                                                        "--out", "dist/plugin-private", "--check", "--zip"],
                            script=True)]
+        shipped = DATA / ("pack-private" if private else "pack")
+        steps.append(Step("plugin:coverage", run=lambda: self.coverage(shipped),
+                          note="eval gap on the shipped pack: report only, never stops the run"))
         steps.append(Step("plugin:validate", run=lambda: self.validate(target), note=f"claude plugin validate {target}"))
         steps.append(Step("plugin:record", run=lambda: self.record_plugin(target), note="remember this build"))
         if self.opts.coach:
             steps.append(Step("plugin:coach", run=lambda: self.coach(target),
                               note=f"eval coach --plugin {target}, once per build"))
         return steps
+
+    def coverage(self, pack: Path) -> int:
+        """`eval gap` on the pack that ships: how often the coach would wrongly answer a Gap question or refuse
+        an answerable one. A report, not a gate: with few judged questions the verdict is inconclusive, and a
+        Library without a second Domain has no Gap questions that matter. Read the numbers; tune with
+        `ytbrain eval calibrate` / `eval gap --tune`, which change behaviour and so stay a human's call."""
+        code = self.child(Step("coverage", ["eval", "gap", "--pack", str(pack)]))
+        if code:
+            self.say(f"ops: eval gap exit {code} (report only): "
+                     f"{'not enough Gap or answerable questions yet' if code == 1 else 'targets missed: see the table above'}; "
+                     "the plugin build goes on")
+        self.last_reason = ""
+        return 0
 
     def validate(self, target: str) -> int:
         if not shutil.which("claude") or self.call is not None:
@@ -386,9 +405,12 @@ class Ops:
 
     def coach(self, target: str) -> int:
         build = _build_id(CODE / target)
-        if self.state.get("coach", {}).get("build") == build and not self.opts.force:
-            self.say(f"ops: coach eval already ran on build {build}")
+        ran = self.state.get("coach", {})
+        if ran.get("build") == build and not ran.get("code") and not self.opts.force:
+            self.say(f"ops: coach eval already passed on build {build}")
             return 0
+        # (a build whose coach eval failed or stopped is run again: finished cases are cached, so only errored
+        # ones cost anything, and a real FAIL is reported again instead of being forgotten)
         if self.call is None and not shutil.which("claude"):
             self.say("ops: coach eval skipped: no `claude` on PATH; it runs on the next `ytbrain ops` that has it")
             self.state["coach"] = {"build": None, "pending": "no claude", "at": _now()}
@@ -398,6 +420,12 @@ class Ops:
             self.say(f"ops: {FIX['plan_limit']}; the plugin is built")
             self.state["coach"] = {"build": None, "pending": "plan limit", "at": _now()}
             return 0
+        if code and self.last_reason == "auth":
+            self.state["coach"] = {"build": None, "pending": "login needed", "at": _now()}
+            return code                      # ops stops with the fix; the next run does only the coach eval
+        if code == 2:                        # stopped or incomplete (spend cap, errored cases): not a verdict on the build
+            self.state["coach"] = {"build": None, "pending": "incomplete", "at": _now()}
+            return code
         self.state["coach"] = {"build": build, "code": code, "at": _now()}
         return code
 
@@ -435,8 +463,9 @@ class Ops:
         last = self.state.get("plugin") or {}
         if self.opts.force or last.get("fp") != self.plugin_fp(self.index_fp()):
             return True, "the index or the plugin changed"
-        if self.opts.coach and self.state.get("coach", {}).get("build") != last.get("build"):
-            return True, COACH_ONLY
+        coach = self.state.get("coach", {})
+        if self.opts.coach and (coach.get("build") != last.get("build") or coach.get("code")):
+            return True, COACH_ONLY             # not run yet, stopped, or failed: say so again until it passes
         return False, "nothing changed since the last build"
 
     # ------------------------------------------------------------------ run
@@ -478,6 +507,10 @@ class Ops:
                 code = step.run() if step.run else self.child(step)
                 if code and step.name == "ingest:sync" and self.last_reason == "network":
                     self.say("ops: sync kept failing on the network: continuing with what is already fetched")
+                    code = 0
+                if code and step.name == "ingest:sync" and self.last_reason == "books":
+                    self.say(f"ops: {self.last_detail}: carrying on with the Books that did register "
+                             "(see the sync output; `skip: true` in sources.yaml silences a PDF you don't want)")
                     code = 0
                 if code:
                     self.save()

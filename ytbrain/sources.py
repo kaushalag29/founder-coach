@@ -27,7 +27,7 @@ TYPES = ("youtube_playlist", "website", "pdf_books")
 RENDER_MODES = ("auto", "always", "never")
 DOC_TYPE = {"youtube_playlist": "youtube", "website": "web", "pdf_books": "book"}     # manifest documents.doc_type
 BOOK_FIELDS = {"title", "subtitle", "author", "authors", "year", "isbn", "publisher", "url", "chapters",
-               "chapters_only", "include", "exclude", "skip"}
+               "chapters_only", "include", "exclude", "skip", "domains"}
 
 
 class SourceConfigError(ValueError):
@@ -56,7 +56,27 @@ def website_id(url: str) -> str:
 
 
 def normalize(entry: dict, defaults: dict | None = None) -> dict:
-    """One sources.yaml entry as a complete dict with `type`, `id`, `name` and `enabled`."""
+    """One sources.yaml entry as a complete dict with `type`, `id`, `name` and `enabled`; `domains`
+    (the Domains its Documents belong to, ytbrain/domains.py) is a list of names when given."""
+    src = _normalize(entry, defaults)
+    if "domains" in src:
+        names = src["domains"]
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n.strip() for n in names):
+            raise SourceConfigError(f"source {src['id']}: domains must be a list of Domain names")
+        src["domains"] = list(dict.fromkeys(n.strip() for n in names))
+    for fname, fields in (src.get("books") or {}).items():
+        if "domains" in (fields or {}):
+            names = fields["domains"]
+            names = [names] if isinstance(names, str) else names
+            if not isinstance(names, list) or not names or not all(isinstance(n, str) and n.strip() for n in names):
+                raise SourceConfigError(f"source {src['id']}: books[{fname!r}].domains must be a list of Domain names")
+            fields["domains"] = list(dict.fromkeys(n.strip() for n in names))
+    return src
+
+
+def _normalize(entry: dict, defaults: dict | None = None) -> dict:
     if not isinstance(entry, dict):
         raise SourceConfigError(f"each source must be a mapping, got {entry!r}")
     typ = entry.get("type")

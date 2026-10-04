@@ -649,11 +649,13 @@ def test_ops_runs_only_what_changed_resumes_and_stops_at_a_failed_gate():
 
     code, out = run()
     assert code == 0, out
-    assert calls[:4] == ["sync", "clean", "extract", "verify"] and "index" in calls
+    assert calls[:4] == ["sync --strict-domains", "clean", "extract", "verify"] and "index" in calls
     assert "eval run --config full" in calls and "eval judge --config full --max-cost" in calls
     assert "eval rescore --config full --save-baseline" in calls, "the first eval becomes the baseline"
     assert any(c.startswith("script scripts/assemble_plugin.py") for c in calls)
     assert "eval coach --plugin dist/plugin --max-cost" in calls, "a new build gets its coach eval"
+    assert any(c.startswith("eval gap --pack") for c in calls), "the shipped pack's coverage is reported"
+    assert calls.index(next(c for c in calls if c.startswith("eval gap"))) < calls.index("eval coach --plugin dist/plugin --max-cost")
 
     code, out = run()                                    # nothing changed
     assert code == 0 and "eval skipped: nothing changed" in out and "plugin skipped: nothing changed" in out
@@ -677,6 +679,12 @@ def test_ops_runs_only_what_changed_resumes_and_stops_at_a_failed_gate():
     fail.clear()
     code, out = run(plan="plugin")
     assert "plugin skipped: the current index has no passing eval" in out
+    fail["eval gap"] = 3                                 # coverage targets missed: reported, never a stop
+    ops.STATE.unlink()
+    run(plan="eval", force=True)
+    code, out = run(plan="plugin", force=True)
+    assert code == 0 and "eval gap exit 3 (report only)" in out and "eval coach --plugin dist/plugin --max-cost" in calls
+    fail.clear()
 
 
 def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
@@ -717,10 +725,20 @@ def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
             code = o.run()
         return code, out.getvalue()
     try:
+        # a refused PDF is not the network: no retry, and the run carries on with the Books that registered
+        script["sync"] = [("books", 1)]
+        code, out = run(plan="ingest")
+        assert code == 0 and calls.count("sync --strict-domains") == 1 and slept == [], out
+        assert "carrying on with the Books that did register" in out and "continuing with what is already" not in out
+        # a configuration problem (a book folder that is not a Domain) stops at once, with no retry
+        script["sync"] = [("config", 1)]
+        code, out = run(plan="ingest", restart=True)
+        assert code == 1 and calls == ["sync --strict-domains"] and slept == [], out
+        assert "configuration problem" in out
         # the network: sync retried twice, then the run goes on with what is fetched
         script["sync"] = [("network", 2)] * 3
-        code, out = run(plan="ingest")
-        assert code == 0 and calls.count("sync") == 3 and slept == [60, 300], out
+        code, out = run(plan="ingest", restart=True)
+        assert code == 0 and calls.count("sync --strict-domains") == 3 and slept == [60, 300], out
         assert "continuing with what is already fetched" in out
         # a refused endpoint stops at once, says what to fix, and resumes there
         script["extract"] = [("endpoint", 1)]
@@ -735,9 +753,26 @@ def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
         code, out = run(plan="all", sync=False)
         assert code == 0 and versions["v"] == "0.2.0", out
         assert "coach eval pending" in ops.LAST_RUN.read_text(), "the plugin is built; the coach waits for the reset"
+        # the Claude login expired on the resume: ops stops with the fix, and the next run does only the coach eval
+        script["eval coach"] = [("auth", 2)]
+        code, out = run(plan="plugin")
+        assert code == 2 and "/login" in out and "Resume: ytbrain ops plugin" in ops.LAST_RUN.read_text(), out
+        assert _json.loads(ops.STATE.read_text())["coach"]["pending"] == "login needed"
         code, out = run(plan="plugin")
         assert "eval coach --plugin" in " ".join(calls) and not any(c.startswith("pack") for c in calls), \
             "only the pending coach eval runs again"
+        # a failed coach gate is reported again by the next run (not forgotten as "already ran"), until it passes
+        coach_run = lambda: sum(c.startswith("eval coach --plugin") for c in calls)         # noqa: E731
+        st = _json.loads(ops.STATE.read_text())
+        st["coach"] = {"build": None}                    # as for a freshly built plugin
+        ops.STATE.write_text(_json.dumps(st))
+        script["eval coach"] = [("unknown", 1)]
+        code, out = run(plan="plugin")
+        assert code == 1 and coach_run() == 1, out
+        code, out = run(plan="plugin")
+        assert code == 0 and coach_run() == 1 and not any(c.startswith("pack") for c in calls), out
+        code, out = run(plan="plugin")
+        assert coach_run() == 0 and "nothing changed" in out, out
         # a hand-set version is kept; no answer means patch
         versions["v"] = "0.5.0"
         code, out = run(plan="plugin", force=True)
@@ -1159,6 +1194,26 @@ def test_coach_eval_parses_the_hosts_stream_with_tool_results():
     assert C.parse_stream(_stream({"type": "result", "subtype": "error_max_turns", "result": ""})).error
 
 
+def test_coach_eval_stream_parser_survives_events_whose_message_is_plain_text():
+    """A host notice (retry, overload) can carry `message` as a string: it must not fail the case."""
+    from ytbrain.eval import coach as C
+    t = C.parse_stream(_stream(
+        {"type": "system", "subtype": "api_retry", "message": "Overloaded, retrying in 2s"},
+        {"type": "assistant", "message": "not a dict either"},
+        {"type": "user", "message": ["nor", "a", "list", "of", "blocks"]},
+        {"type": "result", "subtype": "success", "result": "Answer.", "session_id": "s-2"}))
+    assert t.error is None and t.text == "Answer." and t.session_id == "s-2"
+
+
+def test_an_unexpected_case_error_says_where_it_was_raised():
+    from ytbrain.eval import coach as C
+    try:
+        {}["x"].get("y")
+    except KeyError as e:
+        assert "test_eval.py:" in C._where(e)
+    assert C._where(ValueError("no traceback")) == ""
+
+
 def test_coach_eval_host_runs_are_cheap_isolated_and_counted():
     """Pro-plan limits: each case runs the chosen model (default Haiku), capped in turns, in a
     scratch folder outside the repo (so the repo's CLAUDE.md/AGENTS.md never ride along, and
@@ -1433,6 +1488,92 @@ def test_coach_eval_stops_at_the_hosts_usage_limit_and_keeps_finished_cases():
     finally:
         C.load_cases = real
 
+
+def test_coach_gate_with_only_errored_cases_missing_is_incomplete_not_failed():
+    from ytbrain.eval import coach as C
+    # 19 of 20 cases finished at 92 % (gate 90 %), one errored: not a FAIL, an incomplete run to retry
+    done = [{"id": f"c{i}", "claims": 5, "supported": 5 if i else 3} for i in range(19)]
+    s = C.score("g2", done + [{"id": "c19", "error": "error_max_turns"}])
+    assert s["errors"] == 1 and s["rate"] >= s["threshold"] and not s["passed"]
+    # a rate under the gate is a FAIL whatever the errors
+    bad = [{"id": f"c{i}", "claims": 5, "supported": 2} for i in range(19)]
+    s2 = C.score("g2", bad + [{"id": "c19", "error": "x"}])
+    assert s2["rate"] < s2["threshold"] and not s2["passed"]
+
+
+def test_coach_eval_with_one_errored_case_is_an_incomplete_run_and_a_rerun_does_only_that_case():
+    import contextlib
+    import io
+    from ytbrain import runstatus
+    from ytbrain.eval import coach as C
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.eval.llm import Answer
+    tmp = Path(tempfile.mkdtemp())
+    C.OUT = tmp / "coach"
+    plugin = tmp / "plugin"
+    plugin.mkdir()
+    (plugin / "BUILD_ID").write_text("b3\n")
+    calls, broken = [], {"s3": True}
+
+    def run(prompt, env=None, resume=None):
+        calls.append(prompt)
+        if prompt == "plan 3" and broken["s3"]:
+            return C.Turn(error="error_max_turns")
+        return C.Turn(text="Answer (Seibel, 2019).", session_id="s",
+                      tools=[{"name": C.SEARCH, "input": {"query": prompt}, "result": "1. [advice] X"}])
+    env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
+                           "ask": staticmethod(lambda *a, **k: Answer(C.Verdict(passed=True, reason="r"), cost=0))})()
+    cases = {"g4": [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(10)]}
+    real = C.load_cases
+    C.load_cases = lambda g, plugin=None: cases[g]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            summ, code = C.run_gates(env, ["g4"], plugin, runner=run)
+        assert code == 2 and "incomplete" in out.getvalue() and "Re-run" in out.getvalue(), (code, out.getvalue())
+        assert len(calls) == 10
+        broken["s3"] = False
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            summ, code = C.run_gates(env, ["g4"], plugin, runner=run)
+        assert code == 0 and calls == ["plan 3"], (code, calls)        # only the errored case runs again
+    finally:
+        C.load_cases = real
+
+
+def test_coach_eval_stops_at_the_first_case_when_the_host_is_not_signed_in():
+    import contextlib
+    import io
+    from ytbrain import runstatus
+    from ytbrain.eval import coach as C
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.eval.llm import Answer
+    for text in ("success: Failed to authenticate: OAuth session expired and could not be refreshed",
+                 "authentication_error: invalid x-api-key", "Please run /login"):
+        assert C.HOST_AUTH.search(text), text
+    assert not C.HOST_AUTH.search("claude exited 1: MCP server failed to start")
+    assert not C.HOST_AUTH.search("You've hit your session limit · resets 1pm")
+    tmp = Path(tempfile.mkdtemp())
+    C.OUT = tmp / "coach"
+    plugin = tmp / "plugin"
+    plugin.mkdir()
+    (plugin / "BUILD_ID").write_text("b2\n")
+    calls = []
+    run = lambda prompt, env=None, resume=None: (calls.append(prompt), C.Turn(error="success: Failed to authenticate: OAuth session expired"))[1]   # noqa: E731
+    env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
+                           "ask": staticmethod(lambda *a, **k: Answer(C.Verdict(passed=True, reason="r"), cost=0))})()
+    cases = {"g4": [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(5)]}
+    real_cases, real_status = C.load_cases, runstatus.STATUS
+    C.load_cases, runstatus.STATUS = (lambda g, plugin=None: cases[g]), tmp / "stop.json"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            summ, code = C.run_gates(env, ["g4"], plugin, runner=run)
+        assert code == 2 and len(calls) == 1, (code, calls)                    # the first case, not all five
+        assert "/login" in out.getvalue() and "not signed in" in out.getvalue()
+        assert (runstatus.read() or {}).get("reason") == "auth"
+        assert not (C.OUT / f"g4-b2-{C.HARNESS['g4']}.jsonl").exists(), "nothing was recorded as a result"
+    finally:
+        C.load_cases, runstatus.STATUS = real_cases, real_status
+
 def test_coach_eval_stops_when_the_plugin_is_rebuilt_mid_run():
     """Reassembling dist/plugin while `eval coach` runs would record the new build's answers under
     the old build's id; the run stops instead, keeping what finished."""
@@ -1532,6 +1673,300 @@ def test_coach_evidence_puts_the_cited_hits_first_and_a_split_goes_to_the_third_
     env = type("E", (), {"judges": ["j1", "j2", "j3"], "ask": staticmethod(ask)})()
     res = C.grade_support(env, t, lambda m, c: None)
     assert asked == ["j1", "j2", "j3"] and res["supported"] == 2 and res["detail"][1]["j3"] is True
+
+# --- the routing eval (M5d) ---------------------------------------------------------------------
+def _route_fixture():
+    from ytbrain.eval import route as R
+    docs = {"AAAAAAAAAA1": frozenset({"startup"}), "BBBBBBBBBB2": frozenset({"startup"}),
+            "LLLLLLLLLL3": frozenset({"leadership"}), "MMMMMMMMMM4": frozenset({"leadership", "startup"})}
+    q = lambda i, doc, **kw: {"_id": f"q{i}", "text": f"Question {i}?", "answerable": True,
+                              "creation": {"seed_moment": f"{doc}_00120"}, **kw}
+    queries = [q(1, "AAAAAAAAAA1"), q(2, "BBBBBBBBBB2"), q(3, "LLLLLLLLLL3"), q(4, "MMMMMMMMMM4"),
+               q(5, "UNKNOWNDOC5"), q(6, "AAAAAAAAAA1", answerable=False), {"_id": "q7", "text": "no seed", "answerable": True}]
+    return R, docs, queries
+
+
+def test_routing_questions_expect_the_domains_of_their_seed_document():
+    R, docs, queries = _route_fixture()
+    items = R.questions(queries, docs)
+    assert [(i.qid, set(i.expected)) for i in items] == [
+        ("q1", {"startup"}), ("q2", {"startup"}), ("q3", {"leadership"}), ("q4", {"leadership", "startup"})], \
+        "unanswerable, seedless and unknown-Document questions are left out"
+
+    class Store:
+        def rows(self, columns=None):
+            return [{"doc_id": "D1", "domains": ["startup"]}, {"doc_id": "D1", "domains": ["startup"]},
+                    {"doc_id": "D2", "domains": ["leadership", "startup"]}, {"doc_id": "D3", "domains": None}]
+    assert R.doc_domains(Store()) == {"D1": frozenset({"startup"}), "D2": frozenset({"leadership", "startup"}), "D3": frozenset()}
+
+
+def test_composed_prompts_join_questions_from_different_domains_and_are_deterministic():
+    R, docs, queries = _route_fixture()
+    items = R.questions(queries, docs) + [R.Item(f"s{i}", f"Startup question {i}?", frozenset({"startup"})) for i in range(6)] \
+        + [R.Item(f"l{i}", f"Leadership question {i}?", frozenset({"leadership"})) for i in range(6)]
+    a, b = R.compose(items, 5), R.compose(items, 5)
+    assert a == b and 0 < len(a) <= 5
+    for c in a:
+        left, right = c.qid.split("+")
+        by = {i.qid: i for i in items}
+        assert not (by[left].expected & by[right].expected) and c.expected == by[left].expected | by[right].expected
+        assert by[left].text.strip() in c.text and " Also, " in c.text
+    used = [q for c in a for q in c.qid.split("+")]
+    assert len(used) == len(set(used)), "a question is used once"
+    assert R.compose([R.Item("x", "x?", frozenset({"startup"})), R.Item("y", "y?", frozenset({"startup"}))], 3) == [], \
+        "no pair from different Domains: nothing composed"
+
+
+def test_routing_scores_sweep_the_margin_over_scores_computed_once():
+    R, _, _ = _route_fixture()
+    items = [R.Item("a", "a", frozenset({"startup"})), R.Item("b", "b", frozenset({"leadership"})),
+             R.Item("c+d", "c d", frozenset({"startup", "leadership"}))]
+    scores = [{"startup": 0.8, "leadership": 0.5, "finance": 0.1},
+              {"startup": 0.6, "leadership": 0.62, "finance": 0.1},      # leadership best, startup close
+              {"startup": 0.7, "leadership": 0.62, "finance": 0.1}]
+    tight = R.score(items, scores, margin=0.0, max_domains=3)       # only the best Domain is routed
+    assert tight == {"n": 3, "top1": 1.0, "exact": 2 / 3, "recall": 2 / 3, "precision": 1.0}, tight
+    wide = R.score(items, scores, margin=0.1, max_domains=3)        # a Domain within 0.1 of the best comes too
+    assert wide["recall"] == 1.0 and wide["exact"] == 2 / 3 and abs(wide["precision"] - (1 + 0.5 + 1) / 3) < 1e-9, wide
+    huge = R.score(items, scores, margin=1.0, max_domains=3)
+    assert huge["recall"] == 1.0 and abs(huge["precision"] - (1 / 3 + 1 / 3 + 2 / 3) / 3) < 1e-9, huge
+    assert R.score([], [], 0.05, 3)["n"] == 0
+    rep = R.report(items[:2], scores[:2], items[2:], scores[2:], margins=(0.0, 1.0))
+    assert rep["questions_by_domain"] == {"leadership": 1, "startup": 1} and [r["margin"] for r in rep["sweep"]] == [0.0, 1.0]
+    text = R.render(R.report(items[:2], scores[:2], items[2:], scores[2:]))
+    assert "margin" in text and "composed" in text and "<- default" in text
+
+
+def test_the_route_configs_exist_and_pass_route_to_search():
+    from ytbrain.eval import run as ER
+    assert ER.CONFIGS["full-route"]["route"] and ER.CONFIGS["pack-route"]["backend"] == "pack"
+    assert ER.base_config("pack-route") == "pack-route" and ER.gate_for("pack-route") == ER.PACK_GATE
+    assert ER.gate_for("full-route") == ER.GATE
+    seen = []
+    real = ER.search
+    ER.search = lambda *a, **k: seen.append(k.get("route")) or []
+    try:
+        for cfg in ("full", "full-route"):
+            ER.run_config(object(), lambda t: [[0.0]], None, [{"_id": "q1", "text": "t"}], cfg)
+    finally:
+        ER.search = real
+    assert seen == [False, True]
+
+
+def test_eval_route_command_prints_the_sweep_and_refuses_a_single_domain_library():
+    import contextlib
+    import io
+    from ytbrain import cli
+    from ytbrain.eval import files as EF
+    R, docs, queries = _route_fixture()
+    many = queries + [{"_id": f"s{i}", "text": f"startup thing {i}?", "answerable": True,
+                       "creation": {"seed_moment": f"AAAAAAAAAA1_{i:05d}"}} for i in range(6)] \
+        + [{"_id": f"l{i}", "text": f"leadership thing {i}?", "answerable": True,
+            "creation": {"seed_moment": f"LLLLLLLLLL3_{i:05d}"}} for i in range(6)]
+
+    class Store:
+        def __init__(self, domains):
+            self.domains = domains
+
+        def rows(self, columns=None):
+            return [{"doc_id": d, "domains": list(v)} for d, v in docs.items() if v <= self.domains]
+
+        def domain_scores(self, vec, top_n=3):
+            return {d: (0.9 if d in vec[0] else 0.3) for d in self.domains}
+
+    embed = lambda texts: [[t] for t in texts]            # the "vector" is the text: Store.domain_scores reads it
+    real = (cli._load_search, EF.load_set)
+    EF.load_set = lambda root, name, private=None: (many, {})
+    try:
+        for domains, code in ((frozenset({"startup", "leadership"}), 0), (frozenset({"startup"}), 1)):
+            cli._load_search = lambda device, rerank=True, d=domains: (Store(d), embed, None)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                assert cli.main(["eval", "route", "--composed", "4"]) == code, (out.getvalue(), err.getvalue())
+            if code == 0:
+                text = out.getvalue()
+                assert "composed prompts" in text and "<- default" in text and "startup" in text and "leadership" in text
+            else:
+                assert "nothing to route" in err.getvalue()
+    finally:
+        cli._load_search, EF.load_set = real
+
+
+def _cov_pack(n_docs=40):
+    """A real pack of `n_docs` single-advice talks (half startup, half leadership) with hash embeddings, and
+    for each talk the question that is its own text: the question's one relevant hit has similarity ~1."""
+    import io
+    import contextlib
+    import test_pack as TP
+    rows = []
+    for i in range(n_docs):
+        doc = f"D{i:010d}"
+        text = f"advice number {i} about topic{i}x alpha{i} beta{i} gamma{i}"
+        rows.append({**TP._row(f"adv:{doc}:a01", "advice", doc, text), "domains": ["leadership" if i % 2 else "startup"]})
+    out = Path(tempfile.mkdtemp())
+    with contextlib.redirect_stdout(io.StringIO()):
+        TP._build(out, rows=rows)
+    from founder_coach.pack import PackStore
+    store = PackStore(out)
+    return store, TP.HashEmbed(), rows
+
+
+def test_gap_questions_come_from_the_starter_your_file_and_the_benchmark_and_retire_with_their_domain():
+    from ytbrain.eval import coverage as CV
+    assert CV.parse_gap_questions("# c\n\nWhat is X?\nHow to Y? | finance\n  \n| nothing\n", "t") == [
+        CV.Probe("t-001", "What is X?"), CV.Probe("t-002", "How to Y?", "finance")]
+    extra = Path(tempfile.mkdtemp()) / "mine.txt"
+    extra.write_text("Which antibiotics are used to treat a urinary tract infection?\nA brand new gap?\n", encoding="utf-8")
+    probes = CV.gap_questions(extra, [{"_id": "dev-9", "text": "Out of corpus?", "answerable": False},
+                                      {"_id": "dev-8", "text": "In corpus?", "answerable": True}])
+    texts = [p.text for p in probes]
+    assert len(texts) == len(set(t.lower() for t in texts)), "a question in two files counts once"
+    assert "A brand new gap?" in texts and "Out of corpus?" in texts and "In corpus?" not in texts
+    assert sum(1 for p in probes if p.domain == "finance") >= 3 and sum(1 for p in probes if p.domain == "system-design") >= 3
+    assert len(probes) >= 30, "the starter list is enough to be a measurement"
+    keep, gone = CV.active_gap(probes, {"startup", "leadership"})
+    assert len(keep) == len(probes) and not gone
+    keep, gone = CV.active_gap(probes, {"startup", "finance"})
+    assert gone and all(p.domain == "finance" for p in gone) and all(p.domain != "finance" for p in keep), \
+        "a Domain-tagged Gap question retires itself once the Library has items in that Domain"
+    assert CV.gap_questions(None)[0].qid.startswith("starter-")
+    odd = Path(tempfile.mkdtemp()) / "odd.txt"                      # another editor's bytes: read, never a traceback
+    odd.write_bytes("caf\xe9 question?\n".encode("latin-1") + b"\xff\xfe\nplain one?\n")
+    assert "plain one?" in [p.text for p in CV.gap_questions(odd)]
+
+
+def test_the_gap_eval_counts_wrongful_answers_and_refusals_and_sweeps_the_border():
+    from ytbrain.eval import coverage as CV
+    store, emb, rows = _cov_pack(40)
+    answerable = [CV.Probe(f"a{i}", r["text"], expected=frozenset(r["domains"])) for i, r in enumerate(rows)]
+    gap = [CV.Probe(f"g{i}", f"volcano saxophone telescope {w}") for i, w in enumerate("abcdefghij")]
+    leaky = CV.Probe("g-leak", rows[3]["text"])                    # a "Gap" question the Library plainly answers
+    seen_a, seen_g = CV.observe(store, emb, answerable), CV.observe(store, emb, gap + [leaky])
+    rep = CV.report(store, gap + [leaky], answerable, seen_g, seen_a)
+    now = rep["now"]
+    assert now["gap_n"] == 11 and now["answered"] == 1 and now["answered"] / 11 == now["wrongful_answers"]
+    assert [lk["qid"] for lk in rep["leaks"]] == ["g-leak"]
+    assert now["answerable_n"] == 40 and now["refused"] == 0 and now["wrongful_refusals"] == 0.0
+    assert set(rep["by_domain"]) == {"startup", "leadership"} and rep["by_domain"]["startup"]["n"] == 20
+    assert rep["calibration"] == "provisional"
+    sweep = rep["sweep"]
+    wa = [sweep[s]["wrongful_answers"] for s in CV.SHIFTS]
+    wr = [sweep[s]["wrongful_refusals"] for s in CV.SHIFTS]
+    assert wa == sorted(wa, reverse=True) and wr == sorted(wr), "a stricter border answers less and refuses more"
+    assert rep["status"] == "inconclusive", "too few questions for a verdict"
+    real = CV.MIN_GAP, CV.MIN_ANSWERABLE
+    CV.MIN_GAP, CV.MIN_ANSWERABLE = 5, 5
+    try:
+        rep = CV.report(store, gap + [leaky], answerable, seen_g, seen_a)
+        assert rep["status"] == "pass" and CV.exit_code(rep) == 0 and rep["recommended_shift"] is not None, rep["now"]
+        rep2 = CV.report(store, gap + [CV.Probe(f"l{i}", rows[i]["text"]) for i in range(5)], answerable,
+                         {**seen_g, **{f"l{i}": seen_a[f"a{i}"] for i in range(5)}}, seen_a)
+        assert rep2["status"] == "fail" and CV.exit_code(rep2) == CV.EXIT_FAIL and rep2["recommended_shift"] is None
+        text = CV.render(rep2)
+        assert "FAIL" in text and "no shift meets both targets" in text and "wrongful answers" in text
+        assert "recommended" in CV.render(rep) or rep["recommended_shift"] == 0.0
+    finally:
+        CV.MIN_GAP, CV.MIN_ANSWERABLE = real
+    lo, hi = CV.wilson(1, 11)
+    assert 0.0 < lo < 1 / 11 < hi < 0.4 and CV.wilson(0, 0) == (0.0, 1.0)
+
+
+def test_gap_tuning_recommends_the_shift_that_refuses_the_fewest_answerable_questions():
+    from ytbrain.eval import coverage as CV
+    sweep = {0.0: (8, 0), 0.04: (3, 10), 0.06: (2, 37), 0.08: (2, 86)}      # Gap answered of 30, refused of 309
+    fake = {s: {"wrongful_answers": a / 30, "wrongful_refusals": r / 309} for s, (a, r) in sweep.items()}
+    assert [s for s, r in fake.items() if CV.meets(r)] == [0.04, 0.06]
+    assert CV.recommend(fake) == 0.04, "one more hedged Gap answer costs less than 27 more refused questions"
+    assert CV.recommend({0.0: fake[0.0], 0.08: fake[0.08]}) is None
+
+
+def test_calibrate_fits_the_judged_hits_checks_it_on_held_out_questions_and_refuses_too_little():
+    from ytbrain.eval import coverage as CV
+    from ytbrain.eval.moments import moment_for
+    store, emb, rows = _cov_pack(60)
+    queries = [{"_id": f"q{i}", "text": r["text"], "answerable": True} for i, r in enumerate(rows)]
+    qrels = {f"q{i}": {moment_for(r2["doc_id"], r2["start_ms"]): 2 if j == i else 0 for j, r2 in enumerate(rows)}
+             for i in range(len(rows))}
+    pr = CV.pairs(store, emb, queries, qrels, k=10)
+    assert len(pr) == 600 and sum(y for _, _, y in pr) == 60
+    res = CV.calibrate(pr)
+    cur = res["curve"]
+    assert not cur.provisional and cur.p(0.97) > 0.8 and cur.p(0.2) < 0.2 and res["better"], res
+    assert res["brier_fitted"] < res["brier_provisional"] and res["table"] and res["questions"] == 60
+    text = CV.render_calibration(res, Path("x.json"))
+    assert "held-out Brier" in text and "saved to x.json" in text
+    assert "not saved" in CV.render_calibration({**res, "better": False}, None)
+    assert res["unreachable"] == [] and res["ceiling"] > 0.8
+    # a curve whose ceiling is below a tier's `strong` threshold would make that tier never strong: never saved
+    low = [(q, 0.5 + 0.0002 * i, int(i % 3 == 0)) for i, q in enumerate(f"q{n % 30}" for n in range(300))]
+    capped = CV.calibrate(low)
+    assert capped["ceiling"] < 0.7 and "high" in capped["unreachable"], capped
+    assert "NOT SAVED" in CV.render_calibration(capped, None) and "high" in CV.render_calibration(capped, None)
+    try:
+        CV.calibrate(pr[:20])
+        raise AssertionError("20 judged hits are too few")
+    except ValueError as e:
+        assert "at least" in str(e)
+    unjudged = CV.pairs(store, emb, queries[:5], {q: {} for q in ("q0", "q1", "q2", "q3", "q4")}, k=10)
+    assert unjudged == [], "a hit nobody judged is not a label"
+
+
+def test_eval_gap_and_calibrate_commands_write_the_curve_and_the_tuned_shift_and_report_what_is_missing():
+    import contextlib
+    import io
+    import json as _json
+    from ytbrain import cli, config
+    from ytbrain.eval import coverage as CV
+    from ytbrain.eval import files as EF
+    from ytbrain.eval.moments import moment_for
+    store, emb, rows = _cov_pack(60)
+    queries = [{"_id": f"q{i}", "text": r["text"], "answerable": True, "creation": {"seed_moment": f"{r['doc_id']}_{r['start_ms']:05d}"}}
+               for i, r in enumerate(rows)]
+    qrels = {f"q{i}": {moment_for(r2["doc_id"], r2["start_ms"]): 2 if j == i else 0 for j, r2 in enumerate(rows)}
+             for i in range(len(rows))}
+    saved_file = Path(tempfile.mkdtemp()) / "calibration.json"
+    real = (cli._load_pack, EF.load_set, config.CALIBRATION_FILE, CV.MIN_GAP, CV.MIN_ANSWERABLE)
+    cli._load_pack, EF.load_set, config.CALIBRATION_FILE = (lambda path, rerank=False: (store, emb, None)), \
+        (lambda root, name, private=None: (queries, qrels)), saved_file
+    CV.MIN_GAP, CV.MIN_ANSWERABLE = 5, 5
+    run = lambda *a: (lambda o, e: (cli.main(list(a)), o.getvalue(), e.getvalue()))(io.StringIO(), io.StringIO())
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+            code = cli.main(["eval", "gap"])
+        out = o.getvalue()
+        assert code in (0, CV.EXIT_FAIL) and "wrongful answers" in out and "moving the border" in out and not saved_file.exists()
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()):
+            assert cli.main(["eval", "calibrate"]) == 0
+        assert saved_file.exists(), o.getvalue()
+        got = _json.loads(saved_file.read_text())
+        assert got["embed_model"] == store.meta["embed_model"] and len(got["points"]) >= 2 and got["n"] == 600 and "shift" not in got
+        assert "saved to" in o.getvalue() and "pack build" in o.getvalue()
+        # the pack carries it when built for the same embedding model, and ignores it for another
+        import test_pack as TP
+        m, _ = TP._build(Path(tempfile.mkdtemp()), rows=rows, calibration=got)
+        assert m["calibration"]["points"] == got["points"]
+        m, _ = TP._build(Path(tempfile.mkdtemp()), rows=rows, calibration={**got, "embed_model": "other-model"})
+        assert "calibration" not in m
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["eval", "gap", "--tune"])
+        after = _json.loads(saved_file.read_text())
+        assert len(after["points"]) == len(got["points"]), "tuning keeps the fitted curve"
+        if "shift" in after:
+            assert -0.12 <= after["shift"] <= 0.12 and "saved shift" in o.getvalue()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e:
+            assert cli.main(["eval", "gap", "--questions", "/nonexistent/gq.txt"]) == 1
+        assert "no such file" in e.getvalue()
+        # no questions to measure with: a message, not a traceback
+        EF.load_set = lambda root, name, private=None: ([], {})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e:
+            assert cli.main(["eval", "gap"]) == 1
+        assert "need Gap questions and answerable questions" in e.getvalue()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e:
+            assert cli.main(["eval", "calibrate"]) == 1
+        assert "at least" in e.getvalue() and "ytbrain eval judge" in e.getvalue()
+    finally:
+        cli._load_pack, EF.load_set, config.CALIBRATION_FILE, CV.MIN_GAP, CV.MIN_ANSWERABLE = real
+
 
 if __name__ == "__main__":
     import inspect
