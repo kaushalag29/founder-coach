@@ -384,6 +384,16 @@ class FounderStore:
                     raise StoreError(f"key_metrics[{k!r}] must be text or a number")
                 out[self._text(str(k), "metric name")] = v if not isinstance(v, str) else self._text(v, str(k))
             return out
+        if kind == "places":
+            if not isinstance(value, dict) or not value or len(value) > 20:
+                raise StoreError(f"{field} must be an object of up to 20 what -> where pairs, "
+                                 "e.g. {\"pipeline\": \"HubSpot\"}")
+            out = {}
+            for k, v in value.items():
+                if not isinstance(v, str) or not v.strip():
+                    raise StoreError(f"{field}[{k!r}] must say where, as text (a tool, a file or a folder)")
+                out[self._text(str(k), f"{field} entry")] = self._text(v, str(k))
+            return out
         if kind == "tz":
             try:
                 ZoneInfo(str(value))
@@ -418,7 +428,7 @@ class FounderStore:
             confirmed = dt.datetime.fromisoformat(r["confirmed_at"])
             out[r["field"]] = {"value": json.loads(r["value"]), "since": r["valid_from"],
                                "confirmed_at": r["confirmed_at"],
-                               "stale": r["field"] not in ("timezone", "checkin_day") and confirmed < cutoff}
+                               "stale": r["field"] not in D.NEVER_STALE and confirmed < cutoff}
         return {f: out[f] for f in D.PROFILE_FIELDS if f in out}
 
     def profile_history(self, field: str) -> list[dict]:

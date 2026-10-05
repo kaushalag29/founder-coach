@@ -5,6 +5,7 @@ import os
 os.environ["YTBRAIN_DOTENV"] = "0"          # hermetic: never read the developer's .env (keys, backend)
 os.environ.setdefault("YTBRAIN_SOURCES_FILE", os.path.join(__import__("tempfile").mkdtemp(prefix="ytbrain-nosources-"), "sources.yaml"))   # hermetic: never read your sources.yaml (the file does not exist)
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -644,7 +645,7 @@ def test_ops_runs_only_what_changed_resumes_and_stops_at_a_failed_gate():
     def run(**kw):
         calls.clear()
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = ops.Ops(ops.Options(**{"version": "skip", **kw}), call=call, say=print).run()
+            code = ops.Ops(ops.Options(**{"version": "skip", "coach": True, **kw}), call=call, say=print).run()
         return code, out.getvalue()
 
     code, out = run()
@@ -685,6 +686,65 @@ def test_ops_runs_only_what_changed_resumes_and_stops_at_a_failed_gate():
     code, out = run(plan="plugin", force=True)
     assert code == 0 and "eval gap exit 3 (report only)" in out and "eval coach --plugin dist/plugin --max-cost" in calls
     fail.clear()
+    # the default: the plugin is built and validated, and the coach eval waits for --coach (before a release)
+    code, out = run(plan="plugin", force=True, coach=False)
+    assert code == 0 and not any(c.startswith("eval coach") for c in calls), calls
+    assert any(c.startswith("script scripts/assemble_plugin.py") for c in calls)
+    assert "coach eval not run (`ytbrain ops plugin --coach` before a release)" in out, out
+    assert ops.Options().coach is False
+
+
+def test_ops_carries_on_when_a_step_crashes_on_exit_after_writing_output_that_verifies():
+    """macOS: a native library (ONNX) can abort while Python shuts down, after `pack build` wrote a good pack.
+    ops then trusts the output, never the bare exit code: only a crash signal is checked, and only output this
+    run wrote and that matches its checksum passes; Ctrl+C, kill and ordinary failures stop as before."""
+    import contextlib
+    import io
+    import json as _json
+    import time as _time
+    from ytbrain import ops
+    assert ops.crash_signal(-6) == "SIGABRT" and ops.crash_signal(134) == "SIGABRT" and ops.crash_signal(-11) == "SIGSEGV"
+    assert ops.crash_signal(-2) is None and ops.crash_signal(130) is None and ops.crash_signal(-15) is None
+    assert ops.crash_signal(1) is None and ops.crash_signal(2) is None and ops.crash_signal(0) is None
+
+    import test_pack as TP
+    out = Path(tempfile.mkdtemp()) / "pack"
+    before = _time.time()
+    TP._build(out)
+    assert ops.pack_written(out, before) is None, "a fresh pack that matches its manifest"
+    assert "older than this run" in ops.pack_written(out, _time.time() + 60)
+    nxt = out / "pack.json.next"
+    nxt.write_text("{}")
+    assert "between writing the pack and its manifest" in ops.pack_written(out, before)
+    nxt.unlink()
+    m = _json.loads((out / "pack.json").read_text())
+    (out / "pack.json").write_text(_json.dumps({**m, "sha256": "0" * 64}))
+    assert "doesn't match" in ops.pack_written(out, before)
+    assert "missing or unreadable" in ops.pack_written(Path(tempfile.mkdtemp()), before)
+
+    seen = []
+    o = ops.Ops(ops.Options(version="skip"), call=lambda argv: seen.append(argv) or code[0], say=print)
+    verdict = [None]
+    step = ops.Step("plugin:pack", ["pack", "build"], check=lambda since: verdict[0])
+    for code, why, want in (([-6], None, 0), ([134], None, 0), ([-6], "pack.json is older", -6),
+                            ([-2], None, -2), ([1], None, 1)):
+        verdict[0] = why
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            assert o.child(step) == want, (code, why)
+        text = said.getvalue()
+        if want == 0:
+            assert "crashed on exit (SIGABRT) after writing its output" in text
+        elif why:
+            assert "its output doesn't verify: pack.json is older" in text
+        else:
+            assert "crashed" not in text, "Ctrl+C and ordinary failures are never second-guessed"
+    unchecked = ops.Step("eval:search", ["eval", "run"])
+    code = [-6]
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert o.child(unchecked) == -6, "a step with no check stops on any crash"
+    steps = {s.name: s for s in o.plugin_steps()}
+    assert steps["plugin:pack"].check is not None
+    assert all(s.check is None for n, s in steps.items() if n not in ("plugin:pack", "plugin:pack-private"))
 
 
 def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
@@ -720,7 +780,7 @@ def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
     def run(**kw):
         calls.clear()
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            o = ops.Ops(ops.Options(**kw), call=call, say=print, sleep=slept.append,
+            o = ops.Ops(ops.Options(**{"coach": True, **kw}), call=call, say=print, sleep=slept.append,
                         ask=lambda q, t: answers.pop(0) if answers else None)
             code = o.run()
         return code, out.getvalue()
@@ -795,6 +855,57 @@ def test_ops_handles_each_stop_reason_asks_for_a_version_and_keeps_references():
     finally:
         ops._release = real_release
         runstatus.clear()
+
+
+def test_ops_offers_to_declare_a_stray_book_folder_and_stops_when_no_one_answers():
+    import contextlib
+    import io
+    from ytbrain import domains as D
+    from ytbrain import ops, runstatus
+    tmp = Path(tempfile.mkdtemp())
+    f = tmp / "domains.yaml"
+    f.write_text("default: startup\ndomains:\n  startup:\n    description: Startups.\n    risk_tier: medium\n")
+    real = (D.DOMAINS_FILE, runstatus.STATUS, ops.STATE, ops.LAST_RUN)
+    D.DOMAINS_FILE, runstatus.STATUS, ops.STATE, ops.LAST_RUN = f, tmp / "stop.json", tmp / "state.json", tmp / "last.md"
+    syncs = []
+
+    def call(argv):
+        if argv[0] == "sync":
+            syncs.append(argv)
+            if "legal" not in D.load().names and "Legal" not in D.load().ignore_folders:
+                runstatus.record("config", "book folder Legal/ is not a declared Domain")
+                return 1
+        return 0
+    try:
+        for answers, expect_code, expect_syncs, declared in (
+                ([None], 1, 1, False),                                   # no one at the terminal: stop as before
+                (["", "x"], 1, 1, False),                                # Enter: stop
+                (["h", ""], 1, 1, False),                                # a tier but no description: stop
+                (["h", "Law for founders: incorporation, contracts."], 0, 2, True)):
+            f.write_text("default: startup\ndomains:\n  startup:\n    description: Startups.\n    risk_tier: medium\n")
+            ops.STATE.unlink(missing_ok=True)
+            syncs.clear()
+            q = list(answers)
+            o = ops.Ops(ops.Options(plan="ingest", notify=False), call=call, say=print,
+                        ask=lambda prompt, t: q.pop(0) if q else None, stray=lambda: {"Legal": 2})
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = o.run()
+            assert code == expect_code and len(syncs) == expect_syncs, (answers, code, syncs, out.getvalue())
+            assert ("legal" in D.load().names) == declared
+            if declared:
+                assert D.load().get("legal").risk_tier == "high" and "syncing again" in out.getvalue()
+            else:
+                assert "ytbrain domains add" in out.getvalue(), out.getvalue()
+        f.write_text("default: startup\ndomains:\n  startup:\n    description: Startups.\n    risk_tier: medium\n")
+        ops.STATE.unlink(missing_ok=True)
+        syncs.clear()
+        q = ["i"]
+        o = ops.Ops(ops.Options(plan="ingest", notify=False), call=call, say=print,
+                    ask=lambda prompt, t: q.pop(0) if q else None, stray=lambda: {"Legal": 2})
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert o.run() == 0 and len(syncs) == 2 and D.load().ignore_folders == ("Legal",)
+    finally:
+        D.DOMAINS_FILE, runstatus.STATUS, ops.STATE, ops.LAST_RUN = real
 
 
 def test_run_files_of_a_set_with_a_dash_are_found_under_that_set():
@@ -1398,20 +1509,22 @@ def test_coach_eval_grades_gates_resumes_and_checks_memory_state():
         assert summ["g2"]["rate"] == 0.5 and not summ["g2"]["passed"]         # 1 of 2 cited claims supported
         assert summ["g4"]["rate"] == 0.5                                       # the "raise" plan wasn't challenged
         assert summ["g6"]["passed"]                                            # 3 searches for 2 parts, judged ok
-        g5 = json.loads((C.OUT / f"g5-b1-{C.HARNESS['g5']}.jsonl").read_text().splitlines()[0])
+        g5 = json.loads(next(C.OUT.glob(f"g5-*-{C.HARNESS['g5']}.jsonl")).read_text().splitlines()[0])
         assert [c["ok"] for c in g5["checks"]] == [True, True, False]          # no Goal was recorded
         assert code == 1 and list(C.OUT.glob("report-*.json"))
         n = len(calls)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             C.run_gates(env, ["g2", "g4", "g6", "g5"], plugin, runner=run)
-        assert len(calls) == n and "already done for build b1" in out.getvalue()   # resumed: nothing re-run
+        assert len(calls) == n and "already done for these inputs" in out.getvalue()   # resumed: nothing re-run
         (plugin / "BUILD_ID").write_text("b2\n")
+        (plugin / "server.py").write_text("V = 2\n")                         # a build that changed the runtime
         with contextlib.redirect_stdout(io.StringIO()):
             C.run_gates(env, ["g4"], plugin, runner=run, limit=1)
-        assert len(calls) == n + 1                                             # a new build starts fresh
+        assert len(calls) == n + 2      # starts fresh; that unchallenged plan fails twice, which decides it
         def interrupted(prompt, env=None, resume=None):
             raise KeyboardInterrupt
         (plugin / "BUILD_ID").write_text("b3\n")
+        (plugin / "server.py").write_text("V = 3\n")
         with contextlib.redirect_stdout(io.StringIO()) as out:
             summ, code = C.run_gates(env, ["g4"], plugin, runner=interrupted)
         assert code == 130 and "interrupted" in out.getvalue()                 # Ctrl+C: a message, not a traceback
@@ -1422,7 +1535,7 @@ def test_coach_eval_grades_gates_resumes_and_checks_memory_state():
 def test_coach_eval_case_files_are_well_formed():
     from ytbrain.eval import coach as C
     syc, dec, per = (C.load_cases(g) for g in ("g4", "g6", "g5"))
-    assert len(syc) == 10 and 6 <= len(dec) <= 8 and len(per) == 3
+    assert len(syc) == 10 and 6 <= len(dec) <= 12 and len(per) == 3
     assert len({c["id"] for c in syc + dec + per}) == len(syc) + len(dec) + len(per)
     assert all(len(c["parts"]) >= 2 for c in dec)
     for p in per:
@@ -1481,7 +1594,7 @@ def test_coach_eval_stops_at_the_hosts_usage_limit_and_keeps_finished_cases():
             summ, code = C.run_gates(env, ["g4", "g6"], plugin, runner=run)
         assert code == 2 and len(calls) == 2, (code, calls)                 # stopped, not 5 more errors
         assert "usage limit" in out.getvalue() and "re-run" in out.getvalue()
-        kept = (C.OUT / f"g4-b1-{C.HARNESS['g4']}.jsonl").read_text().splitlines()
+        kept = next(C.OUT.glob(f"g4-*-{C.HARNESS['g4']}.jsonl")).read_text().splitlines()
         assert [json.loads(x)["id"] for x in kept] == ["s0"]                 # the finished case is kept
         assert C.HOST_LIMIT.search("Claude AI usage limit reached|1760000000")
         assert not C.HOST_LIMIT.search("claude exited 1: MCP server failed to start")
@@ -1540,6 +1653,146 @@ def test_coach_eval_with_one_errored_case_is_an_incomplete_run_and_a_rerun_does_
         C.load_cases = real
 
 
+def _fake_plugin(root: Path, *, version="0.1.0", checkin="Check-in body", checkin_desc="Runs a Check-in",
+                 content="c1", file_sha="f1") -> Path:
+    import json as _json
+    p = root / "plugin"
+    if p.exists():
+        shutil.rmtree(p)
+    for name, desc, body in (("ask", "Answers questions", "Ask body"), ("coach", "Coaching method", "Contract"),
+                             ("check-in", checkin_desc, checkin)):
+        (p / "skills" / name).mkdir(parents=True)
+        (p / "skills" / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\n\n{body}\n")
+    (p / "skills" / "check-in" / "references").mkdir()
+    (p / "skills" / "check-in" / "references" / "x.md").write_text(checkin)
+    (p / "founder_coach" / "playbooks").mkdir(parents=True)
+    (p / "founder_coach" / "server.py").write_text("SERVER = 1\n")
+    (p / "founder_coach" / "__init__.py").write_text(f'"""rt"""\n__version__ = "{version}"\n')
+    (p / "founder_coach" / "playbooks" / "check-in.md").write_text(checkin)
+    (p / ".claude-plugin").mkdir()
+    (p / ".claude-plugin" / "plugin.json").write_text(_json.dumps({"name": "x", "version": version}))
+    (p / "pyproject.toml").write_text(f'[project]\nname = "x"\nversion = "{version}"\n')
+    (p / "pack").mkdir()
+    (p / "pack" / "pack.json").write_text(_json.dumps({"sha256": file_sha, "content_sha256": content,
+                                                       "built_at": file_sha}))
+    (p / "pack" / "knowledge.sqlite").write_text(file_sha)
+    (p / "BUILD_ID").write_text(f"build-{file_sha}-{version}\n")
+    return p
+
+
+def test_every_domain_a_decomposition_case_expects_is_declared():
+    from ytbrain import domains as D
+    from ytbrain.eval import coach as C
+    names = set(D.load().names)
+    cases = C.load_cases("g6")
+    multi = [c for c in cases if c.get("domains")]
+    assert len(multi) >= 4, "multi-Domain questions are part of G6"
+    for c in multi:
+        assert len(c["domains"]) == len(c["parts"]), c["id"]
+        assert all(set(d) <= names for d in c["domains"]), (c["id"], c["domains"])
+    assert len({c["id"] for c in cases}) == len(cases)
+
+
+def test_a_part_reaches_its_domain_by_naming_it_or_by_searching_everything():
+    from ytbrain.eval import coach as C
+    r = C.domain_parts([["gtm", "startup"], ["leadership"]], [{"query": "a", "domains": ["startup"]},
+                                                             {"query": "b", "domains": ["finance"]}])
+    assert r["domain_parts_reached"] == 1 and r["domains_searched"] == [["startup"], ["finance"]]
+    r = C.domain_parts([["gtm"], ["leadership"]], [{"query": "a"}, {"query": "b", "domains": []}])
+    assert r["domain_parts_reached"] == 2 and r["domains_searched"] == [["*"], ["*"]], "no domains = the whole Library"
+
+
+def test_each_coach_gate_is_cached_on_what_it_depends_on_not_the_whole_build():
+    from ytbrain.eval import coach as C
+    tmp = Path(tempfile.mkdtemp())
+    cases = [{"id": "a", "prompt": "q"}]
+
+    def keys(**kw):
+        p = _fake_plugin(tmp, **kw)
+        return {g: C.gate_inputs(p, g, cases) for g in ("g2", "g4", "g5", "g6")}
+    base = keys()
+    assert keys(version="0.2.0", file_sha="f2") == base, "a new version and a rebuilt pack file with the same items"
+    edited = keys(checkin="Check-in body, reworded")
+    assert edited["g5"] != base["g5"], "G5 uses the check-in skill"
+    assert all(edited[g] == base[g] for g in ("g2", "g4", "g6")), "the other gates don't read its text"
+    described = keys(checkin_desc="Runs the weekly Check-in")
+    assert all(described[g] != base[g] for g in base), "a description is in every gate's context"
+    assert all(v != base[g] for g, v in keys(content="c2").items()), "new pack content re-runs every gate"
+    p = _fake_plugin(tmp)
+    assert C.gate_inputs(p, "g2", cases) != C.gate_inputs(p, "g2", cases + [{"id": "b", "prompt": "r"}])
+    (p / "founder_coach" / "server.py").write_text("SERVER = 2\n")
+    assert C.gate_inputs(p, "g4", cases) != base["g4"], "the runtime is every gate's input"
+    import json as _json
+    (p / "pack" / "pack.json").write_text(_json.dumps({"sha256": "f9"}))      # an older pack: the file hash
+    assert C.pack_id(p) == "f9"
+    (p / "pack" / "pack.json").unlink()
+    assert C.pack_id(p) == "none"
+
+
+def test_a_failed_case_is_run_again_and_a_majority_of_three_decides():
+    from ytbrain.eval import coach as C
+
+    def runner(outcomes):
+        seq = iter(outcomes)
+        n = {"runs": 0}
+
+        def one():
+            n["runs"] += 1
+            o = next(seq)
+            if o == "err":
+                return {"id": "x", "error": "error_max_turns"}
+            return {"id": "x", "passed": o, "host_tokens": {"input": 10}, "host_cost_usd": 0.5, "reason": str(o)}
+        return one, n
+    one, n = runner([True])
+    assert C.run_trials("g4", {"id": "x"}, one, say=lambda m: None)["passed"] and n["runs"] == 1, "a pass costs one run"
+    one, n = runner([False, False])
+    r = C.run_trials("g4", {"id": "x"}, one, say=lambda m: None)
+    assert not r["passed"] and r["trials"] == [False, False] and n["runs"] == 2, "two failures decide it"
+    one, n = runner([False, True, True])
+    r = C.run_trials("g5", {"id": "x"}, one, say=lambda m: None)
+    assert r["passed"] and r["trials"] == [False, True, True] and r["reason"] == "True"
+    assert r["host_tokens"] == {"input": 30} and r["host_cost_usd"] == 1.5, "every run's tokens are counted"
+    one, n = runner([False, True, False])
+    r = C.run_trials("g6", {"id": "x"}, one, say=lambda m: None)
+    assert not r["passed"] and r["reason"] == "False", "a failure keeps the failing run's details"
+    one, n = runner([False, "err"])
+    assert "error" in C.run_trials("g4", {"id": "x"}, one, say=lambda m: None), "an errored run isn't a verdict"
+    one, n = runner([False])
+    assert not C.run_trials("g2", {"id": "x"}, one, say=lambda m: None)["passed"] and n["runs"] == 1, "G2 runs once"
+
+
+def test_coach_eval_reuses_a_gates_results_across_a_rebuild_that_changed_nothing_it_uses():
+    import contextlib
+    import io
+    from ytbrain.eval import coach as C
+    from ytbrain.eval.db import EvalDB
+    from ytbrain.eval.llm import Answer
+    tmp = Path(tempfile.mkdtemp())
+    C.OUT = tmp / "coach"
+    calls = []
+
+    def run(prompt, env=None, resume=None):
+        calls.append(prompt)
+        return C.Turn(text="Answer (Seibel, 2019).", session_id="s",
+                      tools=[{"name": C.SEARCH, "input": {"query": prompt}, "result": "1. [advice] X"}])
+    env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
+                           "ask": staticmethod(lambda *a, **k: Answer(C.Verdict(passed=True, reason="r"), cost=0))})()
+    cases = {"g4": [{"id": f"s{i}", "prompt": f"plan {i}"} for i in range(3)]}
+    real = C.load_cases
+    C.load_cases = lambda g, plugin=None: cases[g]
+    try:
+        plugin = _fake_plugin(tmp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert C.run_gates(env, ["g4"], plugin, runner=run)[1] == 0 and len(calls) == 3
+        calls.clear()
+        plugin = _fake_plugin(tmp, version="0.1.1", file_sha="f2", checkin="reworded")   # G4 doesn't read check-in
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert C.run_gates(env, ["g4"], plugin, runner=run)[1] == 0
+        assert calls == [] and "3 already done" in out.getvalue(), out.getvalue()
+    finally:
+        C.load_cases = real
+
+
 def test_coach_eval_stops_at_the_first_case_when_the_host_is_not_signed_in():
     import contextlib
     import io
@@ -1570,7 +1823,7 @@ def test_coach_eval_stops_at_the_first_case_when_the_host_is_not_signed_in():
         assert code == 2 and len(calls) == 1, (code, calls)                    # the first case, not all five
         assert "/login" in out.getvalue() and "not signed in" in out.getvalue()
         assert (runstatus.read() or {}).get("reason") == "auth"
-        assert not (C.OUT / f"g4-b2-{C.HARNESS['g4']}.jsonl").exists(), "nothing was recorded as a result"
+        assert not list(C.OUT.glob(f"g4-*-{C.HARNESS['g4']}.jsonl")), "nothing was recorded as a result"
     finally:
         C.load_cases, runstatus.STATUS = real_cases, real_status
 
@@ -1588,9 +1841,13 @@ def test_coach_eval_stops_when_the_plugin_is_rebuilt_mid_run():
     (plugin / "BUILD_ID").write_text("b1\n")
     calls = []
 
+    change = {"code": True}
+
     def run(prompt, env=None, resume=None):
         calls.append(prompt)
-        (plugin / "BUILD_ID").write_text("b2\n")                           # reassembled during case 1
+        (plugin / "BUILD_ID").write_text(f"b{len(calls) + 1}\n")            # reassembled during each case...
+        if change["code"]:
+            (plugin / "server.py").write_text(f"V = {len(calls)}\n")         # ...with a change every gate uses
         return C.Turn(text="Answer (Seibel, 2019).", session_id="s",
                       tools=[{"name": C.SEARCH, "input": {"query": prompt}, "result": "1. [advice] X"}])
     env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
@@ -1602,6 +1859,12 @@ def test_coach_eval_stops_when_the_plugin_is_rebuilt_mid_run():
             summ, code = C.run_gates(env, ["g4", "g6"], plugin, runner=run)
         assert code == 2 and len(calls) == 1, (code, calls)
         assert "rebuilt during this run" in out.getvalue() and "g6" not in summ
+        # a rebuild that only bumps the build id (a new version, the same files) changes nothing the gates use
+        change["code"], C.OUT = False, tmp / "coach2"
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            summ, code = C.run_gates(env, ["g4"], plugin, runner=run)
+        assert code == 0 and len(calls) == 3 and "rebuilt" not in out.getvalue(), (code, calls, out.getvalue())
     finally:
         C.load_cases = real
 
@@ -1966,6 +2229,19 @@ def test_eval_gap_and_calibrate_commands_write_the_curve_and_the_tuned_shift_and
         assert "at least" in e.getvalue() and "ytbrain eval judge" in e.getvalue()
     finally:
         cli._load_pack, EF.load_set, config.CALIBRATION_FILE, CV.MIN_GAP, CV.MIN_ANSWERABLE = real
+
+
+def test_a_tuned_shift_is_relative_to_the_shift_the_pack_already_carries():
+    """`eval gap` sweeps the border from where the pack is, so `--tune` must save base + recommendation:
+    saving the recommendation alone undid the shift the pack was built with (0.04 became 0.02, looser)."""
+    from ytbrain.eval import coverage as CV
+    assert CV.tuned_shift({"calibration": {"shift": 0.04}}, 0.02) == 0.06
+    assert CV.tuned_shift({"calibration": {"shift": 0.04}}, 0.0) == 0.04, "no move keeps the shift"
+    assert CV.tuned_shift({"calibration": {"shift": 0.04}}, -0.06) == -0.02
+    assert CV.tuned_shift({"calibration": {"points": [[0.5, 0.2], [0.8, 0.9]]}}, 0.02) == 0.02, "a curve alone has no shift"
+    assert CV.tuned_shift({}, 0.02) == 0.02 and CV.tuned_shift(None, -0.02) == -0.02
+    assert CV.tuned_shift({"calibration": {"shift": True}}, 0.02) == 0.02, "a damaged value is no shift"
+    assert CV.tuned_shift({"calibration": {"shift": 0.29}}, 0.1) == 0.3, "never past what the runtime accepts"
 
 
 if __name__ == "__main__":

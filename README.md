@@ -119,6 +119,7 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 | [docs/phase2-plan.md](docs/phase2-plan.md) | Milestones M0–M6 and the pipeline design |
 | [docs/eval-spec.md](docs/eval-spec.md) | The retrieval benchmark (Tuning and Holdout sets, judges, metrics) |
 | [docs/commands.md](docs/commands.md) | Every command, by phase |
+| [docs/testing.md](docs/testing.md) | Testing the whole system end to end: seven levels from `scripts/check.sh` to a live session, with what a pass looks like |
 | [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | Next: one engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); proposed |
 | [docs/ops.md](docs/ops.md) | `ytbrain ops`: the whole loop in one resumable command |
 | [docs/release.md](docs/release.md) | Repos, CI, beta releases, what testers do, renaming |
@@ -465,6 +466,8 @@ Claude plan by default**, set up to use as little of its limits as possible:
 - a case that errors (a turn cap, a host hiccup) is not cached and does not fail the gate by itself: when the rest pass,
   the gate is **incomplete** (exit 2) and re-running the same command retries only those cases; if the Claude login has
   expired the run stops at the first case and says to run `claude`, then `/login`;
+- the gates run before a release (`ytbrain ops plugin --coach`), not on every build; each is cached on what it reads, so
+  editing one skill re-runs only the gates that use it, and a version bump re-runs nothing;
 - `claude plugin eval` with `--runs 1 --ablation none` while iterating (3 runs, with the
   without-plugin comparison, before a release).
 
@@ -492,13 +495,17 @@ start from `cp sources.example.yaml sources.yaml`, then build it interactively w
 
 ### Domains: which subject a Source belongs to
 
-`domains.yaml` (committed) declares the **Domains** of the Library: `startup`, `leadership`,
-`system-design`, `finance`, `investment`, `coding`, each with a description, example questions, a risk tier, a freshness
+`domains.yaml` (committed) declares the **Domains** of the Library: `startup`, `gtm` (sales, marketing, positioning,
+pricing, launches), `leadership`, `system-design`, `finance`, `investment`, `coding`, each with a description, example questions, a risk tier, a freshness
 half-life and a web policy. Tag a Source with `domains: [leadership]` in `sources.yaml`; a Book in a folder
 named after a Domain (`data/books/leadership/…`) belongs to it with no tag, and `books: {"X.pdf": {domains: [...]}}`
-overrides one Book. A Source or Book with none is `startup`. A Book folder that is not a declared Domain
-(a typo such as `system-desing/`) is reported by `ytbrain sync`, and `ytbrain sync --strict-domains` (what `ytbrain ops` runs)
-exits 1 on it; `ignore_folders: [to-read]` in `domains.yaml` lists folders that only sort files. A Document may belong to several Domains, and
+overrides one Book. A Source or Book with none is `startup`. Folder names match whatever their case or spacing
+(`GTM/`, `System Design/`). A Book folder that is not a declared Domain (a typo such as `system-desing/`, or a new
+subject) is reported by `ytbrain sync`, and `ytbrain sync --strict-domains` (what `ytbrain ops` runs) exits 1 on it;
+`ytbrain ops` then asks whether to declare it (risk tier and a one-line description, both required) or ignore it.
+By hand: `ytbrain domains add legal --risk high --description "Law for founders"`, `ytbrain domains ignore to-read`
+(a folder that only sorts files), `ytbrain domains` to list them. Domains never appear by themselves: a new one is a
+choice, because its risk tier decides how much evidence a confident answer needs. A Document may belong to several Domains, and
 `coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them.
 Tags are configuration: after editing them run `ytbrain index`, which re-tags existing items in place
 (no re-embedding, no re-extraction). The coach learns the Domains from `coach_get_context` and passes the ones a
@@ -644,6 +651,8 @@ wrong, per file: `title`, `subtitle`, `authors`, `year`, `isbn`, `url`, or a `ch
   copyright line who isn't among the authors.
 - **Chapters:** the first plausible of a `chapters_only` list, the bookmarks (Parts opened into their chapters),
   the printed contents page, headings, then 15-page windows; front and back matter skipped.
+- **One file per Book:** two PDFs with the same id (two editions, a copy, two untitled books) would overwrite each other's
+  Chapters, so the second is refused (`same book id`): keep one, or `skip: true` for the other under `books:`.
 - **Ids:** `<ISBN-13>__<chapter-title>`, so a re-split or a renamed file keeps them. An unchanged Chapter is
   never cleaned again; a book removed from the folder leaves the index; a PDF that fails to parse keeps what it had.
 - **Check your books:** keep the expected title, authors, year, ISBN and chapters in a local YAML and run
@@ -715,7 +724,7 @@ only the talks whose records changed.
 
 | Command | Does | Useful flags |
 |---|---|---|
-| `ops [ingest\|eval\|plugin]` | The whole loop in one resumable, change-detecting command: ingest, then eval when the index changed, then the plugin when it passed; asks the plugin version, handles retries and stop reasons, notifies ([docs/ops.md](docs/ops.md)) | `--dry-run`, `--max-cost`, `--max-extract`, `--no-sync`, `--skip-coach`, `--restart`, `--force`, `--version patch\|minor\|skip`, `--no-notify` |
+| `ops [ingest\|eval\|plugin]` | The whole loop in one resumable, change-detecting command: ingest, then eval when the index changed, then the plugin when it passed; asks the plugin version, handles retries and stop reasons, notifies ([docs/ops.md](docs/ops.md)) | `--dry-run`, `--max-cost`, `--max-extract`, `--no-sync`, `--coach` (the coach eval, before a release), `--restart`, `--force`, `--version patch\|minor\|skip`, `--no-notify` |
 | `discover` | Build/extend `sources.yaml` | `--method ytdlp\|api`, `--channel` |
 | `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--strict-domains` (exit 1 on a Book folder that is not a Domain), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
 | `clean` | Caption file → deduplicated, ~10–25 s timestamped utterances; web page → numbered paragraphs | `--limit N`, `--retry-failed` |
@@ -742,7 +751,8 @@ only the talks whose records changed.
 | `status` | Count of finished items per stage | |
 | `invalidate <stage>` | Mark `fetch`, `clean`, `extract`, `verify` or `index` for redo | `--only-flagged`, `--source ID`, `--reason` |
 | `drop --source ID` | Take a Source's Documents out of the knowledge (then `index`) | |
-| `eval coach` | Gates G2, G4, G5, G6 on the real host: the local Claude Code on your plan (Haiku, token-saving); stops if the plugin is reassembled mid-run | `--gate`, `--limit`, `--model`, `--max-turns`, `--host claude\|openrouter`, `--max-cost`, `--plugin DIR` (default `dist/plugin`) |
+| `domains [list\|add\|ignore]` | The Library's Domains in `domains.yaml`: list them (and book folders that aren't one yet), declare one (`add NAME --risk low\|medium\|high --description "…"`), or mark a folder as sorting only (`ignore FOLDER`); comments in the file are kept | `--example Q` (repeatable), `--freshness DAYS`, `--web-policy` |
+| `eval coach` | Gates G2, G4, G5, G6 on the real host: the local Claude Code on your plan (Haiku, token-saving). Each gate is cached on what it reads (runtime, pack content, its skills, its cases), so only gates whose inputs changed run; a failed G4-G6 case gets up to three runs and a majority decides; stops if the plugin is reassembled mid-run with a change the gate reads | `--gate`, `--limit`, `--model`, `--max-turns`, `--host claude\|openrouter`, `--max-cost`, `--plugin DIR` (default `dist/plugin`) |
 | `claude [--model M] [--openrouter] -- <args>` | The local Claude Code for plugin work, on your plan with Haiku | `--model`, `--openrouter` (before `--`) |
 
 `--limit` counts Documents per Step (for `sync`, per Source). A Document that fails a Step 3 runs in a row is parked;
@@ -1293,7 +1303,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 327 tests, no network
+for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 353 tests, no network
 pytest tests/                                                                        # the same under pytest
 ```
 
@@ -1314,6 +1324,8 @@ machine. CI (`.github/workflows/ci.yml`) runs on every push and pull request: a 
 then the suites on Python 3.11 and 3.13 (`serve,pack,dev,web` plus LanceDB), failing on any skipped
 test, and all of them again in one process (`pytest tests`, which catches state leaking between suites); then it assembles a plugin from a test pack, fails if the generated files are stale, and
 runs `claude plugin validate --strict`.
+Everything that needs your books, models or keys (the corpus, search, the benchmark, the coach on the real host, a live
+session) is a command, not a CI job: [docs/testing.md](docs/testing.md) lists them in order, cheapest first.
 Answer quality is measured separately, on the real host (the local Claude Code on your plan,
 Haiku by default): `ytbrain eval coach` (gates G2, G4, G5, G6) and `ytbrain claude -- plugin eval …` (mocked skill
 behaviour); see [docs/commands.md](docs/commands.md).
@@ -1330,7 +1342,7 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 | M2 | Evaluation: Tuning sets, one per source kind, each at most 20 % of its Documents (Talks 150, labels v1.5.0; Articles and private Books are built by `ytbrain ops eval`), and a Holdout set | Talks set **done**; Holdout (M2c lite, G3) next |
 | M2d | The Knowledge pack (ONNX, no torch) | **done**; pack experiments toward G1 pending |
 | M3a/b | The coach runtime (8 MCP tools, local Founder store) and the Claude Code plugin (9 skills, hook) | **done**; one live session left |
-| M3d | Coach evaluation on the real host (G2, G4, G5, G6) | on Haiku: G2, G4, G6 pass; G5 re-run after the Check-in fixes |
+| M3d | Coach evaluation on the real host (G2, G4, G5, G6) | a release gate (`ytbrain ops plugin --coach`): each gate cached on its inputs, a failed case decided by a majority of three runs |
 | — | Repos, CI, Feedback, beta releases | **done** (2026-09-26) |
 | — | Website Sources: generic crawler for any listed site (robots.txt, pacing, Playwright when needed), articles through the same Steps | **done** (2026-09-26); first crawls (paulgraham.com, pmarchive.com, YC Library) done, fixes in CHANGELOG |
 | — | Local usage log | **done** (2026-09-26) |
@@ -1340,7 +1352,11 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 | — | Eval support for articles (article Moments), review fixes (index/pack upgrades, hermetic tests) | **done** (2026-09-26) |
 | next | M2c lite (Holdout, G3); Jev (typed judgements) plan | planned |
 | M4 | Dogfood with real founders; every miss becomes an eval case | after the first beta release |
-| M5, M6 | Principles and a thin graph; other hosts (Cursor, Codex, Gemini CLI…) | later |
+| M5 | Library and routing: Domains (incl. `gtm`), Coverage, Gap questions, multi-Domain questions ([plan](docs/library-and-packs-plan.md)) | built; exit pending: search p95 measured, a Gap set of 60+ |
+| — | The Founder's own data through the host's Connectors (calendar, email, docs, CRM), read-only unless asked; Goals past their date as Nudges | **done** (2026-10-04) |
+| M6 | Engine and Packs (a second Pack from the coding books) | planned |
+| M7 | Posts and freshness (RSS, Substack, sync windows) | planned |
+| later | Other hosts (Cursor, Codex, Gemini CLI…); cross-book synthesis and memory validity windows if evals ask for them | later |
 
 ## Contributing
 

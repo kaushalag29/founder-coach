@@ -44,6 +44,8 @@ if os.environ.get("YTBRAIN_DOTENV") != "0":
     _load_dotenv(DOTENV)
 
 ROOT = Path(os.environ.get("YTBRAIN_ROOT", Path(__file__).resolve().parents[1]))
+# your Sources (git-ignored); the env var points tests at a file that need not exist
+SOURCES_FILE = Path(os.environ.get("YTBRAIN_SOURCES_FILE") or Path(__file__).resolve().parents[1] / "sources.yaml")
 DATA = ROOT / "data"
 RAW = DATA / "raw"                   # yt-dlp: <id>.info.json, <id>.en.srt
 TRANSCRIPTS = DATA / "transcripts"   # cleaned, utterance-merged

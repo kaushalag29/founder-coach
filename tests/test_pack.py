@@ -86,6 +86,24 @@ def _build(out, rows=ROWS, emb=None, batch=64, route=None, calibration=None):
                           say=lambda m: None, route=route, calibration=calibration), emb
 
 
+def test_the_pack_content_hash_ignores_when_it_was_built_but_not_what_it_holds():
+    import numpy as np
+    from ytbrain import pack as B
+    from founder_coach import pack as P
+    rows = [{c: f"{c}-{i}" for c in P.COLUMNS} for i in range(3)]
+    m = np.eye(3, 4, dtype=np.float32)
+    meta = {"embed_model": "e", "built_at": "2026-10-01T00:00:00", "built_by": "ytbrain 0.1.0", "router": {"enabled": False}}
+    h = B.content_hash(rows, m, meta)
+    assert h == B.content_hash(rows, m, {**meta, "built_at": "2026-10-04T09:00:00", "built_by": "ytbrain 0.2.0"})
+    assert h != B.content_hash([{**rows[0], P.COLUMNS[0]: "changed"}] + rows[1:], m, meta), "an item changed"
+    assert h != B.content_hash(rows, m * 0.5, meta), "a vector changed"
+    assert h != B.content_hash(rows, m, {**meta, "router": {"enabled": True}}), "a setting changed"
+    with tempfile.TemporaryDirectory() as t:
+        a, _ = _build(Path(t) / "a")
+        b, _ = _build(Path(t) / "b")
+        assert a["content_sha256"] and a["content_sha256"] == b["content_sha256"], "two builds of the same items"
+
+
 def test_pack_builds_verifies_and_searches_like_the_index():
     out = Path(tempfile.mkdtemp())
     manifest, emb = _build(out)

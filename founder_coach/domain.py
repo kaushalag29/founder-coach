@@ -22,7 +22,12 @@ PROFILE_FIELDS: dict[str, tuple[str, str]] = {
     "key_metrics": ("metrics", "the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}"),
     "timezone": ("tz", "IANA time zone, e.g. Asia/Kolkata"),
     "checkin_day": ("weekday", "preferred Check-in day: " + ", ".join(WEEKDAYS)),
+    "workspace": ("places", "where the Founder keeps their own data, in their words: {what: tool or place}, e.g. "
+                            "{\"pipeline\": \"HubSpot\", \"metrics\": \"Google Sheet 'KPIs'\", "
+                            "\"investor updates\": \"Drive folder 'Updates'\"}"),
 }
+# facts that don't drift on their own: never flagged stale (the rest want confirming after PROFILE_STALE_DAYS)
+NEVER_STALE = ("timezone", "checkin_day", "workspace")
 
 STATUSES = {
     "goal": ("active", "met", "dropped"),

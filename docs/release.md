@@ -63,6 +63,7 @@ See runs under the repo's **Actions** tab.
 ## Release a beta version
 
 ```bash
+ytbrain ops plugin --coach        # the coach gates (G2, G4, G5, G6): only those whose inputs changed run
 # commit your changes first; the release refuses uncommitted work (--allow-dirty overrides)
 python scripts/release.py --pack data/pack \
   --marketplace "../founder-coach-marketplace" --version 0.1.1 --push
@@ -76,6 +77,10 @@ git commit -am "Release 0.1.1" && git push      # the version bump in this repo
   README, runs `claude plugin validate`, commits and tags `founder-coach--v<version>`.
   Nothing in the marketplace clone changes until every check passes.
 - Without `--push` it prints the push command, so you can look at the commit first.
+- The coach eval is the release's quality gate, and the only time it runs: a day-to-day `ytbrain ops plugin`
+  builds and validates without it. Each gate is cached on what it depends on (the runtime, the pack's content,
+  the skills it uses, its cases), so after editing one skill only the gates that read it run again, and a failed
+  G4-G6 case is run up to three times and passes on a majority.
 
 ## What testers do
 

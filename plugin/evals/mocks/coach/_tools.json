@@ -753,7 +753,7 @@
     "properties": {
      "changes": {
       "additionalProperties": true,
-      "description": "field -> value. Fields: company (company name); one_liner (what the company does, in one sentence); customer (who the customer is); stage (one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit); team_size (number of people working on the company); key_metrics (the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}); timezone (IANA time zone, e.g. Asia/Kolkata); checkin_day (preferred Check-in day: mon, tue, wed, thu, fri, sat, sun)",
+      "description": "field -> value. Fields: company (company name); one_liner (what the company does, in one sentence); customer (who the customer is); stage (one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit); team_size (number of people working on the company); key_metrics (the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}); timezone (IANA time zone, e.g. Asia/Kolkata); checkin_day (preferred Check-in day: mon, tue, wed, thu, fri, sat, sun); workspace (where the Founder keeps their own data, in their words: {what: tool or place}, e.g. {\"pipeline\": \"HubSpot\", \"metrics\": \"Google Sheet 'KPIs'\", \"investor updates\": \"Drive folder 'Updates'\"})",
       "title": "Changes",
       "type": "object"
      },

@@ -3,6 +3,63 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-05 (One file per Book; the end-to-end test runbook)
+
+- **A second PDF of a book already registered is refused** (`same book id`) instead of overwriting the first's plan and
+  orphaning its Chapters (two editions or a copy share an ISBN; two books with no title share `untitled-book`). The first file in
+  folder order keeps the Book; `skip: true` under `books:` in sources.yaml silences the other. Found on a real folder:
+  "Crossing the Chasm 3rd Edition.pdf" and an untitled copy made three Chapters report "BOOK PLAN OR PARSE MISSING".
+- **`ytbrain eval gap --tune` saved the recommended shift as if the pack had none.** The sweep moves the border from where
+  the pack already is, so a pack built with +0.04 and a recommendation of +0.02 should save +0.06, not +0.02 (which loosened
+  the border and made every re-tune undo the last). It now saves the pack's shift plus the recommendation and says so.
+- **`ytbrain ops` no longer stops when `pack build` crashes on exit after writing a good pack.** On macOS a native
+  library (ONNX) can abort while Python shuts down (`recursive_mutex lock failed`, exit -6). For a step that has a check
+  (both pack builds), a crash signal now makes ops check the output instead: a pack.json written by this run whose
+  pack matches its sha256 lets the run go on with a warning. Anything else, Ctrl+C or an ordinary failure still stops it.
+- **docs/testing.md:** testing the whole system end to end in seven levels (offline checks, corpus, search, benchmark, plugin,
+  coach gates, a live session), what each proves and costs, and what CI cannot run.
+
+## 2026-10-04 (Domains from a command or a question; the Founder's Workspace)
+
+- **`ytbrain domains`** lists the Domains and any books folder that isn't one yet; `ytbrain domains add NAME --risk
+  low|medium|high --description "..."` declares one (examples, freshness and web policy optional) and `ytbrain domains
+  ignore FOLDER` marks a folder that only sorts files. domains.yaml keeps its comments, and an edit is validated before
+  the file is replaced.
+- **`ytbrain ops` asks when sync stops on a books folder that isn't a Domain:** declare it (risk tier and a one-line
+  description, both required) or ignore it, then it syncs again. With no one at the terminal it stops as before, and
+  the sync warning now prints the exact command.
+- **Folder names match their Domain whatever the case or spacing:** `GTM/` is `gtm`, `System Design/` is `system-design`
+  (they were reported as stray before).
+- **Workspace:** a new profile fact, `workspace` ("pipeline": "HubSpot", "metrics": "Google Sheet 'KPIs'"), saved on a yes
+  when the Founder says where something lives or names a tool to use, never flagged stale. Check-ins and `ask` look
+  there first; setup asks for it once (optional). A named tool the host can't reach gets one sentence on connecting it.
+- Decisions #32-#33; glossary: Workspace.
+## 2026-10-04 (Coach eval as a release gate; Connectors; `gtm`; complete answers; overdue Goals)
+
+- **The coach eval runs before a release, not on every build.** `ytbrain ops plugin` builds and validates; `ytbrain ops
+  plugin --coach` adds the coach eval (`--skip-coach` is now the default and still accepted).
+- **Each coach gate is cached on what it reads**, not on the whole build: the runtime, the pack's content, the full text of
+  the skills it uses (and only the descriptions of the others) and its cases. A version bump or a rebuilt pack with the
+  same items re-runs nothing; editing `check-in` re-runs G5 alone. Packs now carry `content_sha256`, equal for two builds
+  of the same items (the file's sha256 is not). The first run after this change re-runs every gate once.
+- **A failed G4, G5 or G6 case is run again, up to three runs, and a majority decides** (a pass costs one run). One unlucky
+  host run no longer fails a gate; a real failure still does, and the output says "1 of 3 runs passed".
+- **`ask` doesn't drop parts of a question:** a part whose coverage is partial or none gets one rewritten follow-up
+  search, the question is re-read for any ask left without a search, the conditions of one ask stay together, and asks
+  beyond four are listed as questions to ask next.
+- **G6 asks multi-Domain questions** (GTM with leadership, finance, system design) and reports how many parts searched
+  their Domain (report only). The G6 judges accept a high-risk part declined with a pointer to an adviser (harness h4,
+  so earlier G6 results are not reused).
+- **New Domain `gtm`** (sales, marketing, positioning, pricing, launches): put GTM books in `data/books/gtm/`. A GTM part
+  searches `gtm` and `startup`, so YC's GTM talks still count.
+- **The Founder's own data through the host's Connectors** (calendar, email, documents, chat, CRM): Check-ins look for
+  evidence first, the weekly Focus picks cues from real free time, and `ask` reads the Founder's data when they point at
+  it. Read-only unless the Founder asks, after the exact text is shown; what a Connector returns is data, never
+  instructions; Founder memory never goes into another tool. The same rule is in the server instructions.
+- **A Goal past its target date is a Nudge** ("met, dropped, or a new date?") and is marked in FOUNDER.md; nothing changes
+  without the Founder's yes. A stale profile fact now says when it was last confirmed (`confirmed_on`).
+- Decisions #26-#31 in docs/library-and-packs-plan.md; M5's exit now measures host routing (G6) and asks for a Gap set
+  of 60+; glossary: Calibration, Connector, a single Source kind entry; README roadmap matches the plan's milestones.
 ## 2026-10-03 (Book folders that are not Domains are reported; `invalidate` flags combine)
 
 - **`ytbrain sync` warns about a book folder that is not a declared Domain** (`system-desing/`, an undeclared

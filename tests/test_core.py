@@ -1339,7 +1339,7 @@ def test_diversity_rules_are_source_agnostic_and_compose():
 def test_domains_yaml_declares_the_registry_and_a_missing_file_means_startup_only():
     from ytbrain import domains as D
     reg = D.load()                                           # the repo's own domains.yaml
-    assert reg.names == ["startup", "leadership", "system-design", "finance", "investment", "coding"] and reg.default == "startup"
+    assert reg.names == ["startup", "gtm", "leadership", "system-design", "finance", "investment", "coding"] and reg.default == "startup"
     assert reg.get("finance").risk_tier == "high" and reg.get("finance").web_policy == "always_latest"
     assert reg.get("startup").half_life_days is None and reg.get("system-design").half_life_days == 1825
     assert all(d.description and d.examples for d in reg.domains.values()), "the router needs both"
@@ -1411,6 +1411,105 @@ def test_stray_folders_are_found_when_the_books_folder_is_reached_through_a_syml
         link = Path(t) / "link"
         link.symlink_to(real.parent, target_is_directory=True)
         assert D.stray_folders(D.load(), {"id": "b"}, files, [link / "books"]) == {"sytem-design": 1}
+
+
+DOMAINS_FIXTURE = """# The Library's Domains.
+default: startup                       # the Domain of a Source that names none
+domains:
+  startup:
+    description: "Startups."           # keep this comment
+    risk_tier: medium
+  coding:
+    description: "Code."
+
+# a comment after the block stays after it
+ignore_folders: []   # sorting folders
+"""
+
+
+def test_adding_a_domain_appends_it_keeps_every_comment_and_validates_before_writing():
+    import yaml
+    from ytbrain import domains as D
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "domains.yaml"
+        f.write_text(DOMAINS_FIXTURE)
+        reg = D.add_domain("GTM", risk_tier="medium", description='Sales: "founder-led", outbound; pricing',
+                           examples=["How do I price: per seat or usage?"], freshness=1095, path=f)
+        assert reg.names == ["startup", "coding", "gtm"] and reg.get("gtm").half_life_days == 1095
+        assert reg.get("gtm").description == 'Sales: "founder-led", outbound; pricing'
+        assert reg.get("gtm").examples == ("How do I price: per seat or usage?",)
+        text = f.read_text()
+        for comment in ("# keep this comment", "# the Domain of a Source that names none",
+                        "# a comment after the block stays after it", "# sorting folders"):
+            assert comment in text, comment
+        assert text.index("gtm:") < text.index("# a comment after the block"), "inside `domains:`, not after it"
+        assert D.load(f).names == reg.names and yaml.safe_load(text)["ignore_folders"] == []
+        for bad, why in ((dict(name="gtm"), "already"), (dict(name="Legal/Advice"), "lowercase"),
+                         (dict(name="legal", description=" "), "description"),
+                         (dict(name="legal", risk_tier="extreme"), "risk tier")):
+            kw = {"risk_tier": "high", "description": "Law.", **bad}
+            before = f.read_text()
+            try:
+                D.add_domain(kw.pop("name"), path=f, **kw)
+                raise AssertionError(f"accepted {bad}")
+            except D.DomainConfigError as e:
+                assert why in str(e), (why, str(e))
+            assert f.read_text() == before, "a refused edit changes nothing"
+        missing = Path(t) / "none.yaml"
+        reg = D.add_domain("legal", risk_tier="high", description="Law for founders.", path=missing)
+        assert reg.names == ["startup", "legal"] and reg.get("legal").risk_tier == "high"
+
+
+def test_ignoring_a_folder_adds_it_once_whatever_the_list_style():
+    import yaml
+    from ytbrain import domains as D
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "domains.yaml"
+        f.write_text(DOMAINS_FIXTURE)
+        D.ignore_folder("to-read", path=f)
+        D.ignore_folder("To Read/", path=f)                     # the same folder: nothing added
+        assert yaml.safe_load(f.read_text())["ignore_folders"] == ["to-read"] and "# sorting folders" in f.read_text()
+        f.write_text(DOMAINS_FIXTURE.replace("ignore_folders: []   # sorting folders", "ignore_folders:\n  - old\n  - archive"))
+        D.ignore_folder("drafts", path=f)
+        assert yaml.safe_load(f.read_text())["ignore_folders"] == ["old", "archive", "drafts"]
+        f.write_text(DOMAINS_FIXTURE.replace("ignore_folders: []   # sorting folders\n", ""))
+        assert D.ignore_folder("misc", path=f).ignore_folders == ("misc",)
+
+
+def test_a_folders_capitals_and_spaces_never_make_its_books_miss_their_domain():
+    from ytbrain import domains as D
+    reg = D.parse({"domains": {"startup": {}, "gtm": {}, "system-design": {}}, "ignore_folders": ["To Read"]})
+    root = Path("/library/books")
+    assert D.folder_domain(root / "GTM" / "A.pdf", reg, [root]) == "gtm"
+    assert D.folder_domain(root / "System Design" / "B.pdf", reg, [root]) == "system-design"
+    assert D.folder_domain(root / "system_design" / "C.pdf", reg, [root]) == "system-design"
+    files = [root / "GTM" / "A.pdf", root / "to-read" / "D.pdf", root / "Legal" / "E.pdf"]
+    assert D.stray_folders(reg, {"id": "b"}, files, [root]) == {"Legal": 1}
+
+
+def test_the_domains_command_lists_adds_and_ignores():
+    import contextlib
+    import io
+    from ytbrain import cli
+    from ytbrain import domains as D
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "domains.yaml"
+        f.write_text(DOMAINS_FIXTURE)
+        real, D.DOMAINS_FILE = D.DOMAINS_FILE, f
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                assert cli.main(["domains", "add", "Legal", "--risk", "high", "--description", "Law for founders.",
+                                 "--example", "Do I need a lawyer to incorporate?"]) == 0
+                assert cli.main(["domains", "ignore", "to-read"]) == 0
+                assert cli.main(["domains"]) == 0
+            text = out.getvalue()
+            assert "added `legal` (high risk)" in text and "ytbrain index" in text
+            assert "legal" in text and "high" in text and "ignore_folders: to-read" in text, text
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                assert cli.main(["domains", "add", "legal", "--risk", "low", "--description", "x"]) == 2
+            assert "already" in err.getvalue()
+        finally:
+            D.DOMAINS_FILE = real
 
 
 def test_a_documents_domains_come_from_its_book_then_its_folder_then_its_source_then_the_default():

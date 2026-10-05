@@ -193,6 +193,24 @@ def domain_info(rows: list[dict], registry=None) -> dict:
     return out
 
 
+VOLATILE_META = ("built_at", "built_by", "content_sha256")
+
+
+def content_hash(rows: list[dict], matrix, meta: dict) -> str:
+    """sha256 of what a pack answers with: every item (in id order), every vector as stored, and the settings
+    (models, Domains, router, calibration), but not when or by which version it was built. Two builds of the same
+    items hash the same, unlike the file's own sha256 (SQLite bytes differ), so a coach eval can reuse its
+    results across a rebuild that changed nothing."""
+    import numpy as np
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(json.dumps([r.get(c) for c in P.COLUMNS], ensure_ascii=False, default=str).encode() + b"\n")
+    h.update(np.ascontiguousarray(matrix, dtype=np.dtype(DTYPE).newbyteorder("<")).tobytes())
+    h.update(json.dumps({k: v for k, v in meta.items() if k not in VOLATILE_META},
+                        sort_keys=True, ensure_ascii=False, default=str).encode())
+    return h.hexdigest()
+
+
 def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
                kinds: tuple[str, ...] = P.KINDS, batch: int = 64, say=print,
                source_info: dict | None = None, include_private: bool = False,
@@ -248,6 +266,7 @@ def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
     elif calibration:
         say(f"pack: ignoring the saved calibration (fitted for {calibration.get('embed_model')}, this pack "
             f"embeds with {embedder.name}); coverage stays provisional")
+    meta["content_sha256"] = content_hash(rows, matrix, meta)
     final = out_dir / P.PACK_FILE
     tmp = out_dir / f".{P.PACK_FILE}.tmp-{os.getpid()}"
     try:

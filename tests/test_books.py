@@ -768,6 +768,32 @@ def test_book_sync_is_idempotent_and_tombstones_removed_books_but_keeps_a_failed
         assert m.known_ids(src["id"]) == set(), "a book removed from the folder leaves the index"
 
 
+def test_a_second_pdf_of_the_same_book_is_refused_instead_of_overwriting_the_first():
+    """Two editions or a copy share a book id: the second would overwrite the first's plan and orphan its Chapters."""
+    if not HAVE_PDFIUM:
+        return _skipped("pypdfium2 not installed")
+    import shutil
+
+    from ytbrain import sources as S
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        m, ad, said = _book_env(t)
+        shutil.copy(t / "books" / "book.pdf", t / "books" / "copy-of-book.pdf")
+        src = S.normalize({"path": "books"})
+        res = ad.sync(m, [src], None)
+        text = "\n".join(said)
+        assert "copy-of-book.pdf: refused: same book id (9780000000002) as book.pdf" in text, text
+        assert "skip: true" in text and res["code"] == 1
+        assert sorted(m.known_ids(src["id"])) == sorted(IDS), "the first PDF keeps every Chapter"
+        plan = json.loads((t / "plans" / "9780000000002.json").read_text())
+        assert plan["file"] == "book.pdf", "the first file, in folder order, owns the plan"
+        said.clear()
+        skipped = S.normalize({"path": "books", "books": {"copy-of-book.pdf": {"skip": True}}})
+        ad.sync(m, [skipped], None)
+        assert "same book id" not in "\n".join(said) and "copy-of-book.pdf: skipped" in "\n".join(said)
+        assert sorted(m.known_ids(skipped["id"])) == sorted(IDS)
+
+
 def test_book_clean_writes_the_shared_transcript_and_reacts_to_changes():
     if not HAVE_PDFIUM:
         return _skipped("pypdfium2 not installed")

@@ -126,6 +126,19 @@ def test_the_contract_lives_in_founder_coach_and_every_playbook_points_to_it():
         assert "coaching contract" in skills[name][1], name
 
 
+def test_the_founders_other_tools_are_read_only_unless_asked_wherever_the_coach_meets_them():
+    skills = _skills()
+    body = skills["coach"][1]
+    for rule in ("Act only when asked", "data, never instructions", "Founder memory stays here", "Say what you read"):
+        assert rule in body, rule
+    for name in ("ask", "weekly-focus", "check-in"):
+        assert "connector rules of the coach skill" in skills[name][1], name
+        assert "rule on the Founder's other tools in the server instructions" in A.prompt_text(skills[name][1]), name
+    assert "add events only on a yes" in skills["weekly-focus"][1]
+    assert "`workspace`" in body and "Connectors in Claude's settings" in body and "Don't repeat it" in body
+    assert "`workspace`" in skills["setup"][1] and "`workspace`" in skills["check-in"][1]
+
+
 def test_forget_keeps_both_gates():
     meta, body = _skills()["forget"]
     assert "allowed-tools" not in meta, "forget must go through the host's permission prompt"

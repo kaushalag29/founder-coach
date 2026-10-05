@@ -3,7 +3,7 @@
     ytbrain ops            # = all: ingest, then eval when the index changed, then the plugin when it passed
     ytbrain ops ingest     # sync -> clean -> extract -> verify -> one retry of newly flagged -> index
     ytbrain ops eval       # questions top-up -> search -> judge -> gate -> baseline
-    ytbrain ops plugin     # packs -> assembled plugins -> validate -> coach eval (new builds only)
+    ytbrain ops plugin     # packs -> assembled plugins -> validate (`--coach`: then the coach eval, before a release)
 
 Every step is an existing `ytbrain` command run as a child process, so its output, its own resume
 and its own lock are unchanged. The runner adds three things:
@@ -12,8 +12,9 @@ and its own lock are unchanged. The runner adds three things:
     stopped run resumes at the first step not done (`--restart` starts over).
   - **Change detection.** Fingerprints of the index (every indexed Document's input), the labels and
     the plugin's inputs decide what is due: eval runs only when the index or labels changed since the
-    last eval, the plugin only when the index or the plugin's code changed, the coach eval only for a
-    new plugin build. Sources are always synced (that is how new talks, pages and books are found).
+    last eval, the plugin only when the index or the plugin's code changed. The coach eval runs only
+    with `--coach` (before a release), and then only the gates whose inputs changed (`eval coach` caches each
+    gate on what it depends on). Sources are always synced (that is how new talks, pages and books are found).
   - **Gates and a spend cap.** A FAIL or INCONCLUSIVE verdict stops before the plugin; a new
     baseline is saved only after a PASS. `--max-cost` caps the eval and coach-judge spend of this
     run (each paid child gets what is left). Extraction is billed by your LLM endpoint and isn't
@@ -25,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -40,12 +42,15 @@ CODE = Path(__file__).resolve().parents[1]          # the repo: scripts/, plugin
 STATE = DATA / "ops" / "state.json"
 LAST_RUN = DATA / "ops" / "last-run.md"
 VERSION_WAIT_S = 60
+DOMAIN_WAIT_S = 300                 # a new Domain needs a moment of thought (risk tier, description)
 COACH_ONLY = "the coach eval hasn't run on this build"
 OPS_LOCK = DATA / "ops" / "ops.lock"
 PLANS = ("all", "ingest", "eval", "plugin")
 BASELINE = "full"                                    # the configuration every change is gated on
 EXIT_FAIL, EXIT_STOPPED, EXIT_INCONCLUSIVE = 1, 2, 3
 NETWORK_RETRY_S = (60, 300)                         # a network stop is retried twice: after 1, then 5 minutes
+# a crash, not a request to stop: SIGINT/SIGTERM (Ctrl+C, kill) always stop the run
+CRASH_SIGNALS = tuple(int(s) for s in (signal.SIGABRT, signal.SIGSEGV, getattr(signal, "SIGBUS", signal.SIGSEGV)))
 DATED_KEEP = 10                                      # dated references kept (baseline-all-full-<date>.json)
 FIX = {"budget": "the spend cap is used up: re-run with a higher --max-cost",
        "endpoint": "the LLM endpoint refused (key, credits, model or quota in .env): fix it, then re-run",
@@ -54,7 +59,7 @@ FIX = {"budget": "the spend cap is used up: re-run with a higher --max-cost",
        "auth": "the Claude host is not signed in (its login expired): run `claude`, type /login, then re-run the same `ytbrain ops` command, which resumes at the coach eval",
        "interrupted": "interrupted: re-run to continue",
        "books": "a PDF was refused or failed to parse (see the sync output): fix or `skip: true` it, then re-run",
-       "config": "a configuration problem (see the warning above, e.g. a book folder that is not a declared Domain): fix it, then re-run",
+       "config": "a configuration problem (see the warning above). A book folder that is not a Domain: `ytbrain domains add NAME --risk ... --description ...` or `ytbrain domains ignore FOLDER` (ops asks when you're at the terminal), then re-run",
        "gate": "the regression gate: read the per-kind lines (`ytbrain eval rescore --config full --compare full`)",
        "unknown": "see the output above"}
 
@@ -65,7 +70,7 @@ class Options:
     max_cost: float = EVAL_MAX_COST
     max_extract: int = 0
     sync: bool = True
-    coach: bool = True
+    coach: bool = False             # the coach eval (paid in plan usage): asked for with --coach, before a release
     restart: bool = False
     force: bool = False
     dry_run: bool = False
@@ -81,6 +86,10 @@ class Step:
     paid: str | None = None         # the eval db spend key this step bills to (for --max-cost)
     run: Callable[[], int] | None = None    # in-process steps (bookkeeping, gates)
     note: str = ""
+    # (run start time) -> None when the step's output is complete and was written by this run, else why not.
+    # Asked only when the child dies on a crash signal: native libraries (ONNX, PyTorch) can abort while Python
+    # shuts down, after every file is written, and the output decides whether that was harmless.
+    check: Callable[[float], str | None] | None = None
 
 
 @dataclass
@@ -92,6 +101,7 @@ class Ops:
     state: dict = field(default_factory=dict)
     sleep: Callable[[float], None] = time.sleep
     ask: Callable[[str, float], str | None] | None = None    # (prompt, timeout) -> answer; None: no one there
+    stray: Callable[[], dict[str, int]] | None = None        # book folders that aren't Domains (tests fake it)
     last_reason: str = ""
     last_detail: str = ""
 
@@ -202,8 +212,17 @@ class Ops:
             [sys.executable, "-m", "ytbrain.cli", *argv]
         for attempt, wait in enumerate((*NETWORK_RETRY_S, None)):
             runstatus.clear()
+            started = time.time()
             code = self.call(argv if not step.script else ["script", *argv]) if self.call is not None \
                 else subprocess.call(cmd, cwd=str(CODE))
+            if code and step.check is not None and crash_signal(code):
+                why = step.check(started)
+                if why is None:
+                    self.say(f"ops: {step.name} crashed on exit ({crash_signal(code)}) after writing its output; "
+                             "the output verifies, so the run goes on")
+                    code = 0
+                else:
+                    self.say(f"ops: {step.name} crashed ({crash_signal(code)}) and its output doesn't verify: {why}")
             if code == 0:
                 self.last_reason = ""
                 return 0
@@ -330,12 +349,14 @@ class Ops:
         private = self.has_private()
         target = "dist/plugin-private" if private else "dist/plugin"
         steps = [Step("plugin:version", run=self.version, note="a new build gets a new version (Cowork updates on it)"),
-                 Step("plugin:pack", ["pack", "build", "--out", str(DATA / "pack")]),
+                 Step("plugin:pack", ["pack", "build", "--out", str(DATA / "pack")],
+                      check=lambda since: pack_written(DATA / "pack", since)),
                  Step("plugin:assemble", ["scripts/assemble_plugin.py", "--pack", str(DATA / "pack"), "--out",
                                           "dist/plugin", "--check", "--zip"], script=True)]
         if private:
             steps += [Step("plugin:pack-private", ["pack", "build", "--include-private", "--out",
-                                                    str(DATA / "pack-private")]),
+                                                    str(DATA / "pack-private")],
+                           check=lambda since: pack_written(DATA / "pack-private", since)),
                       Step("plugin:assemble-private", ["scripts/assemble_plugin.py", "--pack", str(DATA / "pack-private"),
                                                        "--out", "dist/plugin-private", "--check", "--zip"],
                            script=True)]
@@ -346,7 +367,7 @@ class Ops:
         steps.append(Step("plugin:record", run=lambda: self.record_plugin(target), note="remember this build"))
         if self.opts.coach:
             steps.append(Step("plugin:coach", run=lambda: self.coach(target),
-                              note=f"eval coach --plugin {target}, once per build"))
+                              note=f"eval coach --plugin {target}: only the gates whose inputs changed"))
         return steps
 
     def coverage(self, pack: Path) -> int:
@@ -372,6 +393,46 @@ class Ops:
         self.state["plugin"] = {"fp": self.plugin_fp(self.index_fp()), "build": _build_id(CODE / target),
                                 "path": target, "version": _release().current_version(CODE), "at": _now()}
         return 0
+
+    def declare_domains(self) -> bool:
+        """Sync stopped on book folders that aren't Domains: ask, folder by folder, to declare each one (a risk tier
+        and a one-line description, both required) or to ignore it as a sorting folder. True only when every
+        folder was settled; with no one at the terminal, or an empty answer, nothing changes and ops stops."""
+        from . import domains as D
+        try:
+            stray = (self.stray or _stray_book_folders)()
+        except Exception as e:                    # noqa: BLE001 -- a lookup failure must not hide the real stop
+            self.say(f"ops: could not list the book folders ({e})")
+            return False
+        if not stray:
+            return False
+        ask = self.ask or _ask_tty
+        for folder, n in stray.items():
+            name = D.folder_key(folder)
+            answer = ask(f"\nBook folder {folder}/ ({n} Book(s)) is not a declared Domain. Add `{name}` as a Domain "
+                         f"with risk tier [l]ow / [m]edium / [h]igh, [i]gnore it (it only sorts files), or Enter to "
+                         f"stop: ", DOMAIN_WAIT_S)
+            a = (answer or "").strip().lower()
+            if a in ("i", "ignore"):
+                D.ignore_folder(folder)
+                self.say(f"ops: {folder}/ added to ignore_folders")
+                continue
+            tier = {"l": "low", "low": "low", "m": "medium", "medium": "medium", "h": "high", "high": "high"}.get(a)
+            if tier is None:
+                if answer is None:
+                    self.say("ops: no answer: domains.yaml unchanged")
+                return False
+            desc = ask(f"One line: what is `{name}` about (the coach chooses Domains by it)? ", DOMAIN_WAIT_S)
+            if not (desc or "").strip():
+                self.say("ops: no description: domains.yaml unchanged for this folder")
+                return False
+            try:
+                D.add_domain(name, risk_tier=tier, description=desc.strip())
+            except D.DomainConfigError as e:
+                self.say(f"ops: {e}")
+                return False
+            self.say(f"ops: Domain `{name}` ({tier} risk) added to domains.yaml")
+        return True
 
     def version(self) -> int:
         """Ask for the new build's version: patch (default), minor or skip. With no one at the
@@ -508,6 +569,9 @@ class Ops:
                 if code and step.name == "ingest:sync" and self.last_reason == "network":
                     self.say("ops: sync kept failing on the network: continuing with what is already fetched")
                     code = 0
+                if code and step.name == "ingest:sync" and self.last_reason == "config" and self.declare_domains():
+                    self.say("ops: domains.yaml updated: syncing again")
+                    code = self.child(step)
                 if code and step.name == "ingest:sync" and self.last_reason == "books":
                     self.say(f"ops: {self.last_detail}: carrying on with the Books that did register "
                              "(see the sync output; `skip: true` in sources.yaml silences a PDF you don't want)")
@@ -531,12 +595,49 @@ class Ops:
                                   "spent": round(self.spent_total() - cur["spent_at_start"], 4)}
         self.save()
         ev, pl = self.state.get("eval") or {}, self.state.get("plugin") or {}
+        coach = self.state.get("coach") or {}
+        coach_note = ("" if self.opts.plan in ("ingest", "eval")
+                      else "; coach eval pending" if self.opts.coach and coach.get("pending")
+                      else "" if self.opts.coach
+                      else "; coach eval not run (`ytbrain ops plugin --coach` before a release)")
         summary = (f"eval {ev.get('verdict', 'not run')}; plugin {pl.get('version', '-')} ({pl.get('path', 'not built')})"
-                   + ("; coach eval pending" if (self.state.get("coach") or {}).get("pending") else "")
+                   + coach_note
                    + f"; eval spend ${self.state['last_run']['spent']:.3f}")
         self.say(f"\nops: {self.opts.plan} done: {summary}")
         self.notify(f"ytbrain ops {self.opts.plan} done", summary)
         return 0
+
+
+def crash_signal(code: int) -> str | None:
+    """The crash signal a child died on, as subprocess reports it (-6) or a shell does (134), else None."""
+    n = -code if code < 0 else code - 128 if code > 128 else 0
+    if n in CRASH_SIGNALS:
+        try:
+            return signal.Signals(n).name
+        except ValueError:
+            return f"signal {n}"
+    return None
+
+
+def pack_written(out: Path, since: float) -> str | None:
+    """None when `out` holds a Knowledge pack whose manifest was written at or after `since` and whose file
+    matches the manifest's sha256, else why not. `pack build` swaps the file, then its manifest (via
+    pack.json.next), so a fresh pack.json with no .next left over means both swaps happened."""
+    from founder_coach import pack as P
+    db, manifest = out / P.PACK_FILE, out / P.MANIFEST_FILE
+    try:
+        if manifest.stat().st_mtime < since - 1:          # 1 s: coarse file-system clocks
+            return f"{manifest} is older than this run: the build never got that far"
+        want = json.loads(manifest.read_text(encoding="utf-8")).get("sha256")
+    except (OSError, ValueError, AttributeError) as e:
+        return f"{manifest} is missing or unreadable ({e})"
+    if manifest.with_name(P.MANIFEST_FILE + ".next").exists():
+        return "the build stopped between writing the pack and its manifest"
+    try:
+        got = P.sha256_file(db)
+    except OSError as e:
+        return f"{db} is missing or unreadable ({e})"
+    return None if want and got == want else f"{db.name} doesn't match the sha256 in {manifest.name}"
 
 
 def _pending_extract() -> int:
@@ -563,6 +664,11 @@ def _release():
 def _bump(version: str, part: str) -> str:
     major, minor, patch = (int(x) for x in version.split(".")[:3])
     return f"{major}.{minor + 1}.0" if part == "minor" else f"{major}.{minor}.{patch + 1}"
+
+
+def _stray_book_folders() -> dict[str, int]:
+    from .books.adapter import stray_book_folders
+    return stray_book_folders()
 
 
 def _ask_tty(question: str, timeout: float) -> str | None:

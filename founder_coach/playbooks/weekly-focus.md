@@ -10,7 +10,7 @@ Follow the coaching contract in the server instructions throughout.
 3. **Find what matters.** For the most important Goal, run `coach_search` for what YC advises at this Stage. Use the last Check-in's blockers as queries too. With several Goals, or none, pick from the Stage and what the Founder just said, and name that assumption in the proposal.
 4. **Propose up to 3 Commitments,** fewer if this week already has open ones. Each:
    - **action**: one concrete thing ("Call 10 design-partner leads").
-   - **cue**: when/if it happens ("Tuesday and Thursday 9-11am, before email").
+   - **cue**: when/if it happens ("Tuesday and Thursday 9-11am, before email"). When you can read the Founder's calendar, pick a cue from time that is really free this week and say so; follow the rule on the Founder's other tools in the server instructions. Booking the time is the Founder's call: offer it, and add events only on a yes.
    - **outcome**: measurable ("3 pilots with a price agreed").
    - **why**: one line with a Citation; pass its item_ids as the Commitment's `citations`.
    - linked `goal_id` when it serves a Goal.

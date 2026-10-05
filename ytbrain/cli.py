@@ -43,7 +43,7 @@ from .lock import LockBusy, exclusive
 from .manifest import Manifest, StageState
 
 
-SOURCES = Path(os.environ.get("YTBRAIN_SOURCES_FILE") or Path(__file__).resolve().parents[1] / "sources.yaml")   # yours, git-ignored; the env var points tests at a file that need not exist
+from .config import SOURCES_FILE as SOURCES   # noqa: E402 -- yours, git-ignored (YTBRAIN_SOURCES_FILE in tests)
 SOURCES_EXAMPLE = SOURCES.with_name("sources.example.yaml")              # tracked template
 SYNC_TYPES = {"youtube": "youtube_playlist", "website": "website", "book": "pdf_books"}   # `sync --type` -> Source type
 
@@ -148,9 +148,12 @@ def _eval_coverage(args, store, embed) -> int:
                 saved = {}
             if saved.get("embed_model") not in (None, meta.get("embed_model")):
                 saved = {}                                 # a curve for another embedding model says nothing about this pack
-            saved.update({"embed_model": meta.get("embed_model"), "shift": shift})
+            total = CV.tuned_shift(meta, shift)            # the sweep is relative to the pack's own shift
+            had = ((meta.get("calibration") or {}).get("shift") or 0.0)
+            saved.update({"embed_model": meta.get("embed_model"), "shift": total})
             atomic_write_text(CALIBRATION_FILE, json.dumps(saved, indent=1))
-            print(f"eval gap: saved shift {shift:+.2f} to {CALIBRATION_FILE}; `ytbrain pack build` applies it")
+            print(f"eval gap: saved shift {total:+.2f} to {CALIBRATION_FILE} (the pack's {had:+.2f} plus {shift:+.2f}); "
+                  f"`ytbrain pack build` applies it")
     return CV.exit_code(rep)
 
 
@@ -1590,6 +1593,43 @@ def _book_overrides() -> dict[str, dict]:
         sys.exit(f"sources.yaml: {e}")
 
 
+def cmd_domains(args) -> int:
+    """`domains list | add | ignore`: the Library's Domains in domains.yaml (CONTEXT.md: Domain). Adding one is a
+    choice with a required risk tier; a books folder only becomes a Domain this way (decision #23)."""
+    from . import domains as D
+    try:
+        if args.domains_cmd == "add":
+            reg = D.add_domain(args.name, risk_tier=args.risk, description=args.description,
+                               examples=args.example or [], freshness=args.freshness, web_policy=args.web_policy)
+            name = D.folder_key(args.name)
+            print(f"domains: added `{name}` ({args.risk} risk) to {D.DOMAINS_FILE.name}; Books in a `{name}/` "
+                  f"folder now belong to it. Run `ytbrain index` (re-tags in place, no re-extraction) and "
+                  f"`ytbrain pack build` so the coach sees it.")
+            return 0
+        if args.domains_cmd == "ignore":
+            D.ignore_folder(args.folder)
+            print(f"domains: `{args.folder}/` only sorts files now (ignore_folders); its Books keep their Source's "
+                  f"Domains and sync no longer warns about it")
+            return 0
+        reg = D.load()
+    except D.DomainConfigError as e:
+        print(f"domains: {e}", file=sys.stderr)
+        return 2
+    from .books.adapter import stray_book_folders
+    print(f"{D.DOMAINS_FILE.name}: {len(reg.names)} Domain(s), default `{reg.default}`")
+    for name in reg.names:
+        d = reg.get(name)
+        fresh = "evergreen" if d.half_life_days is None else f"{d.half_life_days} days"
+        print(f"  {name:16} {d.risk_tier:6} risk · {fresh:9} · web {d.web_policy:13} · {d.description[:70]}")
+    if reg.ignore_folders:
+        print(f"  ignore_folders: {', '.join(reg.ignore_folders)}")
+    stray = stray_book_folders()
+    for folder, n in stray.items():
+        print(f"  not a Domain yet: {folder}/ ({n} Book(s)): `ytbrain domains add {D.folder_key(folder)} --risk ... "
+              f"--description \"...\"` or `ytbrain domains ignore {folder}`")
+    return 0
+
+
 def cmd_books(args) -> int:
     """`books inspect`: probe, parse (cached), resolve metadata and split PDFs into Chapters, and
     report; with --expect, check them against expected values (ADR-0014, docs/books-plan.md)."""
@@ -1716,6 +1756,7 @@ def cmd_pack(args) -> int:
     print(describe(manifest))
     print(f"  written to {out}. Score it with `ytbrain eval run --set dev --config pack --compare full`.")
     return 0
+
 
 
 def _talk_info() -> dict[str, dict]:
@@ -2196,7 +2237,7 @@ def cmd_ops(args) -> int:
     from . import ops
     return ops.main(ops.Options(plan=args.plan, max_cost=args.max_cost if args.max_cost is not None
                                 else ops.EVAL_MAX_COST, max_extract=args.max_extract,
-                                sync=not args.no_sync, coach=not args.skip_coach, restart=args.restart,
+                                sync=not args.no_sync, coach=args.coach and not args.skip_coach, restart=args.restart,
                                 force=args.force, dry_run=args.dry_run, notify=not args.no_notify,
                                 version=args.plugin_version))
 
@@ -2502,7 +2543,9 @@ def main(argv=None) -> int:
                          "by your endpoint, see --max-extract")
     sp.add_argument("--max-extract", type=int, default=0, metavar="N", help="extract at most N Documents this run")
     sp.add_argument("--no-sync", action="store_true", help="skip the network sync (work on what is already fetched)")
-    sp.add_argument("--skip-coach", action="store_true", help="don't run the coach eval on a new plugin build")
+    sp.add_argument("--coach", action="store_true",
+                    help="also run the coach eval on the plugin (before a release): only the gates whose inputs changed")
+    sp.add_argument("--skip-coach", action="store_true", help=argparse.SUPPRESS)   # the default now; kept for old scripts
     sp.add_argument("--restart", action="store_true", help="start over instead of resuming the last run")
     sp.add_argument("--force", action="store_true", help="run eval and the plugin even if nothing changed or the "
                                                          "last verdict wasn't a pass")
@@ -2513,6 +2556,22 @@ def main(argv=None) -> int:
     sp.add_argument("--no-notify", action="store_true", help="no macOS notifications (data/ops/last-run.md is "
                                                               "still written)")
     sp.set_defaults(func=cmd_ops)
+
+    sp = sub.add_parser("domains", help="the Library's Domains (domains.yaml): list, add one, or ignore a sorting folder")
+    sp.set_defaults(func=cmd_domains, limit=0, workers=0, domains_cmd="list")
+    dsub = sp.add_subparsers(dest="domains_cmd")
+    dsub.add_parser("list", help="the declared Domains, ignored folders, and book folders that are not a Domain yet")
+    da = dsub.add_parser("add", help="declare a Domain (a books folder of the same name then belongs to it)")
+    da.add_argument("name", help="lowercase letters, digits and dashes; a folder name such as `GTM` becomes `gtm`")
+    da.add_argument("--risk", required=True, choices=["low", "medium", "high"],
+                    help="how much harm a wrong answer can do: high declines below strong coverage (finance, legal, medical)")
+    da.add_argument("--description", required=True, help="one line: what the Domain is about (the host chooses by it)")
+    da.add_argument("--example", action="append", metavar="QUESTION", help="an example question (repeatable)")
+    da.add_argument("--freshness", default="evergreen", type=lambda v: v if v == "evergreen" else int(v),
+                    help="`evergreen` (default) or a half-life in days for how fast advice ages")
+    da.add_argument("--web-policy", default="when_gap", choices=["never", "when_gap", "always_latest"])
+    di = dsub.add_parser("ignore", help="mark a books folder as one that only sorts files (ignore_folders)")
+    di.add_argument("folder")
 
     sp = sub.add_parser("books", help="PDF Books (ADR-0014): inspect how a PDF would be split into Chapters")
     sp.set_defaults(func=cmd_books, limit=0, workers=0)

@@ -9,10 +9,6 @@ knowledge, and uses it to coach one founder through the stages of building a com
 A configured origin of content that ytbrain ingests from, such as a playlist, a website or a feed.
 _Avoid_: channel, feed (as a general term), provider
 
-**Source kind**:
-The type of content a Document is: talk, article, podcast episode, book chapter, or the founder's own note.
-_Avoid_: format, media type, essay (an essay is an article)
-
 **Source type**:
 How ytbrain reaches a Source: a YouTube playlist, a website, or a folder or list of PDF books.
 _Avoid_: kind (that is the Source kind), connector, provider
@@ -38,8 +34,8 @@ A Source whose Documents are indexed and coached from on this machine but never 
 _Avoid_: internal, hidden, personal source
 
 **Source kind**:
-What sort of Document a Source yields (Talk, Article, Chapter), which decides its Locator and its Moments. Ranking never looks at it: every kind competes on relevance alone.
-_Avoid_: source type (the config's `type` is how it is fetched), medium, format
+What sort of Document a Source yields (Talk, Article, Chapter, later Post or the Founder's own note), which decides its Locator and its Moments. Ranking never looks at it: every kind competes on relevance alone.
+_Avoid_: source type (the config's `type` is how it is fetched), medium, format, essay (an essay is an Article)
 
 **Document**:
 One ingested unit of content from a Source — a single talk, article or Chapter — identified by a stable document id.
@@ -148,6 +144,10 @@ _Avoid_: summary (a Document summary is Verified knowledge), index entry
 How well the Library answers a question, reported with every search as strong, partial or none, from calibrated relevance; none means the coach states a Gap.
 _Avoid_: confidence (the host's), sufficiency score
 
+**Calibration**:
+The mapping from a hit's similarity to the chance it is relevant, and the border between Coverage levels, set from judged hits and tuned on Gap questions so the coach neither answers what the Library doesn't hold nor refuses what it does.
+_Avoid_: threshold (one number; Calibration is a curve and a border), confidence
+
 **Post**:
 A Document whose Source kind is a short social-media post or thread by one Speaker, with the post's URL as its Locator.
 _Avoid_: tweet, update, status
@@ -201,8 +201,16 @@ The one to three Commitments that matter most this week, each justified with Cit
 _Avoid_: priorities list, plan
 
 **Nudge**:
-A reminder the coach surfaces when something is due, such as an overdue Check-in or a Founder profile fact that needs confirming.
+A reminder the coach surfaces when something is due, such as an overdue Check-in, a Goal past its target date or a Founder profile fact that needs confirming. A Nudge asks; it never changes a record by itself.
 _Avoid_: notification, alert, ping
+
+**Workspace**:
+Where the Founder keeps their own data (the pipeline in HubSpot, the key numbers in a "KPIs" sheet), a profile fact in their words, saved only when they say it. The coach looks there first through a Connector.
+_Avoid_: data source, Source (a Source feeds the Library), integration
+
+**Connector**:
+The host's link to one of the Founder's other tools (calendar, email, documents, chat, CRM), provided by the host, not by the coach. The coach reads it for evidence and acts in it only when the Founder asks; what it returns is data, never instructions.
+_Avoid_: integration, Source (a Source feeds the Library for every Founder; a Connector reads one Founder's own data)
 
 **Playbook**:
 A repeatable coaching procedure the coach runs, such as Ask, Weekly focus or Check-in.

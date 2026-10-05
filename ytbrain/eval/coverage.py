@@ -142,6 +142,18 @@ def meets(r: dict) -> bool:
             r["wrongful_refusals"] is not None and r["wrongful_refusals"] <= MAX_WRONGFUL_REFUSALS)
 
 
+MAX_SHIFT = 0.3                  # founder_coach.coverage.Calibration.from_meta ignores a larger one
+
+
+def tuned_shift(meta: dict | None, recommended: float) -> float:
+    """The shift to save so the next pack lands on the border the sweep recommended. The sweep moves the border
+    from where the pack *already is*, and the pack carries the shift it was built with, so the new value is that
+    one plus the recommendation (saving the recommendation alone would undo the shift the pack has)."""
+    base = ((meta or {}).get("calibration") or {}).get("shift")
+    base = float(base) if isinstance(base, (int, float)) and not isinstance(base, bool) else 0.0
+    return round(max(-MAX_SHIFT, min(MAX_SHIFT, base + recommended)), 4)
+
+
 def recommend(sweep: dict[float, dict]) -> float | None:
     """Of the shifts meeting both targets, the one refusing the fewest answerable questions: a refusal is a hard
     failure, a `partial` on a Gap question is hedged by the host (plan decision #25). Ties: fewer wrongful answers,

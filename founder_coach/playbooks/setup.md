@@ -12,7 +12,8 @@ Follow the coaching contract in the server instructions: show what you'll save a
    - Stage: offer the eight values from the Stage list in coach_update_profile and let them pick (`stage`);
    - team size (`team_size`) and the one or two numbers that matter now (`key_metrics`);
    - time zone: propose the one `coach_get_context` reports and let them correct it (`timezone`, an IANA name like `Asia/Kolkata`);
-   - preferred Check-in day (`checkin_day`, e.g. `friday`).
+   - preferred Check-in day (`checkin_day`, e.g. `friday`);
+   - optional, one question: where their pipeline, key numbers and investor updates live (`workspace`, e.g. `{"pipeline": "HubSpot", "metrics": "Google Sheet 'KPIs'"}`), so Check-ins can look there. Skip it if they'd rather not say.
 3. **Save the profile.** Show the values, get a yes, then one `coach_update_profile` call. If the Founder already asked you to save and dictated the values, that is the yes: save exactly those, then show them, and ask about any field they left out.
 4. **One Goal.** Ask for the outcome that matters most over the next 4-8 weeks, with a measure and a target date. Confirm, then `coach_record` kind `goal`.
 5. **Models.** The coach downloads its search models (about 0.2 GB, once) by itself in the background when it starts, so there is nothing the Founder must run: search uses keyword matches until the download ends, then switches to semantic on its own. Say that in one sentence; `coach_corpus_status` shows `search_mode` if they want to check. Run `founder-coach warmup` with Bash only to show download progress, and only when Bash can reach that folder. If it can't (a sandboxed shell, as in Cowork), skip it; never hand the Founder a command containing a temporary plugin path.

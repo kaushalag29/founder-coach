@@ -13,6 +13,8 @@ ytbrain ops --dry-run       # what is due
 
 ## Tests (run after any change)
 
+The whole system, end to end, cheapest level first: [docs/testing.md](docs/testing.md). The offline suites:
+
 ```bash
 for t in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
 ```

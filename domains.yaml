@@ -21,6 +21,15 @@ domains:
     risk_tier: medium
     freshness: evergreen
     web_policy: when_gap
+  gtm:
+    description: "Go-to-market: finding and reaching customers, sales (founder-led, outbound, enterprise), marketing, positioning, pricing, launches, distribution and growth channels."
+    examples:
+      - How do I run founder-led sales for my first enterprise customers?
+      - How should I position us against a bigger competitor?
+      - What pricing model fits a B2B SaaS product at seed?
+    risk_tier: medium
+    freshness: 1095
+    web_policy: when_gap
   leadership:
     description: "Leading and managing people and organizations: management, culture, feedback, hiring and firing, strategy, decision making."
     examples:

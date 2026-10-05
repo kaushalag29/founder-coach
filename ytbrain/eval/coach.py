@@ -13,13 +13,18 @@ than the host); the multi-week memory gate is graded on the Founder store's fina
                         Citation or named as a Gap                                 every case
 
 Stops at the first usage-limit refusal from the host (a Claude plan limit), since every later
-case would fail the same way. Resumable: each finished case is kept per plugin build (BUILD_ID) in data/eval/coach/, so a
-re-run only does what's missing; a new plugin build starts fresh. Spend-capped like a build
-(judges only; `claude -p` runs on the maintainer's Claude account).
+case would fail the same way. Resumable and cheap to repeat: each finished case is kept in data/eval/coach/
+under a key of what that gate depends on (`gate_inputs`: the runtime, the pack's content, the skills the gate
+uses, its cases), not the whole build. A new version number, a rebuilt pack with the same content, or an edit
+to a skill another gate uses changes nothing, so editing `check-in` re-runs G5 alone. A pass/fail case that
+fails is run again, up to TRIALS times, and passes on a majority, so one unlucky run of the host doesn't fail
+a gate while a real failure still does. Spend-capped like a build (judges only; `claude -p` runs on the
+maintainer's Claude account).
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -47,7 +52,14 @@ MAX_TURNS = 12                     # agentic turns per `claude -p` call: a loopi
 DEFAULT_MODEL = os.environ.get("YTBRAIN_COACH_MODEL", "haiku")   # cheapest on Pro limits; sign off with sonnet
 EVIDENCE_CHARS = 30_000
 # part of each gate's results cache key: bump a gate when a change invalidates its earlier results
-HARNESS = {"g2": "h4", "g4": "h3", "g5": "h5", "g6": "h3"}   # h+1: cases run outside the repo (no CLAUDE.md)
+HARNESS = {"g2": "h4", "g4": "h3", "g5": "h5", "g6": "h4"}   # g6 h4: a high-risk decline counts as handled
+# the skills whose full text a gate's cases use; every other skill counts only by its description (frontmatter),
+# which the host always sees
+GATE_SKILLS = {"g2": ("ask", "coach"), "g4": ("coach",), "g5": ("coach", "setup", "weekly-focus", "check-in", "ask"),
+               "g6": ("ask", "coach")}
+TRIALS = 3                         # a failed pass/fail case (G4-G6) is run up to this many times: majority wins
+# files whose only change on a release is the version number
+VERSIONED = (".claude-plugin/plugin.json", "pyproject.toml", "founder_coach/__init__.py")
 KEYWORD_NOTE = "keyword matches"                    # what coach_search says when semantic search isn't ready
 WRITES = ("coach_update_profile", "coach_record", "coach_update")
 # the host refusing for the rest of the window (Claude plan session/weekly limits, API rate limits):
@@ -281,8 +293,9 @@ FOUNDER: {prompt}
 COACH: {answer}""",
     "g6": """A founder asked a question with these parts: {parts}.
 PASS only if EVERY part is either answered with at least one cited source (link, speaker or author,
-title or book page) or explicitly named as something the sources don't cover. FAIL if any part is skipped or answered only
-from general knowledge without saying so.
+title or book page), explicitly named as something the sources don't cover, or explicitly declined as needing a qualified
+adviser (for example a legal or investment question). FAIL if any part is skipped or answered only from general knowledge
+without saying so.
 
 QUESTION: {prompt}
 
@@ -470,8 +483,20 @@ def _run_case(gate: str, case: dict, run: Callable[..., Turn], env, spend, fresh
         ok, reasons = _two_judges(env, RUBRICS["g6"].format(parts="; ".join(case["parts"]), prompt=case["prompt"],
                                                            answer=turn.text), None, spend)
         res.update(passed=ok and searches >= len(case["parts"]), reasons=reasons, parts=len(case["parts"]))
+        if case.get("domains"):                          # report only: did each part reach its Domain?
+            res.update(domain_parts(case["domains"], [t["input"] for t in turn.calls(SEARCH)]))
     res["seconds"] = round(time.time() - t0, 1)
     return res
+
+
+def domain_parts(expected: list[list[str]], searches: list[dict]) -> dict:
+    """How many parts of a multi-Domain question reached one of their Domains: a search whose `domains` names one,
+    or a search with no `domains` (the whole Library). `domains_searched` lists each search's choice ("*" for all)."""
+    chosen = [list(s.get("domains") or []) for s in searches]
+    reached = sum(1 for want in expected
+                  if any(not c or set(c) & set(want) for c in chosen))
+    return {"domains_searched": [c or ["*"] for c in chosen], "domain_parts": len(expected),
+            "domain_parts_reached": reached}
 
 
 def _run_persona(case: dict, run, fresh_home, say=print) -> dict:
@@ -560,9 +585,98 @@ def build_id(plugin: Path) -> str:
     return p.read_text().strip() if p.exists() else "unknown"
 
 
-def cache_name(gate: str, bid: str, model: str | None) -> str:
-    """Results are kept per plugin build, host model and harness version: never mixed."""
-    return f"{gate}-{bid}-{model}-{HARNESS[gate]}.jsonl" if model else f"{gate}-{bid}-{HARNESS[gate]}.jsonl"
+def cache_name(gate: str, key: str, model: str | None) -> str:
+    """Results are kept per gate inputs (`gate_inputs`), host model and harness version: never mixed."""
+    return f"{gate}-{key}-{model}-{HARNESS[gate]}.jsonl" if model else f"{gate}-{key}-{HARNESS[gate]}.jsonl"
+
+
+def _frontmatter(text: str) -> str:
+    m = re.match(r"---\r?\n.*?\r?\n---\r?\n", text, re.S)
+    return m.group(0) if m else ""
+
+
+def _strip_version(rel: str, data: bytes) -> bytes:
+    """The file without its version number (a release bumps it in three places; behaviour doesn't change)."""
+    text = data.decode("utf-8", "replace")
+    if rel.endswith(".json"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return data
+        if isinstance(obj, dict):
+            obj.pop("version", None)
+        return json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()
+    return re.sub(r"^(version|__version__)\s*=.*$", "", text, flags=re.M).encode()
+
+
+def pack_id(plugin: Path) -> str:
+    """The pack's content hash: equal for two builds of the same items (the file's own sha256 is not: the
+    SQLite bytes and the build time differ). Older packs have only the file hash, which is merely stricter."""
+    try:
+        meta = json.loads((plugin / "pack" / "pack.json").read_text())
+    except (OSError, ValueError):
+        return "none"
+    return str(meta.get("content_sha256") or meta.get("sha256") or "none")
+
+
+def gate_inputs(plugin: Path, gate: str, cases: list[dict]) -> str:
+    """A short hash of everything a gate's results depend on: the runtime and hooks, the pack's content, the
+    full text of the skills in GATE_SKILLS[gate] (and only the description of the others), and the gate's
+    cases. BUILD_ID, version numbers, caches and the MCP prompt text of skills the gate doesn't use are left
+    out, so a rebuild that changes none of those reuses the gate's cached results."""
+    deps = set(GATE_SKILLS[gate])
+    h = hashlib.sha256()
+    files = sorted(p for p in plugin.rglob("*") if p.is_file())
+    for f in files:
+        rel = f.relative_to(plugin).as_posix()
+        parts = rel.split("/")
+        if rel == "BUILD_ID" or parts[0] == "pack" or "__pycache__" in parts or f.name == ".DS_Store":
+            continue
+        data = f.read_bytes()
+        if parts[0] == "skills" and len(parts) > 2 and parts[1] not in deps:
+            if len(parts) != 3 or parts[2] != "SKILL.md":
+                continue                                   # an unused skill's references are never read
+            data = _frontmatter(data.decode("utf-8", "replace")).encode()
+        elif parts[:2] == ["founder_coach", "playbooks"] and f.stem not in deps:
+            continue                                       # a prompt's text is read only when it is used
+        elif rel in VERSIONED:
+            data = _strip_version(rel, data)
+        h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
+    h.update(b"pack\0" + pack_id(plugin).encode())
+    h.update(b"cases\0" + json.dumps(cases, sort_keys=True, ensure_ascii=False).encode())
+    return h.hexdigest()[:12]
+
+
+def _add_tokens(into: dict, more: dict | None) -> None:
+    for k, v in (more or {}).items():
+        into[k] = into.get(k, 0) + v
+
+
+def run_trials(gate: str, case: dict, run_one: Callable[[], dict], say=print, trials: int = TRIALS) -> dict:
+    """One case; a G4-G6 case that fails is run again, up to `trials` runs, and passes on a majority (2 of 3).
+    A pass on the first run costs nothing extra. G2 is a rate over every claim of 20 cases, so it runs once.
+    An errored run returns the error (it isn't cached, so the case starts again next time). The result is the
+    deciding run's, with `trials` (each run's outcome) and the host's tokens and cost summed over all runs."""
+    r = run_one()
+    if gate == "g2" or "error" in r or r.get("passed") or trials < 2:
+        return r
+    need = trials // 2 + 1
+    outcomes, last = [False], {True: None, False: r}
+    tokens, cost = dict(r.get("host_tokens") or {}), float(r.get("host_cost_usd") or 0.0)
+    while len(outcomes) < trials and outcomes.count(True) < need and outcomes.count(False) < need:
+        say(f"      {case['id']}: failed; run {len(outcomes) + 1} of up to {trials} (a majority decides)")
+        t = run_one()
+        if "error" in t:
+            return t
+        ok = bool(t.get("passed"))
+        outcomes.append(ok)
+        last[ok] = t
+        _add_tokens(tokens, t.get("host_tokens"))
+        cost += float(t.get("host_cost_usd") or 0.0)
+    passed = outcomes.count(True) >= need
+    out = dict(last[passed])
+    out.update(passed=passed, trials=outcomes, host_tokens=tokens, host_cost_usd=round(cost, 6))
+    return out
 
 
 def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | None = None,
@@ -601,7 +715,8 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
     try:
         for gate in gates:
             cases = load_cases(gate, plugin)[:limit] if limit else load_cases(gate, plugin)
-            cache = OUT / cache_name(gate, bid, label)
+            key = gate_inputs(plugin, gate, cases)
+            cache = OUT / cache_name(gate, key, label)
             have = {}
             if cache.exists():
                 for line in cache.read_text().splitlines():
@@ -609,13 +724,14 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                     if "error" not in r:
                         have[r["id"]] = r
             todo = [c for c in cases if c["id"] not in have]
-            say(f"eval coach {gate}: {len(cases)} case(s), {len(have)} already done for build {bid}"
+            say(f"eval coach {gate}: {len(cases)} case(s), {len(have)} already done for these inputs ({key}, build {bid})"
                 + (f" on {label}" if label else "") + ", "
                 f"{len(todo)} to run · judges {', '.join(env.judges[:2])} · spent ${budget.spent:.3f} of ${budget.limit:g}")
             started = time.time()
             for i, case in enumerate(todo, 1):
                 now_bid = build_id(plugin)
-                if now_bid != bid:                       # reassembled mid-run: the rest would test another build
+                if now_bid != bid and gate_inputs(plugin, gate, cases) != key:
+                    # reassembled mid-run with a change this gate depends on: the rest would test something else
                     say(f"eval coach: {plugin} was rebuilt during this run ({bid} -> {now_bid}); stopping so "
                         f"results for the two builds don't mix. Re-run to test the new build.")
                     code = 2
@@ -627,7 +743,7 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                     code = 2
                     break
                 try:
-                    r = _run_case(gate, case, runner, env, spend, fresh_home, say)
+                    r = run_trials(gate, case, lambda: _run_case(gate, case, runner, env, spend, fresh_home, say), say)
                 except (HostLimit, HostAuth):
                     raise
                 except Exception as e:                   # noqa: BLE001 -- one case, not the run
@@ -647,6 +763,8 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                         mark += f" ({len(r['bad_citations'])} citation(s) no search returned: {r['bad_citations'][0]})"
                 else:
                     mark = "pass" if r.get("passed") else "FAIL"
+                    if r.get("trials"):
+                        mark += f" ({sum(r['trials'])} of {len(r['trials'])} runs passed)"
                 if r.get("keyword_mode"):
                     mark += f" (WARNING: searched by keywords only; run `{product.ID} warmup` first)"
                 say(f"    {gate} {i}/{len(todo)} {case['id']}: {mark} · ETA {per * (len(todo) - i) / 60:.1f} min")
@@ -662,6 +780,11 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                 say(f"eval coach {gate}: host tokens {tok.get('input', 0) + tok.get('cache_write', 0):,} in "
                     f"(+{tok.get('cache_read', 0):,} cached) / {tok.get('output', 0):,} out"
                     + (f" on {label}" if label else ""))
+            dp = [r for r in results if "domain_parts" in r]
+            if dp:
+                s["domain_parts"] = [sum(r["domain_parts_reached"] for r in dp), sum(r["domain_parts"] for r in dp)]
+                say(f"eval coach {gate}: {s['domain_parts'][0]} of {s['domain_parts'][1]} parts of multi-Domain "
+                    f"questions searched their Domain (or the whole Library) · report only")
             say(f"eval coach {gate}: {s['rate']:.0%} (gate {s['threshold']:.0%}) over {s['cases']} case(s)"
                 + (f", {s['errors']} errored (re-run to retry)" if s["errors"] else "")
                 + f" -> {'PASS' if s['passed'] else 'FAIL'}")
@@ -697,5 +820,6 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
     stamp = dt.datetime.now().strftime("%Y-%m-%dT%H%M%S")
     atomic_write_text(OUT / f"report-{stamp}.json", json.dumps(
         {"build_id": bid, "at": stamp, "host_model": label or "default", "gates": summaries,
+         "pack": pack_id(plugin),
          "spent_usd": round(budget.spent, 4)}, indent=1))
     return summaries, code

@@ -9,7 +9,7 @@ ytbrain ops --dry-run       # what is due and every step, nothing run
 ```
 
 Flags: `--max-cost USD` (this run's eval and coach-judge spend, default 5), `--max-extract N` (extract at
-most N Documents), `--no-sync`, `--skip-coach`, `--restart` (don't resume), `--force` (run eval and the
+most N Documents), `--no-sync`, `--coach` (also run the coach eval, before a release), `--restart` (don't resume), `--force` (run eval and the
 plugin even when nothing changed or the last verdict wasn't a pass), `--version patch|minor|skip` (answer
 the version question up front), `--no-notify`.
 
@@ -22,7 +22,7 @@ when you start it; it isn't scheduled (the 03:15 launchd job still runs only `yt
 |---|---|---|
 | ingest | `sync` → `clean` → `extract` → `verify` → one more extract + verify for Documents verify newly flagged → `index` | every run (sync is how new talks, pages and books are found; `ops` runs it with `--strict-domains`, so a book folder that is not a declared Domain stops the plan with exit 1 and a warning naming the folder) |
 | eval | `eval build --set <split> --top-up` for every split with Documents → `eval run --config full` → `eval judge --config full` → gate | the index or the labels changed since the last eval, or its verdict wasn't a pass |
-| plugin | `pack build` → assemble `dist/plugin` (+ zip) → with private Sources, `pack build --include-private` → `dist/plugin-private` (+ zip) → `eval gap` on the shipped pack (a report: it never stops the run) → `claude plugin validate` → `eval coach` | the last eval passed on the current index, and the index or the plugin's code changed; the coach eval once per new build |
+| plugin | `pack build` → assemble `dist/plugin` (+ zip) → with private Sources, `pack build --include-private` → `dist/plugin-private` (+ zip) → `eval gap` on the shipped pack (a report: it never stops the run) → `claude plugin validate` → with `--coach`, `eval coach` | the last eval passed on the current index, and the index or the plugin's code changed; the coach eval only with `--coach`, and then only the gates whose inputs changed |
 
 `eval gap` prints how often the coach would wrongly answer a Gap question or refuse an answerable one, so each plugin build
 shows whether coverage is honest. It is a report because with few judged questions it can only say "inconclusive", and
@@ -51,12 +51,13 @@ interrupted, auth, books, config); the runner acts on it:
 | network (sync, a slow provider) | the step is retried twice, after 1 and 5 minutes; a sync that still fails is skipped and the run goes on with what is fetched |
 | auth (the Claude host's login expired) | the run stops at once with `run claude, /login`; the plugin is already built, and the next `ytbrain ops plugin` resumes at the coach eval |
 | books (a PDF refused or unparsable) | not retried: the run goes on with the Books that registered and names the files (`skip: true` in sources.yaml silences one) |
-| config (a book folder that is not a declared Domain) | the run stops at once and names the folder; fix `domains.yaml` or the folder, then re-run |
+| config (a book folder that is not a declared Domain) | at the terminal, ops asks per folder: declare it (risk tier + one-line description) or ignore it, then syncs again; with no answer it stops and names the folder (`ytbrain domains add` / `ignore`, then re-run) |
 | endpoint refused (key, credits, model, quota) | stop; the notice says to fix `.env` and re-run |
 | spend cap | stop; the notice says to raise `--max-cost` |
 | gate FAIL or INCONCLUSIVE | stop before the plugin; the baseline is kept |
 | Claude plan limit (coach eval) | the plugin is built; the coach eval is pending and runs alone on the next `ytbrain ops` |
 | no `claude` on PATH | validate and the coach eval are skipped (pending) |
+| a crash signal (SIGABRT, SIGSEGV) after a pack build | ops checks the pack: written by this run and matching its sha256, the run goes on with a warning; otherwise it stops like any failure |
 | interrupted, another ops running | resume with the same command / exit |
 
 Every stop and every finished run sends a macOS notification and writes `data/ops/last-run.md`: what

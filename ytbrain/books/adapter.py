@@ -86,17 +86,20 @@ class BookAdapter:
             files = book_files(src, self.root)
             say(f"[{si}/{len(sources)}] {src['id']}: {len(files)} PDF(s) in {src['path']} (private)")
             seen: set[str] = set()
+            claimed: dict[str, str] = {}                 # book id -> the file that registered it this run
             for folder, n in self._stray(src, files).items():
+                from ..domains import folder_key
                 say(f"  warning: {n} Book(s) in {folder}/ are not in a declared Domain, so they take "
-                    f"{', '.join(src.get('domains') or ['the default Domain'])}: declare `{folder}` in domains.yaml, "
-                    f"set `domains:` on the Book, or list it under `ignore_folders`")
+                    f"{', '.join(src.get('domains') or ['the default Domain'])}. Declare it: "
+                    f"`ytbrain domains add {folder_key(folder)} --risk low|medium|high --description \"...\"`; "
+                    f"or, if it only sorts files: `ytbrain domains ignore {folder}`")
                 if getattr(args, "strict_domains", False):
                     code = code or 1
                     config_stop = True
                     runstatus.record("config", f"book folder {folder}/ is not a declared Domain")   # ops stops, no retry
             for fi, pdf in enumerate(files, 1):
                 try:
-                    res = self.sync_book(m, src, pdf)
+                    res = self.sync_book(m, src, pdf, claimed)
                 except RuntimeError as e:                 # the pdf extra is missing: nothing can work
                     say(f"sync: {e}")
                     return {"code": 2, "videos": 0}
@@ -127,8 +130,12 @@ class BookAdapter:
         except D.DomainConfigError:
             return {}                                    # a broken domains.yaml is reported where it is read
 
-    def sync_book(self, m, src: dict, pdf: Path) -> dict:
-        """Register one PDF's Chapters. Returns {status, line, notes, keep (doc ids to keep), chapters}."""
+    def sync_book(self, m, src: dict, pdf: Path, claimed: dict[str, str] | None = None) -> dict:
+        """Register one PDF's Chapters. Returns {status, line, notes, keep (doc ids to keep), chapters}.
+
+        `claimed` maps the book ids already registered in this run to their files: a second PDF with the same id
+        (two editions, a copy, two books with no title) would overwrite the first's plan and orphan its Chapters,
+        so it is refused and says what to do."""
         overrides = (src.get("books") or {}).get(pdf.name) or {}
         if overrides.get("skip"):
             return {"status": "ok", "line": f"{pdf.name}: skipped (skip: true in sources.yaml)", "notes": [],
@@ -138,6 +145,13 @@ class BookAdapter:
             return {"status": "refused", "line": f"{pdf.name}: refused: {facts.reason}", "notes": [],
                     "keep": set(), "chapters": 0}
         meta = resolve(facts.meta, facts.edge_pages, overrides, self._lookup_for(src))   # before parsing: the ids need it
+        if claimed is not None:
+            first = claimed.setdefault(meta.book_id, pdf.name)
+            if first != pdf.name:
+                fix = ("give each its own `title:` under `books:` in sources.yaml" if meta.book_id == slug("untitled-book")
+                       else "keep one: move the other out of the folder, or set `skip: true` for it under `books:` in sources.yaml")
+                return {"status": "refused", "keep": set(), "chapters": 0, "notes": [],
+                        "line": f"{pdf.name}: refused: same book id ({meta.book_id}) as {first}; {fix}"}
         parser = self._parser_for(src.get("parser") or "pdfium")
         try:
             facts, book, _cached = cached_parse(pdf, self.parsed_dir, parser, facts=facts)
@@ -250,3 +264,19 @@ class BookAdapter:
 def _is_title(text: str, title: str) -> bool:
     from .chapters import _opens_with
     return _opens_with(text, title)
+
+
+def stray_book_folders(sources: list[dict] | None = None, root: Path | None = None) -> dict[str, int]:
+    """Book folders below every enabled pdf_books Source that are not a declared Domain: {folder: Books}.
+    `ytbrain ops` asks about these when sync stops on them (--strict-domains)."""
+    from .. import sources as S
+    from ..config import ROOT, SOURCES_FILE
+    root = root or ROOT
+    if sources is None:
+        sources = S.enabled(S.load(SOURCES_FILE), "pdf_books") if SOURCES_FILE.exists() else []
+    ad = BookAdapter(root=root)
+    out: dict[str, int] = {}
+    for src in sources:
+        for folder, n in ad._stray(src, S.book_files(src, root)).items():
+            out[folder] = out.get(folder, 0) + n
+    return out

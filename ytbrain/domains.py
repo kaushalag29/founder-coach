@@ -170,9 +170,15 @@ def folder_domain(path: str | Path | None, registry: Registry, roots: list[Path]
         if parts is None:
             return None
     for part in reversed(parts):
-        if part in registry:
-            return part
+        if folder_key(part) in registry:
+            return folder_key(part)
     return None
+
+
+def folder_key(folder: str) -> str:
+    """The Domain name a folder stands for: `GTM`, `System Design` and `system_design` are `gtm` and
+    `system-design`, so a folder's capitals or spaces never make its Books miss their Domain."""
+    return re.sub(r"[\s_]+", "-", folder.strip().lower())
 
 
 def stray_folders(registry: Registry, source: dict, files, roots) -> dict[str, int]:
@@ -195,7 +201,7 @@ def stray_folders(registry: Registry, source: dict, files, roots) -> dict[str, i
                 break
             except ValueError:
                 pass
-        if not rel or any(part in registry.ignore_folders for part in rel):
+        if not rel or any(folder_key(part) in {folder_key(i) for i in registry.ignore_folders} for part in rel):
             continue
         out[rel[0]] = out.get(rel[0], 0) + 1
     return out
@@ -215,3 +221,97 @@ def resolve(registry: Registry, source: dict | None = None, book_path: str | Pat
     if source.get("domains"):
         return registry.check(source["domains"], f"source {source.get('id')}")
     return [registry.default]
+
+
+# ----------------------------------------------------------------------------- editing domains.yaml
+DEFAULT_FILE_HEAD = """# The Library's Domains (CONTEXT.md: Domain). `ytbrain domains add` appends to this file.
+default: startup
+ignore_folders: []
+domains:
+  startup:
+    description: "Starting and running an early-stage startup."
+    risk_tier: medium
+"""
+
+
+def _q(text: str) -> str:
+    import json
+    return json.dumps(text, ensure_ascii=False)      # a JSON string is a valid YAML double-quoted scalar
+
+
+def _write_checked(path: Path, text: str) -> Registry:
+    """Parse the new text before it replaces the file (atomically): a mistake never leaves a broken domains.yaml."""
+    import yaml
+    from .pages import atomic_write_text
+    try:
+        reg = parse(yaml.safe_load(text))
+    except yaml.YAMLError as e:
+        raise DomainConfigError(f"{path.name}: the edit would not be valid YAML ({e}); nothing was changed") from None
+    atomic_write_text(path, text)
+    return reg
+
+
+def add_domain(name: str, *, risk_tier: str, description: str, examples: list[str] | tuple = (),
+               freshness: int | str = "evergreen", web_policy: str = "when_gap", path: Path | None = None) -> Registry:
+    """Append one Domain to domains.yaml, keeping every comment and the order of the others. The risk tier and a
+    one-line description are required: the tier decides how much evidence a confident answer needs (a `high`
+    Domain declines below strong coverage), and the description is what the host reads to choose Domains."""
+    path = Path(path) if path else DOMAINS_FILE
+    name = folder_key(name)
+    if not _NAME.match(name):
+        raise DomainConfigError(f"{name!r}: a Domain name is lowercase letters, digits and dashes (max 40)")
+    if risk_tier not in RISK_TIERS:
+        raise DomainConfigError(f"risk tier must be one of {', '.join(RISK_TIERS)}")
+    if web_policy not in WEB_POLICIES:
+        raise DomainConfigError(f"web policy must be one of {', '.join(WEB_POLICIES)}")
+    if not (description or "").strip():
+        raise DomainConfigError("a one-line description is required: the host chooses Domains by it")
+    text = path.read_text(encoding="utf-8") if path.exists() else DEFAULT_FILE_HEAD
+    current = load(path) if path.exists() else parse(__import__("yaml").safe_load(text))
+    if name in current:
+        raise DomainConfigError(f"{name!r} is already a Domain in {path.name}")
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if re.match(r"^domains:\s*(#.*)?$", l)), None)
+    if start is None:
+        raise DomainConfigError(f"{path.name}: no top-level `domains:` block to add to")
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^[A-Za-z_][\w-]*\s*:", lines[i])), len(lines))
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].startswith("#")):
+        end -= 1                                         # before trailing blank lines and column-0 comments
+    child = next((l for l in lines[start + 1:end] if l.strip() and not l.lstrip().startswith("#")), "  x:")
+    ind = child[:len(child) - len(child.lstrip())] or "  "
+    block = [f"{ind}{name}:", f"{ind * 2}description: {_q(description.strip())}"]
+    exs = [e.strip() for e in examples if e and e.strip()]
+    if exs:
+        block += [f"{ind * 2}examples:"] + [f"{ind * 3}- {_q(e)}" for e in exs]
+    block += [f"{ind * 2}risk_tier: {risk_tier}", f"{ind * 2}freshness: {freshness}", f"{ind * 2}web_policy: {web_policy}"]
+    new = "\n".join(lines[:end] + block + lines[end:]) + "\n"
+    reg = _write_checked(path, new)
+    if name not in reg:
+        raise DomainConfigError(f"{path.name}: {name!r} did not land in `domains:`")   # never reached when parsed
+    return reg
+
+
+def ignore_folder(folder: str, path: Path | None = None) -> Registry:
+    """Add a folder to `ignore_folders` (a folder that only sorts files, not a Domain), keeping comments."""
+    import yaml
+    path = Path(path) if path else DOMAINS_FILE
+    folder = folder.strip().strip("/")
+    if not folder:
+        raise DomainConfigError("a folder name is required")
+    text = path.read_text(encoding="utf-8") if path.exists() else DEFAULT_FILE_HEAD
+    have = list((yaml.safe_load(text) or {}).get("ignore_folders") or [])
+    if folder_key(folder) in {folder_key(f) for f in have}:
+        return parse(yaml.safe_load(text))
+    flow = "ignore_folders: [" + ", ".join(_q(f) for f in have + [folder]) + "]"
+    lines = text.splitlines()
+    i = next((k for k, l in enumerate(lines) if re.match(r"^ignore_folders\s*:", l)), None)
+    if i is None:
+        j = next((k for k, l in enumerate(lines) if re.match(r"^domains:\s*(#.*)?$", l)), len(lines))
+        lines[j:j] = [flow]
+    else:
+        k = i + 1
+        while k < len(lines) and re.match(r"^\s+-\s", lines[k]):      # a block list's items
+            k += 1
+        comment = re.search(r"\s+#.*$", lines[i]) if "[" in lines[i] or k == i + 1 else None
+        lines[i:k] = [flow + (comment.group(0) if comment else "")]
+    return _write_checked(path, "\n".join(lines) + "\n")

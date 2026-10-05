@@ -43,6 +43,12 @@ def nudges(store: FounderStore) -> list[dict]:
         out.append({"kind": "stale_profile", "fields": stale,
                     "message": f"Profile facts not confirmed in {D.PROFILE_STALE_DAYS}+ days: {', '.join(stale)}; "
                                "ask the Founder whether they still hold"})
+    late = [g for g in store.goals("active") if g.get("target_date") and g["target_date"] < today.isoformat()]
+    if late:
+        out.append({"kind": "goal_past_target", "ids": [g["id"] for g in late],
+                    "message": f"{len(late)} active Goal(s) past their target date ("
+                               + "; ".join(f"{g['text'][:60]} by {g['target_date']}" for g in late[:3])
+                               + "): ask whether each was met, should be dropped, or gets a new date"})
     rev = store.decisions_to_revisit()
     if rev:
         out.append({"kind": "decision_revisit", "ids": [d["id"] for d in rev],
@@ -57,7 +63,9 @@ def context(store: FounderStore, detailed: bool = False) -> dict:
     ctx = {"today": store.today().isoformat(), "week": week,
            "week_starts": week_start(week).isoformat(),
            "timezone": str(store.tz().key),
-           "profile": prof if detailed else {f: ({"value": v["value"], "stale": True} if v["stale"] else v["value"])
+           # a stale fact says when it was last confirmed, so the coach can ask "still true since <date>?"
+           "profile": prof if detailed else {f: ({"value": v["value"], "stale": True,
+                                                  "confirmed_on": v["confirmed_at"][:10]} if v["stale"] else v["value"])
                                              for f, v in prof.items()},
            "goals": store.goals("active"),
            "this_week": store.commitments(week),
@@ -118,8 +126,11 @@ def render_markdown(store: FounderStore) -> str:
         lines.append(f"- **{f.replace('_', ' ')}:** {val}" + ("  _(not confirmed in 30+ days)_" if v["stale"] else ""))
     lines += ["", "## Goals", ""]
     goals = store.goals("active")
+    today = store.today().isoformat()
     lines += [f"- `{g['id']}` {g['text']}" + (f" — measure: {g['measure']}" if g.get("measure") else "")
-              + (f" — by {g['target_date']}" if g.get("target_date") else "") + _cite(store, g["citations"])
+              + (f" — by {g['target_date']}" if g.get("target_date") else "")
+              + ("  _(past its date: met, dropped or a new date?)_" if g.get("target_date") and g["target_date"] < today else "")
+              + _cite(store, g["citations"])
               for g in goals] or ["_None active._"]
     lines += ["", f"## This week ({week})", ""]
     cs = store.commitments(week)

@@ -4,4 +4,4 @@ Only what a founder's machine needs: the Knowledge pack reader, ONNX query model
 the search shared with the ytbrain pipeline, and (M3a) the founder store and MCP
 server. Nothing here imports ytbrain, torch, LanceDB or yt-dlp.
 """
-__version__ = "0.1.2"
+__version__ = "0.1.3"
