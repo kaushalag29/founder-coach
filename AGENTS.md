@@ -12,7 +12,8 @@ knowledge, and is growing into a founder-coach served over MCP.
   or what reaches the coach; record a new ADR when a choice is hard to reverse.
 - **Roadmap:** `docs/phase2-plan.md` (milestones, compatibility guarantees, backlog) and
   `docs/phase3-plan.md` §0 (v1 scope and quality gates); the current state and next steps are in
-  `docs/m3-status.md`. Work is scoped to the current milestone.
+  `docs/m3-status.md`. Work is scoped to the current milestone. Next milestone: `docs/m6-plan.md`
+  (its acceptance criteria are the definition of done).
 
 ## Commands
 

@@ -112,7 +112,9 @@ ytbrain ops plugin --coach   # eval coach on dist/plugin-private; only gates who
 ytbrain eval coach --gate g2 # or one gate by hand (g2, g4, g5, g6); --limit 2 for a quick check
 ```
 
-It uses your Claude plan (Haiku, 12 turns per call) and a few cents of judging. A pass is G2 >= 90% claim support,
+It uses your Claude plan (Haiku, 12 turns per call) and a few cents of judging. A case that errors (for example
+`error_max_turns`) is not a failure: it prints its tool calls, keeps them in `data/eval/coach/*.errors.jsonl`, and runs
+again on the next run. A pass is G2 >= 90% claim support,
 G4 >= 80%, G5 and G6 100%. Don't rebuild `dist/plugin` while it runs.
 
 ## Level 7: a live session (the only manual check of the product)

@@ -3,6 +3,30 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-05 (Coach eval: errored runs can be diagnosed)
+
+- **An errored coach-eval run keeps its tool calls.** A case that stops with `error_max_turns` (or any host error) prints
+  what it did (`9 tool call(s): 1 coach_get_context, 6 coach_search, 2 coach_read`) and writes the calls, in order, to
+  `data/eval/coach/<gate>-...errors.jsonl`, next to the cache and never read as a result, so the case still runs again
+  next time. Before, an errored run left no trace (seen on G6 dec-08).
+- **The retry line says how many runs passed so far** (`1 of 2 run(s) passed; run 3 of up to 3`) instead of "failed",
+  which it printed even after a passing second run.
+- Neither change touches the plugin, so cached gate results stay valid.
+
+## 2026-10-05 (Plan: Packs, Projects and inferred Domains)
+
+- **docs/m6-plan.md** (proposed, no code yet): three Packs (founder, systems, investor) each installed as its own plugin;
+  memory isolated per Project with a shared Common profile; Domains inferred from content against a controlled list;
+  schema 3.0 without a global re-extract; acceptance criteria per Pack plugin (Project isolation G7, investor safety G8).
+- **ADRs:** 0015 accepted with amendments; new 0016 (a plugin per Pack, Projects, Common profile, storage under
+  `~/.ytbrain`), 0017 (Domains inferred against a controlled list), 0018 (extraction versioned per prompt, older records
+  stay compatible). Plan decisions #11, #23, #24, #29 and #32 revised.
+- **CONTEXT.md:** Domain redefined (inferred, several per Document); new terms Project, Common profile, Pack memory,
+  Facet, Rule, Private build and Release build, Investment Policy Statement, Holdings, Drift.
+- **Scenario review:** about 25 happy and failure scenarios run through the plan; ten behaviour rules (R1-R10) close the
+  gaps: a per-session active Project, comparing Projects only on request, knowledge across Packs but never memory,
+  skill templates per Pack with a plugin-choice eval, no ask dropped by the 4-part cap, an investor Project per goal.
+
 ## 2026-10-05 (One file per Book; the end-to-end test runbook)
 
 - **A second PDF of a book already registered is refused** (`same book id`) instead of overwriting the first's plan and

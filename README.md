@@ -120,7 +120,8 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 | [docs/eval-spec.md](docs/eval-spec.md) | The retrieval benchmark (Tuning and Holdout sets, judges, metrics) |
 | [docs/commands.md](docs/commands.md) | Every command, by phase |
 | [docs/testing.md](docs/testing.md) | Testing the whole system end to end: seven levels from `scripts/check.sh` to a live session, with what a pass looks like |
-| [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | Next: one engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); proposed |
+| [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | One engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); M5 built |
+| [docs/m6-plan.md](docs/m6-plan.md) | Next: Packs, Projects and inferred Domains, with acceptance criteria per Pack plugin; proposed |
 | [docs/ops.md](docs/ops.md) | `ytbrain ops`: the whole loop in one resumable command |
 | [docs/release.md](docs/release.md) | Repos, CI, beta releases, what testers do, renaming |
 | [docs/m3-status.md](docs/m3-status.md) | Where the coach work stands and what's next |
@@ -1354,7 +1355,7 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 | M4 | Dogfood with real founders; every miss becomes an eval case | after the first beta release |
 | M5 | Library and routing: Domains (incl. `gtm`), Coverage, Gap questions, multi-Domain questions ([plan](docs/library-and-packs-plan.md)) | built; exit pending: search p95 measured, a Gap set of 60+ |
 | — | The Founder's own data through the host's Connectors (calendar, email, docs, CRM), read-only unless asked; Goals past their date as Nudges | **done** (2026-10-04) |
-| M6 | Engine and Packs (a second Pack from the coding books) | planned |
+| M6 | Packs, Projects and inferred Domains: versioned records with no global re-extract, Domains tagged from content, a plugin per Pack (founder, systems, investor), Projects with a Common profile ([plan](docs/m6-plan.md), ADR-0016 to 0018) | planned; acceptance criteria in the plan |
 | M7 | Posts and freshness (RSS, Substack, sync windows) | planned |
 | later | Other hosts (Cursor, Codex, Gemini CLI…); cross-book synthesis and memory validity windows if evals ask for them | later |
 

@@ -85,14 +85,18 @@ _Avoid_: grounded, validated, checked
 
 **Principle**:
 A recommendation consolidated from Advice across several Documents, with its supporting Advice and any dissenting Advice.
-_Avoid_: best practice, rule, consensus
+_Avoid_: best practice, consensus, rule (a Rule is an authority's requirement)
 
 **Fact**:
 A declarative statement drawn from one Document, carrying its own Evidence, that is true or false rather than something to do ("async replication can lose acknowledged writes on failover"). A Post's statement is the Speaker's view, never a Fact.
 _Avoid_: claim, statement, insight
 
+**Rule**:
+A requirement stated by an authority in one Document (a regulation, a standard, an official guide), with the conditions it applies under and its own Evidence ("a mutual fund must state its fees in its prospectus"). Advice is one Speaker's recommendation; a Rule is what a source of authority says must or must not be done.
+_Avoid_: policy (an Investment Policy Statement is the person's own), regulation (only one kind of Rule), guideline
+
 **Knowledge item**:
-Any retrievable unit of knowledge: Advice, a Fact, a Takeaway, a Passage or a Document summary.
+Any retrievable unit of knowledge: Advice, a Fact, a Rule, a Takeaway, a Passage or a Document summary.
 _Avoid_: record, entry, result
 
 **Citation**:
@@ -111,6 +115,10 @@ _Avoid_: persona, target user
 A distributable snapshot of the Knowledge items — Advice, Takeaways and Document summaries with their Citations, but no Passages unless built with `--with-passages` for the private beta — that lets the coach run without ingesting anything.
 _Avoid_: dataset, dump, index (the local store)
 
+**Private build** / **Release build**:
+The two builds of a Pack's plugin: the Private build includes Private Sources and is for its owner's account only; the Release build holds none and is the one that can be shared.
+_Avoid_: personal plugin, public plugin
+
 ## Library and Packs
 
 **Library**:
@@ -118,7 +126,7 @@ Everything ingested on this machine, synced, extracted, verified and indexed onc
 _Avoid_: corpus (when meaning all Packs), database, knowledge base
 
 **Domain**:
-A named subject area (startup, finance, leadership, system design) that Sources and Books belong to, one or several each; a Pack chooses Domains, and a question is routed to one or several Domains before it is searched (a question can span two). A Document's Domains are configuration (sources.yaml, or the Book's folder), never extracted; a Book folder that is not a declared Domain is reported at sync, because its Books would fall back to the default. Category and Topic live inside a Domain.
+A named subject area (startup, gtm, finance, leadership, system design, investment) from a controlled list. Passages and Knowledge items are tagged with Domains by what they say, and a Document belongs to every Domain that covers a sizeable share of its text, so one talk can have several. A Source's or folder's Domain is only a hint. A new Domain is proposed by the system and accepted by the person, never created by a tagger; synonyms become its aliases. A Pack chooses Domains, and a question is routed to one or several Domains before it is searched.
 _Avoid_: category, profile, vertical, collection
 
 **Routing**:
@@ -129,8 +137,12 @@ A question that asks about separate things ("when to raise and how to read a ter
 _Avoid_: multi-part query, multi-hop question (that is one thing needing a chain of facts, not several things)
 
 **Pack**:
-One configured agent over the Library: its Domains, persona, facets, Playbooks, Risk tier and Eval questions. Founder Coach is the Pack `founder`.
+One configured agent over the Library, installed as its own plugin: its Domains, persona, Facets, Playbooks, memory, Risk tier and Eval questions. Founder Coach is the Pack `founder`; `systems` and `investor` follow.
 _Avoid_: agent (the host is the agent), plugin (how Packs are installed), profile, Knowledge pack (the file a Pack ships)
+
+**Facet**:
+A Pack's own label on a Knowledge item, tagged after extraction from that Pack's list (Stage for founder; lifecycle and concern for systems; asset class for investor). A Domain says what something is about; a Facet sorts it inside a Pack.
+_Avoid_: tag (as a term), Topic, category
 
 **Risk tier**:
 How much harm a wrong answer can do in a Domain (low, medium, high); a Pack takes the highest of its Domains. It sets the evidence a confident answer needs and the gates a Pack must pass.
@@ -159,11 +171,11 @@ Where a company is in its life: pre-idea, idea, MVP, product-market fit, growth,
 _Avoid_: phase, level, pipeline stage
 
 **Topic**:
-What a piece of knowledge is about, from the fixed Category list (e.g. sales, fundraising, founder-story).
+What a piece of knowledge is about, from the fixed Category list (e.g. sales, fundraising, founder-story). Produced by the 2.2 extraction only; read as a founder Facet.
 _Avoid_: tag, label, theme
 
 **Category**:
-The single primary Topic of a whole Document.
+The single primary Topic of a whole Document, from the 2.2 extraction; read as a founder Facet, never used for Domains.
 _Avoid_: genre, type
 
 ## Coaching
@@ -173,8 +185,20 @@ The person being coached; one Founder per installation today.
 _Avoid_: user, customer, client
 
 **Company**:
-The Founder's startup, with its current Stage.
-_Avoid_: project, business, org
+The Founder's startup, with its current Stage: the founder Pack's Project.
+_Avoid_: business, org
+
+**Project**:
+What one Pack's memory is kept for: a Company in founder, a system in systems, an investment goal (retirement, college) in investor, with all the accounts that serve it. A person can have several Projects in a Pack; nothing saved in one appears in another unless they ask to compare them, and each session works in one at a time.
+_Avoid_: workspace (the Workspace is where the person keeps their data), context, session
+
+**Common profile**:
+The few facts true of the person in every Pack (name, timezone, role, how they like answers), read by every Pack and changed only on their yes. A Project fact reaches it only when they say so; money details never do.
+_Avoid_: global memory, user profile, account
+
+**Pack memory**:
+Everything a Pack keeps about one Project (profile facts, Goals, Decisions, Commitments, Check-ins, an Investment Policy Statement, Holdings), with its change log. Only its own Pack reads it.
+_Avoid_: memory (alone), store, history
 
 **Founder profile**:
 The stable facts about the Founder and Company the coach relies on: Stage, what they build, for whom, team, key metrics.
@@ -215,6 +239,20 @@ _Avoid_: integration, Source (a Source feeds the Library for every Founder; a Co
 **Playbook**:
 A repeatable coaching procedure the coach runs, such as Ask, Weekly focus or Check-in.
 _Avoid_: skill (implementation term), workflow, template
+
+## Investing
+
+**Investment Policy Statement**:
+The person's own written plan for one portfolio: goal, horizon, risk tolerance, liquidity needs, constraints, the target allocation by asset class they chose, and when they rebalance. The coach helps write it and reviews against it; it never sets the targets for them.
+_Avoid_: IPS (in prose, after first use it is fine), strategy, plan
+
+**Holdings**:
+A snapshot of what one account held, imported from the person's broker export with the date it is "as of". Reviews combine the Holdings of every account in a Project and compare them with its Investment Policy Statement (allocation, Drift, concentration); there are no live prices.
+_Avoid_: positions, portfolio (the Project is the goal the accounts serve)
+
+**Drift**:
+How far a portfolio's allocation has moved from the Investment Policy Statement's targets, per asset class, as of its Holdings date.
+_Avoid_: deviation, imbalance
 
 ## Evaluation
 

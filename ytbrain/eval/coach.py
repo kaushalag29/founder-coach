@@ -248,6 +248,33 @@ def claude_runner(plugin: Path, claude: str = "claude", model: str | None = None
     return run
 
 
+def tool_trace(turn: Turn) -> list[dict]:
+    """What a run did, in order: each tool's short name and its input, cut short. Kept for an errored run
+    (it isn't cached), so an error such as error_max_turns can be diagnosed (searches looping, too many
+    reads) without the transcript."""
+    out = []
+    for c in turn.tools:
+        inp = json.dumps(c.get("input") or {}, ensure_ascii=False, sort_keys=True)
+        out.append({"tool": c.get("name", "").rsplit("__", 1)[-1],
+                    "input": inp if len(inp) <= 200 else inp[:200] + "..."})
+    return out
+
+
+def trace_summary(trace: list[dict] | None) -> str:
+    """'9 tool call(s): 1 coach_get_context, 6 coach_search, 2 coach_read', in first-use order."""
+    if not trace:
+        return "no tool calls"
+    counts: dict[str, int] = {}
+    for c in trace:
+        counts[c["tool"]] = counts.get(c["tool"], 0) + 1
+    return f"{len(trace)} tool call(s): " + ", ".join(f"{n} {name}" for name, n in counts.items())
+
+
+def errors_name(cache: Path) -> Path:
+    """Where a gate's errored runs are kept, next to its cache and never read as results."""
+    return cache.with_name(cache.name.removesuffix(".jsonl") + ".errors.jsonl")
+
+
 # ----------------------------------------------------------------------------- judging
 class Claim(BaseModel):
     claim: str
@@ -463,7 +490,7 @@ def _run_case(gate: str, case: dict, run: Callable[..., Turn], env, spend, fresh
                env={product.env_name("HOME"): str(home), product.env_name("MODELS"): str(models_dir())})
     _check_host(turn)
     if turn.error:
-        return {"id": case["id"], "error": turn.error}
+        return {"id": case["id"], "error": turn.error, "trace": tool_trace(turn)}
     searches = len(turn.calls(SEARCH))
     res = {"id": case["id"], "answer": turn.text, "searches": searches, "host_cost_usd": turn.cost_usd,
            "host_tokens": turn.tokens,
@@ -521,7 +548,8 @@ def _run_persona(case: dict, run, fresh_home, say=print) -> dict:
             say(f"      {case['id']} week {wi}/{len(case['weeks'])}, turn {done}/{total}"
                 + (f" · saved: {', '.join(wrote)}" if wrote else "") + f" · ETA {per * (total - done) / 60:.1f} min")
             if t.error:
-                return {"id": case["id"], "error": f"week {w['now'][:10]}: {t.error}", "log": log}
+                return {"id": case["id"], "error": f"week {w['now'][:10]}: {t.error}", "log": log,
+                        "trace": tool_trace(t)}
             session = t.session_id
             for k, v in t.tokens.items():
                 tokens[k] = tokens.get(k, 0) + v
@@ -664,7 +692,8 @@ def run_trials(gate: str, case: dict, run_one: Callable[[], dict], say=print, tr
     outcomes, last = [False], {True: None, False: r}
     tokens, cost = dict(r.get("host_tokens") or {}), float(r.get("host_cost_usd") or 0.0)
     while len(outcomes) < trials and outcomes.count(True) < need and outcomes.count(False) < need:
-        say(f"      {case['id']}: failed; run {len(outcomes) + 1} of up to {trials} (a majority decides)")
+        say(f"      {case['id']}: {outcomes.count(True)} of {len(outcomes)} run(s) passed; "
+            f"run {len(outcomes) + 1} of up to {trials} (a majority decides)")
         t = run_one()
         if "error" in t:
             return t
@@ -756,7 +785,13 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                 have[case["id"]] = r
                 per = (time.time() - started) / i
                 if "error" in r:
-                    mark = "ERROR " + r["error"][:80]
+                    errors = errors_name(cache)
+                    with open(errors, "a") as f:         # kept for diagnosis; the case runs again next time
+                        f.write(json.dumps({**r, "gate": gate, "build": bid,
+                                            "at": dt.datetime.now().isoformat(timespec="seconds")},
+                                           ensure_ascii=False) + "\n")
+                    mark = (f"ERROR {r['error'][:80]} · {trace_summary(r.get('trace'))} · "
+                            f"trace in {errors.name}")
                 elif gate == "g2":                       # G2 is a rate over all claims, not per case
                     mark = f"{r['supported']}/{r['claims']} cited claims supported"
                     if r.get("bad_citations"):

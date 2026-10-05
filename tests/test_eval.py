@@ -1631,7 +1631,9 @@ def test_coach_eval_with_one_errored_case_is_an_incomplete_run_and_a_rerun_does_
     def run(prompt, env=None, resume=None):
         calls.append(prompt)
         if prompt == "plan 3" and broken["s3"]:
-            return C.Turn(error="error_max_turns")
+            return C.Turn(error="error_max_turns", tools=[
+                {"name": C.SEARCH, "input": {"query": "q"}, "result": ""},
+                {"name": C.SEARCH, "input": {"query": "x" * 500}, "result": ""}])
         return C.Turn(text="Answer (Seibel, 2019).", session_id="s",
                       tools=[{"name": C.SEARCH, "input": {"query": prompt}, "result": "1. [advice] X"}])
     env = type("Env", (), {"judges": ["j1", "j2"], "max_cost": 5, "db": EvalDB(tmp / "eval.db"),
@@ -1644,6 +1646,14 @@ def test_coach_eval_with_one_errored_case_is_an_incomplete_run_and_a_rerun_does_
             summ, code = C.run_gates(env, ["g4"], plugin, runner=run)
         assert code == 2 and "incomplete" in out.getvalue() and "Re-run" in out.getvalue(), (code, out.getvalue())
         assert len(calls) == 10
+        # the errored run's tool calls are kept for diagnosis, next to the cache and never read as a result
+        assert "2 tool call(s): 2 coach_search" in out.getvalue() and ".errors.jsonl" in out.getvalue(), out.getvalue()
+        errs = list((tmp / "coach").glob("*.errors.jsonl"))
+        assert len(errs) == 1, errs
+        rec = json.loads(errs[0].read_text().splitlines()[0])
+        assert rec["id"] == "s3" and rec["gate"] == "g4" and rec["error"] == "error_max_turns"
+        assert [c["tool"] for c in rec["trace"]] == ["coach_search", "coach_search"]
+        assert len(rec["trace"][1]["input"]) <= 203, "long inputs are cut short"
         broken["s3"] = False
         calls.clear()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1749,7 +1759,11 @@ def test_a_failed_case_is_run_again_and_a_majority_of_three_decides():
     r = C.run_trials("g4", {"id": "x"}, one, say=lambda m: None)
     assert not r["passed"] and r["trials"] == [False, False] and n["runs"] == 2, "two failures decide it"
     one, n = runner([False, True, True])
-    r = C.run_trials("g5", {"id": "x"}, one, say=lambda m: None)
+    said = []
+    r = C.run_trials("g5", {"id": "x"}, one, say=said.append)
+    assert "0 of 1 run(s) passed; run 2 of up to 3" in said[0] and "1 of 2 run(s) passed; run 3 of up to 3" in said[1], \
+        "the retry line says how many runs passed so far, never 'failed' after a pass"
+    assert not any("failed" in m for m in said), said
     assert r["passed"] and r["trials"] == [False, True, True] and r["reason"] == "True"
     assert r["host_tokens"] == {"input": 30} and r["host_cost_usd"] == 1.5, "every run's tokens are counted"
     one, n = runner([False, True, False])

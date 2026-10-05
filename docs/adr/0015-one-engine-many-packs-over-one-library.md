@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 # One engine, many Packs over one shared Library
 
@@ -34,3 +34,12 @@ ADR-0012's id mechanism moves into `packs/<id>/pack.yaml`. The Founder store spl
 Commitments, Check-ins), a forward-only migration with a backup. MCP tool names become engine-neutral,
 and the founder Pack must reproduce today's results on the 263 Tuning questions before it replaces the
 current plugin. Catalog cards are generated, not Verified, and are never cited (ADR-0004 holds).
+
+## Amendments 2026-10-05
+
+- **A plugin per Pack**, not one plugin for all: [ADR-0016](0016-a-plugin-per-pack-with-projects-and-a-common-profile.md),
+  which also isolates memory per Project and adds a shared Common profile.
+- **Domains are inferred from content** against a controlled Domain list, configuration is a hint:
+  [ADR-0017](0017-domains-are-inferred-against-a-controlled-domain-list.md).
+- **Schema 3.0 lands without a full re-extract**: [ADR-0018](0018-extraction-is-versioned-per-prompt-and-old-records-stay-compatible.md).
+- The parity bar is today's Tuning set (dev, dev-articles, dev-private), no longer "the 263 questions".
