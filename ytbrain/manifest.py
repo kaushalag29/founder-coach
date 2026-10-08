@@ -206,17 +206,23 @@ class Manifest:
         )
         self.db.commit()
 
-    def invalidate_old_versions(self, stage: str, version: str) -> int:
-        """Mark 'ok' rows produced under a different version as stale.
-
-        pending() only looks at status, so without this a SCHEMA_VERSION bump
-        silently left every old record in place."""
-        cur = self.db.execute(
-            "UPDATE stage_state SET status='stale', error=? WHERE stage=? AND status='ok'"
-            " AND COALESCE(version, '') != ?",
-            (f"version changed to {version}", stage, version))
+    def invalidate_versions(self, stage: str, is_current, reason: str) -> int:
+        """Mark 'ok' rows whose version stamp is no longer valid as stale (ADR-0018: only a
+        breaking release, or an unknown stamp, invalidates; a compatible one leaves records be)."""
+        stale = [r["doc_id"] for r in self.db.execute(
+            "SELECT doc_id, version FROM stage_state WHERE stage=? AND status='ok'", (stage,))
+            if not is_current(r["version"])]
+        for d in stale:
+            self.db.execute("UPDATE stage_state SET status='stale', error=? WHERE stage=? AND doc_id=?",
+                            (reason, stage, d))
         self.db.commit()
-        return cur.rowcount
+        return len(stale)
+
+    def versions(self, stage: str) -> dict[str, int]:
+        """How many 'ok' rows of a Step each version stamp holds (blank: none recorded)."""
+        return {r["v"]: r["c"] for r in self.db.execute(
+            "SELECT COALESCE(s.version, '') v, COUNT(*) c FROM stage_state s JOIN documents d ON d.doc_id = s.doc_id "
+            "WHERE s.stage=? AND s.status='ok' AND d.tombstoned_at IS NULL GROUP BY 1 ORDER BY 1", (stage,))}
 
     def stage_status(self, doc_id: str, stage: str) -> str | None:
         row = self.db.execute("SELECT status FROM stage_state WHERE doc_id=? AND stage=?",
@@ -302,8 +308,9 @@ class Manifest:
             "tombstoned": self.db.execute(
             "SELECT COUNT(*) c FROM documents WHERE tombstoned_at IS NOT NULL").fetchone()["c"]}
         for stage in STAGES:
-            row = self.db.execute(
-                "SELECT COUNT(*) c FROM stage_state WHERE stage=? AND status='ok'", (stage,)
+            row = self.db.execute(       # a dropped Document's finished Steps don't count (they left the knowledge)
+                "SELECT COUNT(*) c FROM stage_state s JOIN documents d ON d.doc_id = s.doc_id "
+                "WHERE s.stage=? AND s.status='ok' AND d.tombstoned_at IS NULL", (stage,)
             ).fetchone()
             out[stage] = row["c"]
         return out

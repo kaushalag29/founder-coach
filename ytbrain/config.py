@@ -222,6 +222,9 @@ MOMENT_STEP_S = 60                            # ...starting on every whole minut
 ARTICLE_MOMENT_PARAS = 6                      # an article's Moment: six paragraphs (~a two-minute read)...
 ARTICLE_MOMENT_STEP = 3                       # ...starting every third paragraph (the same 50% overlap)
 EVAL_WORKERS = int(os.environ.get("YTBRAIN_EVAL_WORKERS", "8"))
+# `eval coach` / `eval choice`: parallel host runs (each is a `claude -p` on YOUR Claude plan, so 1 until you
+# raise it; deliberately not YTBRAIN_LLM_WORKERS, which is for a model provider's rate limit)
+COACH_WORKERS = int(os.environ.get("YTBRAIN_COACH_WORKERS", "1"))
 EVAL_MAX_RPM = float(os.environ.get("YTBRAIN_EVAL_MAX_RPM", "60"))
 # One eval call (a question, a rewrite, a 5-Moment grade) answers in seconds; a provider that
 # hangs shouldn't hold the build for LLM_TIMEOUT_S (900 s, sized for long extractions).
@@ -262,8 +265,10 @@ RERANK_MODEL = os.environ.get("YTBRAIN_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 from founder_coach.search import (BOOST_STAGE_DOCUMENT, BOOST_STAGE_ITEM, KIND_PRIOR,  # noqa: E402,F401
                                   MAX_PER_DOCUMENT, RECENCY_WEIGHT, RRF_K, SEARCH_CANDIDATES)
 
-SCHEMA_VERSION = "2.2.0"             # bump on ANY change to what the model generates -> auto-invalidates
-                                     # extract. Given fields (url, series, source_kind...) may be added
+SCHEMA_VERSION = "2.2.0"             # the startup prompt variant's latest version (ytbrain/extract/versions.py):
+                                     # bump on ANY change to what the model generates, and declare the new
+                                     # release there as compatible or breaking (ADR-0018: only a breaking one
+                                     # re-extracts, and only its variant). Given fields (url, series, source_kind...) may be added
                                      # with defaults that match existing records (ADR-0013); a test pins
                                      # the generated schema to this version.
                                      # 2.1.0: categories ai-and-tech-trends, founder-story

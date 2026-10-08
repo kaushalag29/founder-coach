@@ -1,18 +1,22 @@
-# Domains: the named subject areas of the Library (CONTEXT.md: Domain, docs/library-and-packs-plan.md).
-# A Source says which Domains its Documents belong to (`domains: [...]` in sources.yaml); a Book in a
-# folder named after a Domain (data/books/leadership/...) belongs to it without saying so. The router
-# (M5d) uses `description` and `examples` to decide which Domains a question touches, so write them
-# the way a person would ask. Adding a Domain is adding an entry here and, later, books or Sources.
+# Domains: the controlled list of the Library's subject areas (CONTEXT.md: Domain; ADR-0017).
+# `ytbrain tag` tags Passages and items with these by what they say, scoring them against each Domain's
+# `description`, `examples` and `aliases` (so write them the way a person would ask); a Source's
+# `domains: [...]` in sources.yaml or a Book's folder name is only a hint. `aliases` are other names for
+# the same subject: a folder, alias or proposal spelled any of these ways means this Domain. New Domains
+# come from `ytbrain domains propose` or `ytbrain domains add`, never by themselves.
 #
 #   risk_tier   low | medium | high: how bad a wrong answer is; high tiers answer only from strong evidence
 #   freshness   evergreen | <days>: the half-life of a Document's relevance (markets decay, principles don't)
 #   web_policy  never | when_gap | always_latest: when the host may search the web beside the Library
+#   not_about   what the Domain is NOT about (read by the tie-break model and the host, never embedded:
+#               keep negative sentences out of `description`, which content is scored against)
 default: startup                       # the Domain of a Source that names none
 # Sub-folders of a book folder that only sort files and are not Domains; `ytbrain sync` warns about
 # any other folder that isn't a declared Domain, because its Books would fall back to the default.
 ignore_folders: []
 domains:
   startup:
+    aliases: ["entrepreneurship", "early-stage company"]
     description: "Starting and running an early-stage startup: ideas, users, product-market fit, growth, hiring, fundraising, founders."
     examples:
       - How do I find my first ten customers?
@@ -22,6 +26,7 @@ domains:
     freshness: evergreen
     web_policy: when_gap
   gtm:
+    aliases: ["go-to-market", "sales", "marketing", "selling", "positioning"]
     description: "Go-to-market: finding and reaching customers, sales (founder-led, outbound, enterprise), marketing, positioning, pricing, launches, distribution and growth channels."
     examples:
       - How do I run founder-led sales for my first enterprise customers?
@@ -31,6 +36,7 @@ domains:
     freshness: 1095
     web_policy: when_gap
   leadership:
+    aliases: ["management", "people management"]
     description: "Leading and managing people and organizations: management, culture, feedback, hiring and firing, strategy, decision making."
     examples:
       - How do I give a hard piece of feedback to a direct report?
@@ -40,6 +46,7 @@ domains:
     freshness: evergreen
     web_policy: when_gap
   system-design:
+    aliases: ["software architecture", "distributed systems", "systems architecture"]
     description: "Software architecture and system design: scalability, data modeling, APIs, reliability, trade-offs, distributed systems."
     examples:
       - How should I shard a database that is outgrowing one machine?
@@ -49,8 +56,10 @@ domains:
     freshness: 1825
     web_policy: when_gap
   finance:
-    description: "A company's money: accounting basics, reading financial statements, valuation, term sheets and venture deal terms, cap tables, fundraising mechanics."
+    aliases: ["corporate finance", "startup finance", "venture finance"]
+    description: "A company's money: raising it (fundraising rounds, investors, valuations, term sheets and venture deal terms, cap tables, dilution), accounting basics, reading financial statements, runway and burn."
     examples:
+      - How much should we raise in our seed round, and from whom?
       - How is a startup valued at a seed round?
       - What does a cap table dilution actually do to my share?
       - What should I negotiate in a venture term sheet?
@@ -58,8 +67,11 @@ domains:
     freshness: 730
     web_policy: always_latest
   investment:
-    description: "Investing your own money: stocks, index funds, value investing, risk, asset allocation, the psychology of money and wealth building."
+    aliases: ["investing", "personal investing", "portfolio management"]
+    description: "Investing your own money for the long term: stocks, ETFs, bonds, index and mutual funds, asset allocation, diversification, costs, risk, investor behaviour and the psychology of money."
+    not_about: "Raising money for a startup, or venture and angel investing in startups: that is finance."
     examples:
+      - How should I split $50,000 between stocks and bonds for retirement?
       - How should I think about index funds versus picking stocks?
       - What is a margin of safety and how do I apply it?
       - How do I stop emotions from driving my investing decisions?
@@ -67,6 +79,7 @@ domains:
     freshness: evergreen
     web_policy: always_latest
   coding:
+    aliases: ["programming", "software engineering", "software craftsmanship"]
     description: "Writing and maintaining code: clean code, design patterns, refactoring, testing, craftsmanship and professional habits of programmers."
     examples:
       - How do I name functions and keep them small?

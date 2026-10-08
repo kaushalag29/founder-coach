@@ -145,6 +145,8 @@ def test_private_items_stay_out_of_the_pack_unless_asked_and_release_refuses_the
         root, mk = Path(t) / "repo", Path(t) / "marketplace"
         root.mkdir()
         (root / "product.toml").write_text((Path(__file__).resolve().parents[1] / "product.toml").read_text())
+        import shutil as _sh
+        _sh.copytree(Path(__file__).resolve().parents[1] / "packs", root / "packs")
         subprocess.run(["git", "init", "-q", str(mk)], check=True)
         try:
             R.release(root, mine, mk, validate=False, say=lambda m: None)
@@ -575,6 +577,71 @@ def test_domain_scores_and_routed_search_agree_between_the_lance_index_and_the_p
     from_lance = search(lance, emb, "price feedback", top_k=5, route={"margin": 0.3})
     assert ids(from_lance).count("L") == 2 and ids(from_lance) == ids(search(pack, emb, "price feedback", top_k=5, route={"margin": 0.3}))
 
+
+
+def test_the_tag_step_sets_item_domains_in_place_and_index_keeps_them():
+    """ADR-0017 on a real LanceDB table: tag_inputs reads vectors through Arrow, set_item_domains changes only
+    the Domains (vectors byte-identical, nothing re-embedded), and re-indexing a Document keeps its tags."""
+    try:
+        import numpy as np
+        from ytbrain.knowledge.store import KnowledgeStore
+    except ImportError:
+        return
+    from ytbrain import cli
+    from ytbrain import tagging as T
+    tmp = Path(tempfile.mkdtemp())
+    emb = HashEmbed()
+    store = KnowledgeStore(path=tmp / "lance")
+    for doc in dict.fromkeys(r["doc_id"] for r in ROWS):           # a Document's items go in as one unit
+        store.replace_document(doc, [{**r, "domains": ["startup"], "source_id": "s", "vector": emb([r["indexable"]])[0],
+                                      "embed_model": emb.name} for r in ROWS if r["doc_id"] == doc], emb.dim)
+    rows, vectors = store.tag_inputs()
+    assert len(rows) == len(ROWS) and vectors.shape == (len(ROWS), emb.dim)
+    before = {r["item_id"]: np.asarray(v) for r, v in zip(rows, vectors)}
+    want = {"adv:AAAAAAAAAA1:a01": ("gtm",), "tkw:CCCCCCCCCC3:01": ("gtm", "startup"), "sum:CCCCCCCCCC3": ("startup",)}
+    assert store.set_item_domains(want) == 2, "only items whose Domains differ are written"
+    assert store.set_item_domains(want) == 0
+    rows2, vectors2 = store.tag_inputs()
+    got = {r["item_id"]: tuple(sorted(r["domains"])) for r in rows2}
+    assert got["adv:AAAAAAAAAA1:a01"] == ("gtm",) and got["tkw:CCCCCCCCCC3:01"] == ("gtm", "startup")
+    assert all(np.array_equal(before[r["item_id"]], v) for r, v in zip(rows2, vectors2)), "vectors untouched"
+    db = T.TagDB(tmp / "tags.db")
+    res = T.Result({"adv:AAAAAAAAAA1:a01": T.ItemTag("AAAAAAAAAA1", ("gtm",))},
+                   {"AAAAAAAAAA1": T.DocTag("s", ("gtm",))})
+    db.replace(res.items, res.docs, {"tagger_version": T.TAGGER_VERSION, "applied": "0"})
+    assert T.tagged_docs(tmp / "tags.db") == set() and T.stored_item_domains(tmp / "tags.db") == {}, \
+        "tags stored for review only (--no-apply, or the gate not passed) never steer the index"
+    db.replace(res.items, res.docs, {"tagger_version": T.TAGGER_VERSION, "applied": "1"})
+    db.close()
+    assert T.tagged_docs(tmp / "tags.db") == {"AAAAAAAAAA1"}
+    stored = T.stored_item_domains(tmp / "tags.db")
+
+    def build_items(record, transcript, domains, source_id):
+        return [{**ROWS[0], "domains": list(domains or ["startup"]), "source_id": source_id}]
+    out = cli._index_rows({"doc_id": "AAAAAAAAAA1"}, {}, build_items, emb, store, emb.name,
+                          {"AAAAAAAAAA1": (["startup"], "s")}, stored)
+    assert out[0]["domains"] == ["gtm"], "a re-indexed item keeps the Domains the tag Step gave it"
+    assert T.stored_item_domains(tmp / "missing.db") == {} and T.tagged_docs(tmp / "missing.db") == set()
+
+
+def test_a_packs_build_holds_only_its_domains_items_and_describes_only_its_domains():
+    """ADR-0016: `pack build --for <id>` ships the items in any of the Pack's Domains."""
+    try:
+        import numpy  # noqa: F401
+        from ytbrain.pack import build_pack
+    except ImportError:
+        return
+    rows = [{**ROWS[0], "domains": ["gtm"]}, {**ROWS[1], "domains": ["leadership", "coding"]},
+            {**ROWS[2], "domains": ["coding"]}, {**ROWS[3], "domains": ["coding"]}, {**ROWS[4], "domains": []}]
+    tmp = Path(tempfile.mkdtemp())
+    said = []
+    m = build_pack(Source(rows), HashEmbed(), tmp / "p", rerank_model=None, domains=("gtm", "leadership"),
+                   pack_id="founder", say=said.append)
+    assert m["items"] == 2 and m["pack"] == {"id": "founder", "domains": ["gtm", "leadership"]}
+    assert set(m["domain_info"]) <= {"gtm", "leadership"}, m["domain_info"].keys()
+    assert any("2 of 4 items are in founder's Domains" in s for s in said), said
+    whole = build_pack(Source(rows), HashEmbed(), tmp / "all", rerank_model=None, say=lambda s: None)
+    assert whole["items"] == 4 and whole["pack"] == {"id": "", "domains": []}, "no Pack: everything, as before"
 
 if __name__ == "__main__":
     import inspect

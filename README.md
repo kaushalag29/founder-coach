@@ -24,7 +24,7 @@ This repository holds both halves:
                                              located
 ```
 
-**Status (2026-09-28):** private beta in preparation ([docs/m3-status.md](docs/m3-status.md)).
+**Status (2026-10-07):** M0–M6g are built: the founder, coding and investor plugins, Projects and inferred Domains. Left before anyone else uses them: each Pack's coach gates on the real host (`ytbrain ops plugin --coach`), then dogfooding in Cowork ([docs/m6-plan.md](docs/m6-plan.md); earlier detail in [docs/m3-status.md](docs/m3-status.md)).
 
 | | State |
 |---|---|
@@ -54,7 +54,7 @@ using Cowork instead: [Use the coach](#use-the-coach-claude-code-and-cowork).
 git clone git@github.com:kaushalag29/founder-coach.git && cd founder-coach
 uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"   # as CI; everything: ".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"
-for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
 ```
 
 Building the corpus needs an LLM key and YouTube access ([Install from scratch](#install-from-scratch)).
@@ -103,7 +103,8 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 
 - `/founder-coach:setup` is a short interview: company, customer, Stage, one Goal, Check-in day. The search models
   (about 0.2 GB, once) download in the background, so there is nothing to run; search uses keywords until they finish.
-  What it saves lives in `~/.founder-coach/` (`FOUNDER.md` is readable) and never leaves the machine.
+  It saves to a Project named after the company, in `~/.ytbrain/founder/projects/<id>/` (`FOUNDER.md` is readable),
+  and nothing leaves the machine. A second company is a second Project (`/founder-coach:project`), with its own memory.
 - After that, just talk. `coach`, `ask`, `weekly-focus` and `check-in` load on their own for startup questions, plans
   and weekly reviews; a multi-part question is split and each part searched, with cited talks. Only `setup`, `status`,
   `export`, `feedback` and `forget` need typing. `/founder-coach:status` shows what is saved, what is due and whether
@@ -120,8 +121,8 @@ saved profile (run `/founder-coach:status` there) and that the session-start nud
 | [docs/eval-spec.md](docs/eval-spec.md) | The retrieval benchmark (Tuning and Holdout sets, judges, metrics) |
 | [docs/commands.md](docs/commands.md) | Every command, by phase |
 | [docs/testing.md](docs/testing.md) | Testing the whole system end to end: seven levels from `scripts/check.sh` to a live session, with what a pass looks like |
-| [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | One engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); M5 built |
-| [docs/m6-plan.md](docs/m6-plan.md) | Next: Packs, Projects and inferred Domains, with acceptance criteria per Pack plugin; proposed |
+| [docs/library-and-packs-plan.md](docs/library-and-packs-plan.md) | One engine, many Packs over one Library (routing, Catalog cards, Coverage, Posts); M5 built, M6 built and under evaluation |
+| [docs/m6-plan.md](docs/m6-plan.md) | Packs, Projects and inferred Domains, with acceptance criteria per Pack plugin; M6a-M6g built, under evaluation |
 | [docs/ops.md](docs/ops.md) | `ytbrain ops`: the whole loop in one resumable command |
 | [docs/release.md](docs/release.md) | Repos, CI, beta releases, what testers do, renaming |
 | [docs/m3-status.md](docs/m3-status.md) | Where the coach work stands and what's next |
@@ -239,7 +240,7 @@ cp .env.example .env          # then fill in, see "Configure an LLM backend"
 
 # 6. Check it works
 ytbrain --help
-for s in core eval pack coach plugin web books; do python tests/test_$s.py || break; done   # no network needed
+for s in core eval pack coach projects invest plugin web books; do python tests/test_$s.py || break; done   # no network needed
 ```
 
 Every new terminal needs `source .venv/bin/activate` before `ytbrain` is on your PATH.
@@ -334,7 +335,7 @@ Notes
   and 16k tokens at 16384. ytbrain retries such a video with a shorter answer and, on
   OpenRouter, on a different provider.
 - Paid models have no published per-key rate limit; ytbrain still caps itself at 30
-  requests/min across all workers (`YTBRAIN_LLM_MAX_RPM`). 5–8 workers is a good range.
+  requests/min per model across all workers (`YTBRAIN_LLM_MAX_RPM`). 5–8 workers is a good range.
 - **Free models** (`...:free`) are limited to 20 requests/min and **50 per day** (1 000 per
   day once you have bought ≥ $10 of credit). ytbrain automatically lowers its cap to 18/min
   for `:free` models and stops cleanly when the daily quota is used up.
@@ -498,18 +499,28 @@ start from `cp sources.example.yaml sources.yaml`, then build it interactively w
 
 `domains.yaml` (committed) declares the **Domains** of the Library: `startup`, `gtm` (sales, marketing, positioning,
 pricing, launches), `leadership`, `system-design`, `finance`, `investment`, `coding`, each with a description, example questions, a risk tier, a freshness
-half-life and a web policy. Tag a Source with `domains: [leadership]` in `sources.yaml`; a Book in a folder
-named after a Domain (`data/books/leadership/…`) belongs to it with no tag, and `books: {"X.pdf": {domains: [...]}}`
-overrides one Book. A Source or Book with none is `startup`. Folder names match whatever their case or spacing
-(`GTM/`, `System Design/`). A Book folder that is not a declared Domain (a typo such as `system-desing/`, or a new
-subject) is reported by `ytbrain sync`, and `ytbrain sync --strict-domains` (what `ytbrain ops` runs) exits 1 on it;
-`ytbrain ops` then asks whether to declare it (risk tier and a one-line description, both required) or ignore it.
-By hand: `ytbrain domains add legal --risk high --description "Law for founders"`, `ytbrain domains ignore to-read`
-(a folder that only sorts files), `ytbrain domains` to list them. Domains never appear by themselves: a new one is a
-choice, because its risk tier decides how much evidence a confident answer needs. A Document may belong to several Domains, and
-`coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them.
-Tags are configuration: after editing them run `ytbrain index`, which re-tags existing items in place
-(no re-embedding, no re-extraction). The coach learns the Domains from `coach_get_context` and passes the ones a
+half-life, a web policy and `aliases` (other names: `go-to-market` and `sales` are `gtm`).
+
+**Domains are tagged by content** ([ADR-0017](docs/adr/0017-domains-are-inferred-against-a-controlled-domain-list.md)):
+`ytbrain tag` scores every Passage and item against each Domain's description, examples and aliases (the vectors are
+already in the index), lets a cheap model decide only close calls between two Domains (cached, temperature 0), and
+gives a Document every Domain that covers at least a fifth of its Passages, so one talk can be `leadership` and `gtm`.
+Nothing is re-extracted or re-embedded. A Source's `domains: [...]`, a Book's folder (`data/books/leadership/…`, any
+case or spacing, or an alias) and `books: {"X.pdf": {domains: [...]}}` are **hints**: they break ties and confirm a
+high-tier tag. A folder that is no Domain name is only noted by `sync`; its Books are tagged by what they say.
+
+The person decides what changes safety: an inferred `finance` or `investment` tag is *suggested* until confirmed
+(`ytbrain domains review`, a whole Source at once) and never reaches a pack before; a new Domain is proposed, never
+created (`ytbrain domains propose` groups content no Domain fits and checks each proposal against the list: spelling,
+aliases, meaning, and the model's same/narrower/new), and its risk tier is asked
+(`ytbrain domains add legal --risk high --description "Law for founders"`, `ytbrain domains alias gtm "growth"`).
+`ytbrain domains why <doc>` shows where a Document's Domains came from.
+
+Tags reach the index only once the tagger passes its gate on your labels: `ytbrain tag --no-apply` (store for review),
+`ytbrain domains sample` (sheets of 100 items and 30 Documents), fill the `label` column, `ytbrain eval tags --items …
+--documents …` (precision >= 90 %, recall >= 85 %, no high-tier label missed; `--tune --save` picks the thresholds).
+`ytbrain ops` runs `tag --gated`, which applies them only then. A Document may belong to several Domains, and
+`coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them. The coach learns the Domains from `coach_get_context` and passes the ones a
 question touches; an automatic router exists too but is off until you have measured it on your corpus:
 `ytbrain eval route` (accuracy on single and composed questions), `ytbrain eval run --config pack-route
 --compare pack-no-rerank` (no nDCG loss), then `ytbrain pack build --route`. Adding a Domain is one entry in `domains.yaml` and its books or Sources.
@@ -739,7 +750,7 @@ only the talks whose records changed.
 | `eval route` | Score the Domain router with no LLM: single questions (is the best Domain one of the seed Document's?) and composed two-Domain prompts (is every Domain routed?), swept over the margin | `--set`, `--pack PATH`, `--composed N`, `--device` |
 | `eval calibrate` | Fit the curve that turns a hit's similarity into the probability it is relevant (isotonic, on your judged hits), check it on held-out questions and save `data/eval/calibration.json` if it beats the provisional curve; `pack build` ships it | `--set`, `--pack PATH`, `--k N`, `--force`, `--no-save` |
 | `eval gap` | Measure whether `coverage` is honest, no LLM: wrongful answers on Gap questions (target <= 10 %), wrongful refusals on answerable ones (<= 15 %), swept over the border; exit 0 pass, 1 fail, 3 inconclusive | `--set`, `--pack PATH`, `--questions FILE`, `--tune` |
-| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--include-private` (your Books; never released), `--route` (turn on the server's automatic Domain routing for this pack), `--out DIR` |
+| `pack build` | Build the Knowledge pack the coach plugin ships: every Verified advice/takeaway/summary (Passages only with `--with-passages`, private beta) embedded with a small ONNX model into one SQLite file; resumable, re-embeds only new or changed items | `--for PACK` (a Pack's Domains only, packs/<id>/pack.toml; default founder), `--embed-model`, `--rerank-model` (`none` = no reranker, the default), `--batch`, `--device cpu\|coreml\|cuda`, `--with-passages`, `--include-private` (your Books; never released), `--route` (turn on the server's automatic Domain routing for this pack), `--out DIR` |
 | `pack info` | Describe the pack and verify its checksum | `--out DIR` |
 | `eval judge` | Grade the Moments a saved run retrieved that no judge has seen (pool extension), then re-release the labels as a new minor version; resumable and spend-capped | `--config C` (repeatable), `--set`, `--depth`, `--max-cost`, `--workers` |
 | `eval rescore` | Score a saved run again against the current labels, without searching (seconds); only the questions the run was asked | `--config`, `--set`, `--compare`, `--save-baseline`, `--refresh-baseline`, `--run FILE --as NAME` |
@@ -749,10 +760,15 @@ only the talks whose records changed.
 | `run` | sync → clean → extract → verify → index | `--limit` (per playlist for sync, per Step after), `--workers`, `--device`, `--force`, `--reconcile`, `--source ID`, `--type website\|youtube\|book` |
 | `report` | Acceptance numbers + last three runs | |
 | `sample` | Stratified review sheet in `data/reports/` | `--n`, `--seed`, `--doc PREFIX` |
-| `status` | Count of finished items per stage | |
+| `status` | Count of finished items per stage, and records per extraction version (ADR-0018) | |
+| `upgrade` | Re-extract valid records a new extraction would make differently (an older prompt version), on purpose and within a cap; marks them, then run `extract`, `verify`, `index` | `--dry-run`, `--max-cost USD`, `--variant NAME`, `--doc PREFIX` |
 | `invalidate <stage>` | Mark `fetch`, `clean`, `extract`, `verify` or `index` for redo | `--only-flagged`, `--source ID`, `--reason` |
 | `drop --source ID` | Take a Source's Documents out of the knowledge (then `index`) | |
-| `domains [list\|add\|ignore]` | The Library's Domains in `domains.yaml`: list them (and book folders that aren't one yet), declare one (`add NAME --risk low\|medium\|high --description "…"`), or mark a folder as sorting only (`ignore FOLDER`); comments in the file are kept | `--example Q` (repeatable), `--freshness DAYS`, `--web-policy` |
+| `domains [list\|add\|ignore\|alias\|why\|review\|propose\|sample]` | The Library's Domains in `domains.yaml` (comments kept): list them, declare one (`add NAME --risk low\|medium\|high --description "…"`), mark a sorting folder (`ignore FOLDER`), another name for one (`alias DOMAIN NAME`); why a Document has its Domains (`why DOC`); high-tier tags awaiting confirmation (`review`, `--accept SOURCE:DOMAIN`); proposed Domains for content none fits (`propose`); labelling sheets for `eval tags` (`sample`) | `--example Q`, `--freshness DAYS`, `--web-policy`; `review --accept`; `propose --min-size N`; `sample --n --docs --seed` |
+| `enrich` | Add Rules, and Facts to records without any, for investment, coding and system-design Documents (ADR-0018): one call per Document, every item quoted; marks `verify` stale so the quotes are checked, then `index` turns them into `rule` and `fact` items; once per extraction and enrich prompt | `--dry-run`, `--max-cost USD`, `--doc PREFIX`, `--limit N` |
+| `eval latency` | Search p95 the way the plugin runs it (its runtime, a Knowledge pack, ONNX models), on real Tuning questions after a warm-up; gate 1.5 s; writes data/eval/latency.json | `--pack PATH`, `--n`, `--no-rerank` |
+| `eval parity` | The subject-neutral extraction prompt against the startup one on ~30 startup talks (shadow extractions, the Library untouched): the neutral verifier pass rate within 2 points and at least 80 % of the Verified items; a pass makes new founder content use it | `--n`, `--max-cost` (default $1) |
+| `tag` | Tag Passages and items with Domains by what they say (ADR-0017): embedding scores, a cheap model for close calls only (cached), Document Domains by Passage share; nothing re-extracted or re-embedded | `--dry-run`, `--max-cost USD`, `--no-llm`, `--no-apply`, `--gated` |
 | `eval coach` | Gates G2, G4, G5, G6 on the real host: the local Claude Code on your plan (Haiku, token-saving). Each gate is cached on what it reads (runtime, pack content, its skills, its cases), so only gates whose inputs changed run; a failed G4-G6 case gets up to three runs and a majority decides; stops if the plugin is reassembled mid-run with a change the gate reads | `--gate`, `--limit`, `--model`, `--max-turns`, `--host claude\|openrouter`, `--max-cost`, `--plugin DIR` (default `dist/plugin`) |
 | `claude [--model M] [--openrouter] -- <args>` | The local Claude Code for plugin work, on your plan with Haiku | `--model`, `--openrouter` (before `--`) |
 
@@ -824,7 +840,7 @@ a **Knowledge pack** instead of the index ([ADR-0009](docs/adr/0009-plugin-ships
   `BAAI/bge-base-en-v1.5` (0.21 GB) with no reranker: on labels v1.2.0,
   `jinaai/jina-reranker-v1-turbo-en` lowered the pack's nDCG@10 (0.457 vs 0.479) and slowed every
   search (`pack build --rerank-model` still sets one). Models download once to
-  `~/.founder-coach/models`.
+  `~/.ytbrain/models`, shared by every coach (an install from before Projects keeps using `~/.founder-coach/models`).
 - **Same ranking code:** search, fusion, boosts and diversity are the same code the index
   uses (`founder_coach/search.py`), so `eval run` measures exactly what founders get.
 
@@ -859,6 +875,23 @@ claude plugin validate dist/plugin --strict                  # no model call
 ytbrain claude -- --plugin-dir dist/plugin                   # then: /founder-coach:setup (your plan, Haiku)
 ```
 
+**One plugin per Pack** (ADR-0016). `packs/<id>/pack.toml` says what each coach is: its Domains, memory modules,
+skills (its own `packs/<id>/skills/` first, then the shared ones above), profile fields, and the words its runtime
+uses. The **coding coach** (`coding-coach`, private build only) answers from the coding and system-design Books and
+talks, remembers a system's stack, scale, SLOs and constraints with its Goals and Decisions, and adds two Playbooks:
+`design-review` (restate, ask for evidence, the single biggest risk, cited) and `decision-record` (a Decision in
+memory, and on a second yes an ADR file in your repo).
+
+The **investor coach** (`investor-coach`, private build only) holds your Investment Policy Statement per goal,
+imports your broker's positions exports, and reviews allocation, drift and concentration exactly (no live prices); it
+never recommends a security (gate G8).
+
+```bash
+ytbrain pack build --for coding --include-private --out data/packs/coding/pack-private
+python scripts/assemble_plugin.py --for coding --pack data/packs/coding/pack-private --check   # -> dist/coding-coach-private
+ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private   # P12: each prompt reaches the right coach
+```
+
 Load `dist/plugin`, never `plugin/` itself. `--check` imports the assembled runtime and verifies
 the pack's checksum before swapping the build in, so a broken build never replaces a working
 one. Only `knowledge.sqlite` and `pack.json` ship; the embedding cache stays behind. Beta
@@ -872,13 +905,15 @@ It serves the Knowledge pack and remembers the Founder, over MCP.
 ```bash
 uv pip install -e ".[serve,pack]"
 founder-coach warmup --pack data/pack        # download the search models once
-founder-coach status --json                  # the same as JSON; every command takes --home DIR (the whole data folder)
+founder-coach status --json                  # the same as JSON; --project ID picks a Project, --home DIR pins one folder
+founder-coach projects [create NAME|rename ID NAME|use ID]   # the Projects; `use` sets the CLI's and hook's default
 founder-coach serve --pack data/pack         # the stdio MCP server (what the plugin starts)
 founder-coach status --pack data/pack        # pack, models, profile, what's due
 founder-coach hook session-start             # what the SessionStart hook prints (silent when nothing is due)
 founder-coach export                         # everything remembered, as JSON + Markdown
 founder-coach forget                         # delete it all (type the company name; one backup is kept)
 founder-coach forget --confirm "Acme"        # the same without a prompt (required when there's no terminal)
+founder-coach forget --all                   # every Project and the Common profile (type 'forget all')
 founder-coach restore --list                 # backups, newest first, each with its integrity check
 founder-coach restore [LABEL]                # restore a backup (default: newest good one); old file set aside
 founder-coach feedback list|export [--out D] # the Founder's Feedback; export writes only that, to send
@@ -886,18 +921,24 @@ founder-coach usage summary|export|clear     # the local usage log (docs/usage-l
 founder-coach usage summary --days 30 --json # a window, as JSON; forget --no-backup also deletes the backups
 ```
 
-- **8 MCP tools, in this order:**
+- **9 MCP tools, in this order:**
   - `coach_search`: cited advice; keyword-only while the models load (a search waits up to 20 s
     first); flags likely Gaps;
   - `coach_read`: a whole talk's items;
   - `coach_get_context`: profile, Goals, Commitments, last Check-in, Decisions, Nudges;
-  - `coach_update_profile`, `coach_record`, `coach_update`: every write needs a `request_id`
-    and is logged;
+  - `coach_update_profile`, `coach_project`, `coach_record`, `coach_update`: every write needs a `request_id`
+    and is logged, and names the Project it was proposed for (another Project's save is refused);
+    `coach_project` lists, switches, creates and renames Projects, or summarises one on request;
   - `coach_corpus_status`;
   - `coach_feedback`: a Founder's report of a wrong answer, saved only after they approve it.
 - **Also served:** 4 prompts (`ask`, `weekly-focus`, `check-in`, `setup`) and the resources
   `founder://profile`, `founder://this-week`, `corpus://status` and `corpus://item/{id}`.
-- **Founder data** lives in `~/.founder-coach/`:
+- **Founder data** lives in one folder per Project, `~/.ytbrain/founder/projects/<id>/` (ADR-0016;
+  `YTBRAIN_HOME` moves `~/.ytbrain`, and `FOUNDER_COACH_HOME` pins one folder with no Projects, as before them).
+  A session works on one Project: with one it is chosen by itself, with several the coach asks. Facts true in
+  every Project (name, role, timezone, answer style) go to the Common profile `~/.ytbrain/you.db` only on a yes.
+  The first start after the update copies `~/.founder-coach/` into a Project once and leaves it as it was. Each
+  Project folder holds:
   - `founder.db`, with a change log of every write;
   - `FOUNDER.md`, regenerated after every write;
   - `backups/`, daily (7 kept), before migrations and before forget;
@@ -976,8 +1017,11 @@ YTBRAIN_LLM_MODEL=<model-a> ytbrain extract --limit 5 && ytbrain verify && ytbra
   video's line prints when it finishes, and a *still working on …* line appears if nothing
   finishes for 60 s.
 - **Rate pacing only for hosted endpoints** (anything not `localhost`/`127.*`/`*.local`/Ollama):
-  all workers share one budget of `YTBRAIN_LLM_MAX_RPM` requests/min (default 30; 18 for
-  OpenRouter `:free` models). A 429 on any worker pauses all of them.
+  all workers share one budget of `YTBRAIN_LLM_MAX_RPM` requests/min per model (default 30;
+  18 for OpenRouter `:free` models). A 429 that names an upstream provider ("qwen/x is
+  temporarily rate-limited upstream") belongs to that model: only its calls pause and slow
+  down (the working rate halves, then climbs back after quiet minutes), so a throttled judge
+  doesn't hold the others back. Any other 429 is the account's limit and slows every model.
 - **Per request**, exponential backoff with jitter (10, 20, 40, 80, 160 s; the server's
   `Retry-After` wins) for: 429 and 5xx, dropped connections, and HTTP 200 responses that
   carry an error or no content. A timed-out request (default 900 s) is retried once.
@@ -1116,9 +1160,11 @@ Each video gets `data/metadata/<video_id>.json` (canonical) and `data/pages/<vid
 - `chapters` (uploader's when present, otherwise LLM-generated and snapped to real timestamps)
 - `extraction_meta`: model, backend, schema version, prompt hash, verification result
 
-To change the category list: edit `Category` in `ytbrain/extract/schema.py` and bump
-`SCHEMA_VERSION` in `ytbrain/config.py` — the next `extract` re-extracts older records
-automatically.
+To change the category list: edit `Category` in `ytbrain/extract/schema.py`, bump
+`SCHEMA_VERSION` in `ytbrain/config.py` and add a release in `ytbrain/extract/versions.py`
+([ADR-0018](docs/adr/0018-extraction-is-versioned-per-prompt-and-old-records-stay-compatible.md)): a
+**compatible** release keeps older records (the next `extract` leaves them be; `ytbrain upgrade --dry-run`
+shows what re-extracting them would cost), a **breaking** one makes the next `extract` redo them.
 
 ---
 
@@ -1151,8 +1197,9 @@ All settings are environment variables (`.env` or shell). Defaults in parenthese
 | `YTBRAIN_LLM_MODEL` (`qwen3:30b-a3b`) | Model id |
 | `YTBRAIN_LLM_JSON_MODE` (`response_format`) | `response_format` (JSON schema), `json_object`, or legacy `nvext` |
 | `YTBRAIN_LLM_EXTRA_BODY` (none) | JSON merged into every request, e.g. provider routing or thinking switches |
-| `YTBRAIN_LLM_WORKERS` (1) | Default for `--workers` |
-| `YTBRAIN_LLM_MAX_RPM` (30; 18 for `:free`) | Shared requests/min cap for hosted endpoints |
+| `YTBRAIN_LLM_WORKERS` (1) | Default for `--workers` of `extract` and `enrich` |
+| `YTBRAIN_COACH_WORKERS` (1) | Default for `--workers` of `eval coach` and `eval choice`: host runs at a time on your Claude plan |
+| `YTBRAIN_LLM_MAX_RPM` (30; 18 for `:free`) | Requests/min cap per model for hosted endpoints, shared by every worker |
 | `YTBRAIN_LLM_MAX_TOKENS` (8192) | Output token cap per request |
 | `YTBRAIN_LLM_NUM_CTX` (32768) | Ollama context window |
 | `YTBRAIN_LLM_TIMEOUT_S` (900) | Per-request timeout |
@@ -1252,7 +1299,7 @@ founder_coach/            the light runtime founders install (ADR-0010): server.
                           product.py (the product id at run time); never imports ytbrain
 plugin/                   the Claude Code plugin template: manifest, .mcp.json, hooks, skills, evals
 scripts/                  assemble_plugin.py (-> dist/plugin), release.py, check.sh, check_secrets.py, ligature_words.py
-tests/                    seven offline suites; golden/ pins the MCP tool schemas and the generated schema
+tests/                    nine offline suites; golden/ pins the MCP tool schemas and the generated schema
 ```
 
 ### What's in git
@@ -1269,7 +1316,7 @@ Commit everything `git status` lists; `.gitignore` keeps out the rest. The repos
 | `founder_coach/`, incl. the generated `product.json` and `playbooks/` | the runtime founders install (CI checks the generated files are current) |
 | `plugin/` | the plugin template (skills, hooks, manifest, evals) |
 | `scripts/`, `ops/` | assembler, release, secret scan; launchd and helpers |
-| `tests/`, incl. `tests/golden/` | the seven suites and their snapshots |
+| `tests/`, incl. `tests/golden/` | the nine suites and their snapshots |
 | `eval/` | the released retrieval benchmark (no transcript text: ids, titles, timestamps, grades) |
 
 | Never in git | Why |
@@ -1304,7 +1351,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 353 tests, no network
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 443 tests, no network
 pytest tests/                                                                        # the same under pytest
 ```
 
@@ -1313,7 +1360,9 @@ pytest tests/                                                                   
 | `test_core.py` | caption dedup, human-over-auto captions, evidence grounding both ways, per-Step checkpoints and parking, schema-version invalidation, atomic writes, rate pacing, extraction retries and windows |
 | `test_eval.py` | benchmark build and release sealing, judges, metrics and gates, run labels, the coach eval harness (resume, usage-limit stop, persona checks) |
 | `test_pack.py` | the Knowledge pack format, checksums, incremental rebuilds, shared search |
-| `test_coach.py` | the Founder store (history, idempotent writes, migrations, backups, forget/restore, Feedback, the usage log, Check-in warnings), Nudges, all 8 MCP tools through the SDK client, the tool-schema snapshot, stdio under both protocol versions, concurrent writers |
+| `test_coach.py` | the Founder store (history, idempotent writes, migrations, backups, forget/restore, Feedback, the usage log, Check-in warnings), Nudges, all 9 MCP tools through the SDK client, the tool-schema snapshot, stdio under both protocol versions, concurrent writers |
+| `test_projects.py` | Projects and the Common profile (M6e): each Project's memory kept apart, a session that asks which one, the write guard, sharing only on a yes and only a Pack's fields, the one-time move of `~/.founder-coach` (counts and change log kept, the old folder unchanged, once, damaged or busy), forget per Project, two coaches writing `you.db` at once, the command line, G7's grading |
+| `test_invest.py` | the investor Pack: Fidelity, Schwab, Vanguard and named-column exports read or refused with what they need, allocation, drift and concentration to the cent across accounts (I1-I5), splits that add up exactly, the policy as profile facts, Holdings imported once, the tools end to end, nothing promoted to the shared profile (C3) |
 | `test_plugin.py` | manifest, skills and their invocation, the assembler (template filling, atomic swap, `--check`), the product id living only in `product.toml`, releases (tags, version checks, renames) |
 | `test_books.py` | PDF Books on synthetic text and fixture PDFs only: probe, ligature repair, metadata, Chapters, ids and resume, private visibility, the sample sheet, folders found recursively |
 | `test_web.py` | website Sources against the acceptance criteria in docs/web-sources-plan.md: config, ids, scope and depth, robots.txt, page types, rendering, retries and host pausing, conditional re-checks, aliases, resume, articles through clean → extract → verify → items → pages, the CLI over a localhost server |
@@ -1355,7 +1404,7 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 | M4 | Dogfood with real founders; every miss becomes an eval case | after the first beta release |
 | M5 | Library and routing: Domains (incl. `gtm`), Coverage, Gap questions, multi-Domain questions ([plan](docs/library-and-packs-plan.md)) | built; exit pending: search p95 measured, a Gap set of 60+ |
 | — | The Founder's own data through the host's Connectors (calendar, email, docs, CRM), read-only unless asked; Goals past their date as Nudges | **done** (2026-10-04) |
-| M6 | Packs, Projects and inferred Domains: versioned records with no global re-extract, Domains tagged from content, a plugin per Pack (founder, systems, investor), Projects with a Common profile ([plan](docs/m6-plan.md), ADR-0016 to 0018) | planned; acceptance criteria in the plan |
+| M6 | Packs, Projects and inferred Domains: versioned records with no global re-extract, Domains tagged from content, a plugin per Pack (founder, coding, investor), Projects with a Common profile ([plan](docs/m6-plan.md), ADR-0016 to 0018) | built (M6a-M6g, 2026-10-05/06), under evaluation: the data runs and each Pack's coach gates decide when it is done ([plan](docs/m6-plan.md)) |
 | M7 | Posts and freshness (RSS, Substack, sync windows) | planned |
 | later | Other hosts (Cursor, Codex, Gemini CLI…); cross-book synthesis and memory validity windows if evals ask for them | later |
 
@@ -1363,10 +1412,10 @@ milestones in [docs/phase2-plan.md](docs/phase2-plan.md).
 
 The repository is private during the beta. Changes follow [AGENTS.md](AGENTS.md):
 
-1. Run the seven suites before and after a change, and add a test for any behaviour change,
+1. Run the nine suites before and after a change, and add a test for any behaviour change,
    especially anything touching resume, retries, verification or the Founder store.
-2. Keep the invariants: bump `SCHEMA_VERSION` in `config.py` for any change to
-   `extract/schema.py`; a Founder-store table change is a new numbered migration; never spell
+2. Keep the invariants: a change to `extract/schema.py` or an extraction prompt is a new release in
+   `extract/versions.py`, compatible or breaking (bump `SCHEMA_VERSION` with the schema); a Founder-store table change is a new numbered migration; never spell
    the product id out in `plugin/` or `founder_coach/` (use `{{id}}` / `founder_coach.product`).
 3. After an intended MCP tool change, review and regenerate the snapshot:
    `UPDATE_GOLDEN=1 python tests/test_coach.py`.

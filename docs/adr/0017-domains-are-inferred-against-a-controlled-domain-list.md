@@ -18,7 +18,10 @@ How tagging stays correct and repeatable:
   Domain list version). The same input and the same list always give the same tags.
 - **The content decides, metadata only hints.** A Document's Domains are those covering a tuned share
   of its Passages (which cover all its text), so a talk on hiring and pricing gets leadership and gtm
-  with no summary or table of contents. Its items carry their own tags.
+  with no summary or table of contents. Its items carry their own tags. A Domain also needs two of those
+  Passages, unless it covers half the Document: in a short essay one stray Passage is noise (on the 2026-10-05
+  Library this removed 108 one-Passage Document tags, mostly finance and investment on Paul Graham essays).
+  A close call the tie-break model leaves undecided is cached like an answer and keeps every candidate.
 - **A new Domain is proposed, never created by a tagger.** On request (`ytbrain domains propose`),
   "none fits" items are clustered (fixed seed) and each cluster must pass four checks before it is
   shown: a normalised name match (case, punctuation, spaces, plural), the aliases, meaning (embedding

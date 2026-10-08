@@ -109,12 +109,20 @@ def _contained(span_words: list[str], flat: list[tuple[str, int]], jac: Match) -
     return jac
 
 
+# Every generated assertion carries a quote that must be found in the text: Takeaways, Advice, and the Facts
+# and Rules of the neutral prompt or `enrich` (ADR-0018). Only Verified ones reach the coach.
+ASSERTION_FIELDS = ("highlights", "advice_atoms", "facts", "rules")
+
+
 def record_issues(record: dict, utterances: list[dict]) -> list[str]:
     """Problems the evidence pass rate cannot see: a real talk that yielded nothing."""
     words = sum(len((u.get("text") or "").split()) for u in utterances)
-    items = len(record.get("highlights") or []) + len(record.get("advice_atoms") or [])
+    items = sum(len(record.get(f) or []) for f in ASSERTION_FIELDS)
     if not items and words >= EMPTY_RECORD_MIN_WORDS:
         return [f"no highlights or advice from {words} words"]
+    neutral = (record.get("extraction_meta") or {}).get("prompt_variant") == "neutral"
+    if neutral:                       # a reference chapter of facts with no advice is a good record (ADR-0018)
+        return []
     if (not record.get("advice_atoms") and words >= NO_ADVICE_FLAG_MIN_WORDS
             and record.get("category") not in NARRATIVE_CATEGORIES):
         kind = record.get("source_kind") or "talk"
@@ -154,7 +162,7 @@ def verify_record(record: dict, utterances: list[dict],
     """
     checked = failed = 0
     details = []
-    for field in ("highlights", "advice_atoms"):
+    for field in ASSERTION_FIELDS:
         for item in record.get(field) or []:
             span = item.get("evidence_span") or ""
             m = find_evidence(span, utterances, threshold)

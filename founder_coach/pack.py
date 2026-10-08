@@ -28,7 +28,7 @@ from . import product
 FORMAT_VERSION = 1
 PACK_FILE = "knowledge.sqlite"
 MANIFEST_FILE = "pack.json"
-KINDS = ("advice", "takeaway", "summary")          # the default; Passages only with --with-passages
+KINDS = ("advice", "takeaway", "summary", "fact", "rule")   # the default; Passages only with --with-passages
 ALL_KINDS = KINDS + ("passage",)                    # (private beta only: ADR-0009, phase3 §10.2)
 
 TEXT_COLS = ("item_id", "kind", "doc_id", "text", "evidence", "deep_link", "title", "speaker",
@@ -69,10 +69,11 @@ def resolve(path: str | Path) -> Path:
 def pack_candidates() -> list[Path]:
     """Where a pack is looked for when none is named, in order: next to the runtime (the
     assembled plugin keeps `pack/` beside `founder_coach/`), the dev repo's `data/pack`, then
-    the Founder's home (~/.founder-coach/pack)."""
+    this coach's folder (~/.ytbrain/<pack id>/pack), then the data folder from before Projects
+    (~/.founder-coach/pack)."""
     from . import domain as D
     here = Path(__file__).resolve().parents[1]
-    return [here / "pack", here / "data" / "pack", D.home() / "pack"]
+    return list(dict.fromkeys([here / "pack", here / "data" / "pack", D.pack_home() / "pack", D.home() / "pack"]))
 
 
 def find_pack(arg: str | Path | None = None) -> Path:
@@ -104,7 +105,7 @@ def fts_query(query: str) -> str | None:
 
 def _memo_path() -> Path:
     from . import domain as D
-    return D.home() / "pack-verified.json"
+    return D.pack_home() / "pack-verified.json"
 
 
 def _verified_memo() -> dict:

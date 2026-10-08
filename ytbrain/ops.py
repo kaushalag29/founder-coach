@@ -78,6 +78,10 @@ class Options:
     version: str | None = None       # patch | minor | skip: answer the version question up front
 
 
+TAG_MAX_COST = 1.0                  # the tag Step's tie-breaks per run (cached; a full first run costs cents)
+ENRICH_MAX_COST = 2.0               # enrich per run (a few hundred chapters cost a few dollars: spread over runs)
+
+
 @dataclass
 class Step:
     name: str                       # "<plan>:<step>", the checkpoint key
@@ -240,7 +244,7 @@ class Ops:
     def ingest_steps(self) -> list[Step]:
         steps = []
         if self.opts.sync:
-            steps.append(Step("ingest:sync", ["sync", "--strict-domains"]))
+            steps.append(Step("ingest:sync", ["sync"]))      # an unknown book folder is a hint, not a stop (ADR-0017)
         steps += [Step("ingest:clean", ["clean"]),
                   Step("ingest:extract", ["extract", *(["--limit", str(self.opts.max_extract)]
                                                          if self.opts.max_extract else [])],
@@ -248,7 +252,14 @@ class Ops:
                   Step("ingest:verify", ["verify"]),
                   Step("ingest:retry-flagged", run=self.retry_flagged,
                        note="extract + verify once more, for Documents verify newly flagged"),
-                  Step("ingest:index", ["index"])]
+                  Step("ingest:index", ["index"]),
+                  Step("ingest:tag", ["tag", "--gated", "--max-cost", f"{TAG_MAX_COST:g}"],
+                       note="Domains by content (ADR-0017), applied once `ytbrain eval tags` passes; "
+                            "a cheap model only for uncached close calls"),
+                  Step("ingest:enrich", ["enrich", "--max-cost", f"{ENRICH_MAX_COST:g}"],
+                       note="Rules (and Facts) for investment, coding and system-design Documents (ADR-0018)"),
+                  Step("ingest:verify-enriched", ["verify"], note="checks the quotes enrich added"),
+                  Step("ingest:index-enriched", ["index"], note="indexes the Verified rules and facts")]
         return steps
 
     def retry_flagged(self) -> int:
@@ -360,15 +371,67 @@ class Ops:
                       Step("plugin:assemble-private", ["scripts/assemble_plugin.py", "--pack", str(DATA / "pack-private"),
                                                        "--out", "dist/plugin-private", "--check", "--zip"],
                            script=True)]
+        steps += self.other_pack_steps(private)
         shipped = DATA / ("pack-private" if private else "pack")
         steps.append(Step("plugin:coverage", run=lambda: self.coverage(shipped),
                           note="eval gap on the shipped pack: report only, never stops the run"))
         steps.append(Step("plugin:validate", run=lambda: self.validate(target), note=f"claude plugin validate {target}"))
         steps.append(Step("plugin:record", run=lambda: self.record_plugin(target), note="remember this build"))
         if self.opts.coach:
-            steps.append(Step("plugin:coach", run=lambda: self.coach(target),
+            steps.append(Step("plugin:founder:coach", run=lambda: self.coach(target),
                               note=f"eval coach --plugin {target}: only the gates whose inputs changed"))
+            others = self.other_private_builds() if private else []
+            for pid, dist in others:                 # every Pack's own gates, on its own plugin
+                steps.append(Step(f"plugin:{pid}:coach", run=lambda d=dist, k=f"coach:{pid}": self.coach(d, key=k),
+                                  note=f"eval coach --plugin {dist}"))
+            if others:                               # P12: with every coach installed, each prompt reaches the right one
+                plugins = [target, *(d for _, d in others)]
+                steps.append(Step("plugin:choice", run=lambda ps=plugins: self.choice(ps),
+                                  note="eval choice: the right coach for each prompt (P12)"))
         return steps
+
+    @staticmethod
+    def other_private_builds() -> list[tuple[str, str]]:
+        """(pack id, dist folder) of every Pack besides founder with a private build."""
+        from . import packs as PK
+        out = []
+        for pid in PK.all_ids():
+            if pid == PK.DEFAULT_PACK:
+                continue
+            pk = PK.load(pid, check_skills=False)
+            if "private" in pk.builds:
+                out.append((pid, str(pk.dist_dir(True, Path("dist")))))
+        return out
+
+    @staticmethod
+    def other_pack_steps(private: bool) -> list[Step]:
+        """One plugin per Pack (ADR-0016): every Pack besides founder (packs/<id>/pack.toml) gets its pack built
+        from its Domains and its plugin assembled and validated, Private and/or Release as its `builds` say."""
+        from . import packs as PK
+        steps: list[Step] = []
+        for pid in PK.all_ids():
+            if pid == PK.DEFAULT_PACK:
+                continue
+            pk = PK.load(pid, check_skills=False)
+            for priv in (False, True):
+                if ("private" if priv else "release") not in pk.builds or (priv and not private):
+                    continue
+                out, dist = pk.pack_dir(priv, DATA), pk.dist_dir(priv, Path("dist"))
+                tag = f"plugin:{pid}" + (":private" if priv else "")
+                steps += [Step(f"{tag}:pack", ["pack", "build", "--for", pid, *(["--include-private"] if priv else []),
+                                               "--out", str(out)],
+                               check=lambda since, o=out: pack_written(o, since)),
+                          Step(f"{tag}:assemble", ["scripts/assemble_plugin.py", "--for", pid, "--pack", str(out),
+                                                   "--out", str(dist), "--check", "--zip"], script=True),
+                          Step(f"{tag}:validate", run=lambda d=str(dist): Ops.validate_static(d),
+                               note=f"claude plugin validate {dist}")]
+        return steps
+
+    @staticmethod
+    def validate_static(target: str) -> int:
+        if not shutil.which("claude"):
+            return 0
+        return subprocess.call(["claude", "plugin", "validate", str(CODE / target), "--strict"])
 
     def coverage(self, pack: Path) -> int:
         """`eval gap` on the pack that ships: how often the coach would wrongly answer a Gap question or refuse
@@ -464,9 +527,20 @@ class Ops:
         self.say(f"ops: plugin version {cur} -> {new} (plugin.json, plugin/pyproject.toml, founder_coach)")
         return 0
 
-    def coach(self, target: str) -> int:
+    def choice(self, plugins: list[str]) -> int:
+        """P12 on the host (your Claude plan, no judges); skipped without `claude`, kept per prompt like the gates."""
+        if self.call is None and not shutil.which("claude"):
+            self.say("ops: plugin choice skipped: no `claude` on PATH")
+            return 0
+        code = self.child(Step("choice", ["eval", "choice", *(a for d in plugins for a in ("--plugin", d))]))
+        if code and self.last_reason in ("plan_limit", "auth"):
+            self.say(f"ops: {FIX[self.last_reason]}")
+            return 0 if self.last_reason == "plan_limit" else code
+        return 0 if code == 2 else code
+
+    def coach(self, target: str, key: str = "coach") -> int:
         build = _build_id(CODE / target)
-        ran = self.state.get("coach", {})
+        ran = self.state.get(key, {})
         if ran.get("build") == build and not ran.get("code") and not self.opts.force:
             self.say(f"ops: coach eval already passed on build {build}")
             return 0
@@ -474,20 +548,20 @@ class Ops:
         # ones cost anything, and a real FAIL is reported again instead of being forgotten)
         if self.call is None and not shutil.which("claude"):
             self.say("ops: coach eval skipped: no `claude` on PATH; it runs on the next `ytbrain ops` that has it")
-            self.state["coach"] = {"build": None, "pending": "no claude", "at": _now()}
+            self.state[key] = {"build": None, "pending": "no claude", "at": _now()}
             return 0
         code = self.child(Step("coach", ["eval", "coach", "--plugin", target], paid="coach"))
         if code and self.last_reason == "plan_limit":
             self.say(f"ops: {FIX['plan_limit']}; the plugin is built")
-            self.state["coach"] = {"build": None, "pending": "plan limit", "at": _now()}
+            self.state[key] = {"build": None, "pending": "plan limit", "at": _now()}
             return 0
         if code and self.last_reason == "auth":
-            self.state["coach"] = {"build": None, "pending": "login needed", "at": _now()}
+            self.state[key] = {"build": None, "pending": "login needed", "at": _now()}
             return code                      # ops stops with the fix; the next run does only the coach eval
         if code == 2:                        # stopped or incomplete (spend cap, errored cases): not a verdict on the build
-            self.state["coach"] = {"build": None, "pending": "incomplete", "at": _now()}
+            self.state[key] = {"build": None, "pending": "incomplete", "at": _now()}
             return code
-        self.state["coach"] = {"build": build, "code": code, "at": _now()}
+        self.state[key] = {"build": build, "code": code, "at": _now()}
         return code
 
     # ------------------------------------------------------------------ what is due
@@ -527,6 +601,11 @@ class Ops:
         coach = self.state.get("coach", {})
         if self.opts.coach and (coach.get("build") != last.get("build") or coach.get("code")):
             return True, COACH_ONLY             # not run yet, stopped, or failed: say so again until it passes
+        if self.opts.coach and self.has_private():     # every other Pack's coach, on its own state key
+            for pid, _ in self.other_private_builds():
+                ran = self.state.get(f"coach:{pid}") or {}
+                if not ran.get("build") or ran.get("code"):
+                    return True, COACH_ONLY
         return False, "nothing changed since the last build"
 
     # ------------------------------------------------------------------ run
@@ -555,7 +634,7 @@ class Ops:
                     continue
                 self.say(f"ops: plugin: {why}")
                 if why == COACH_ONLY:            # the build is current: no new pack, version or zip
-                    steps = [st for st in steps if st.name == "plugin:coach"]
+                    steps = [st for st in steps if st.name.endswith(":coach") or st.name == "plugin:choice"]
             for i, step in enumerate(steps, 1):
                 if step.name in cur["done"]:
                     continue
@@ -600,7 +679,10 @@ class Ops:
                       else "; coach eval pending" if self.opts.coach and coach.get("pending")
                       else "" if self.opts.coach
                       else "; coach eval not run (`ytbrain ops plugin --coach` before a release)")
-        summary = (f"eval {ev.get('verdict', 'not run')}; plugin {pl.get('version', '-')} ({pl.get('path', 'not built')})"
+        verdict = ev.get("verdict", "not run")
+        if verdict in ("pass", "baseline") and ev.get("index") != self.index_fp():
+            verdict += " (on an older index)"          # the plugin step skips: a pass on this index is still missing
+        summary = (f"eval {verdict}; plugin {pl.get('version', '-')} ({pl.get('path', 'not built')})"
                    + coach_note
                    + f"; eval spend ${self.state['last_run']['spent']:.3f}")
         self.say(f"\nops: {self.opts.plan} done: {summary}")

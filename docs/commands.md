@@ -16,7 +16,7 @@ ytbrain ops --dry-run       # what is due
 The whole system, end to end, cheapest level first: [docs/testing.md](docs/testing.md). The offline suites:
 
 ```bash
-for t in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
+for t in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
 ```
 
 ## Phase 1: corpus (sync → clean → extract → verify)
@@ -28,7 +28,24 @@ ytbrain sync --backfill               # retry caption downloads that hit HTTP 42
 ytbrain sync --reconcile              # tombstone videos removed upstream (weekly)
 ytbrain refresh                       # backfill Series and provenance without re-extracting
 ytbrain clean ; ytbrain extract --workers 4 ; ytbrain verify     # one Step at a time
-ytbrain status                        # per-Step counts
+ytbrain status                        # per-Step counts, and records per extraction version (ADR-0018)
+ytbrain tag --dry-run                 # Domains by content (ADR-0017): close calls, their cost, Documents per Domain
+ytbrain tag --no-apply                # store the tags for review and labelling; the index keeps its Domains
+ytbrain tag --no-apply --retry-undecided   # ask again about close calls the model left undecided (cached otherwise)
+ytbrain domains sample                # labelling sheets (100 items, 30 Documents) in data/reports/
+ytbrain eval tags --items domain-labels-items-<date>.csv --documents domain-labels-documents-<date>.csv
+ytbrain eval tags --items ... --documents ... --tune --save   # thresholds that pass on your labels
+ytbrain tag                           # apply (ops runs `tag --gated`: only after eval tags passed)
+ytbrain domains why <doc>             # where a Document's Domains came from
+ytbrain domains review                # high-tier tags awaiting your yes (--accept SOURCE:DOMAIN)
+ytbrain domains propose               # content no Domain fits, grouped, checked against the list
+ytbrain upgrade --dry-run             # records a new extraction would make differently: how many, at what cost
+                                      #   (coding and system-design chapters move to the subject-neutral prompt)
+ytbrain eval parity                   # the neutral prompt vs the startup one on ~30 startup talks (shadow, ~$0.10)
+ytbrain enrich --dry-run              # Rules (and Facts) for investment, coding, system-design Documents
+ytbrain enrich --max-cost 2 && ytbrain verify && ytbrain index
+ytbrain enrich --workers 4            # parallel model calls (default YTBRAIN_LLM_WORKERS, as for extract); progress as extract's
+ytbrain upgrade --max-cost 2          # re-extract as many of them as fit $2 (then extract, verify, index)
 ytbrain report                        # quality gates
 ytbrain sample --n 10                 # human review sheet in data/reports/ (fill the verdicts)
 ytbrain pages                         # readable Markdown per talk in data/pages/
@@ -72,7 +89,14 @@ pack` say so when a saved run or the pack is older than the index.
 ## M2d: Knowledge pack
 
 ```bash
-ytbrain pack build                    # data/pack: knowledge.sqlite + pack.json (resumable)
+ytbrain pack build                    # data/pack: knowledge.sqlite + pack.json (resumable); the founder Pack's Domains
+ytbrain pack build --for coding --include-private   # another Pack (packs/<id>/pack.toml): data/packs/coding/pack-private
+python scripts/assemble_plugin.py --for coding --pack data/packs/coding/pack-private --check --zip   # its plugin
+ytbrain eval latency --pack data/pack-private      # search p95 as the plugin runs it (gate 1.5 s)
+ytbrain eval run --config pack --pack data/packs/coding/pack-private --only-pack-docs   # a Pack on its own questions
+ytbrain eval gap --pack data/packs/coding/pack-private --questions data/eval/gap-questions-coding.txt --only-pack-docs
+ytbrain eval coach --plugin dist/coding-coach-private   # a Pack's own coach gates (cases in ytbrain/eval/coach_cases/<pack>/)
+ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private   # P12, your Claude plan, no judges
 ytbrain pack info                     # counts, models, checksum OK
 ytbrain pack build --device coreml    # experimental: Apple GPU/Neural Engine for embedding (default cpu)
 ytbrain search "..." --pack           # search the pack with the ONNX runtime path
@@ -87,17 +111,24 @@ ytbrain eval run --set dev --config pack-no-rerank --pack data/pack-arctic --lab
 founder-coach warmup                              # download the ONNX query models
 founder-coach status                              # pack, models, store integrity, Nudges
 founder-coach serve --pack data/pack              # stdio MCP server (the host starts this)
-npx @modelcontextprotocol/inspector founder-coach serve --pack data/pack   # try the 8 tools by hand
+npx @modelcontextprotocol/inspector founder-coach serve --pack data/pack   # try the 9 tools by hand
 echo '{}' | founder-coach hook session-start      # prints SessionStart JSON only when something is due
 founder-coach export [--out DIR]
 founder-coach restore --list ; founder-coach restore            # put back the newest good backup
 founder-coach forget [--confirm "<company>"] [--no-backup]
+founder-coach forget --all [--confirm "forget all"]   # every Project and the Common profile
+founder-coach projects                            # list (* = the one the CLI and the hook use)
+investor-coach holdings import positions.csv [--account NAME] [--as-of YYYY-MM-DD]   # the investor Pack only
+investor-coach holdings label VTI=us_equity BND=bonds ; investor-coach holdings ; investor-coach holdings review
+founder-coach projects create "Kitebook" ; founder-coach projects rename kitebook "Kitebook Inc" ; founder-coach projects use acme
 founder-coach feedback list ; founder-coach feedback export [--out DIR]   # the Founder's Feedback, as one file to send
 founder-coach usage summary [--days 30] [--json] ; founder-coach usage export [--out DIR]
 founder-coach usage clear --yes                  # the local usage log (docs/usage-log.md)
 ```
 
-Use `--home /tmp/fc-test` on any of these to try them without touching your real store.
+Memory commands act on one Project: `--project ID` (or its name), else the only one, else the last used, else
+`$FOUNDER_COACH_PROJECT`; with several and none of those, they ask for `--project`. Use `--home /tmp/fc-test` on
+any of these to try them on one folder without Projects, without touching your real store.
 
 Settings (`FOUNDER_COACH_*`, listed in `.env.example`) come from the environment, then
 `$FOUNDER_COACH_ENV_FILE`, `./.env` and `~/.founder-coach/.env`. Only `FOUNDER_COACH_*` lines are
@@ -132,7 +163,7 @@ ytbrain claude -- plugin eval dist/plugin-eval --runs 1 --threshold 0.8   # --ru
 # token-saving: Haiku, 12 turns per call, no repo context (judges spend a few cents, --max-cost)
 python scripts/assemble_plugin.py --pack data/pack --check
 ytbrain eval coach --limit 2                      # a quick end-to-end check first
-ytbrain eval coach                                # all four gates; resumable per plugin build and model
+ytbrain eval coach                                # all five gates (G7: Project isolation); resumable per plugin build and model
 ytbrain eval coach --gate g5                      # one gate (repeatable)
 ytbrain eval coach --max-turns 12                 # turns per host call (the default)
 ytbrain eval coach --model sonnet                 # sign a release off on the model founders use
@@ -180,3 +211,22 @@ ytbrain verify --doc <ISBN> && ytbrain sample --doc <ISBN> --n 10
 ytbrain index                         # Books join the index, marked private
 ytbrain pack build --include-private --out data/pack-mine   # your own coach only; release refuses it
 ```
+
+## Parallelism: what runs on threads, and what stays serial
+
+Workers only make the slow call (a model, or a `claude -p` host run). Every database and file write stays on the
+calling thread, in completion order, so there is one SQLite writer; Ctrl+C keeps what finished and redoes what was in
+flight. Each setting is limited by something different, which is why there are three:
+
+| Setting | Used by | What limits it |
+|---|---|---|
+| `YTBRAIN_LLM_WORKERS` / `--workers` (default 1) | `extract`, `enrich` | the model provider's rate (`YTBRAIN_LLM_MAX_RPM` per model, shared by every worker; a 429 halves that model's rate, or every model's when it is the account's) |
+| `YTBRAIN_EVAL_WORKERS` (default 8) | `tag` tie-breaks, `eval build` and the judges | the same provider rate |
+| `YTBRAIN_COACH_WORKERS` / `--workers` (default 1) | `eval coach` gates, `eval choice` (so `ops plugin --coach`) | **your Claude plan**: each case is a `claude -p` run; raise it from 1 gradually and stop at the first plan-limit message |
+
+`enrich --max-cost` counts a call's cost when it returns and starts no new call after the cap, so a parallel run goes
+over by at most the calls in flight. A call with no answer after `3 × YTBRAIN_EVAL_TIMEOUT_S + 60` s is given up on (that Document is recorded as failed and
+the next run redoes it). `extract` gives up on a Document that reports no new step for `YTBRAIN_LLM_TIMEOUT_S + 300` s the same way; a slow
+Document that keeps reporting steps is never cut off. Left serial on purpose: `verify`, `clean`, `pages`, `refresh` (pure-Python CPU work,
+the GIL gives threads nothing), `index`, `pack build` and `eval run` (one shared embedding model and device), web and
+YouTube `sync` (politeness limits per host and per IP), PDF book parsing (CPU: a process pool, if it is ever worth it).

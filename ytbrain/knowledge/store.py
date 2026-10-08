@@ -33,6 +33,7 @@ def _schema(dim: int):
 
 
 RETAG_BATCH = 200                      # Documents per commit when re-tagging
+RETAG_ITEMS_BATCH = 500                # items per commit when the tag Step sets Domains
 
 
 def _q(value: str) -> str:
@@ -106,6 +107,41 @@ class KnowledgeStore:
                 self._t.update(where="doc_id IN (" + ", ".join(_q(d) for d in docs[i:i + RETAG_BATCH]) + ")",
                                values_sql=values)
         return sum(len(d) for d in groups.values())
+
+    def tag_inputs(self):
+        """(rows, vectors) for the tag Step: each item's id, Document, kind, text, Source and Domains, and
+        its vector as one numpy row (read through Arrow: tens of thousands of vectors as Python lists
+        would take gigabytes)."""
+        if self._t is None or not self.count():
+            return [], []
+        self._upgrade()
+        cols = ["item_id", "doc_id", "kind", "text", "source_id", "domains"]
+        tbl = self._t.to_arrow().select(cols + ["vector"])
+        rows = tbl.select(cols).to_pylist()
+        vec = tbl.column("vector").combine_chunks()
+        dim = vec.type.list_size
+        return rows, vec.flatten().to_numpy(zero_copy_only=False).reshape(len(rows), dim)
+
+    def set_item_domains(self, want: dict[str, tuple[str, ...]]) -> int:
+        """Set items' Domains in place (`want`: item_id -> Domains), only where they differ; no vector is
+        read or rewritten by us, so nothing is re-embedded. Grouped by Domain set, a batch of items per
+        update. Returns how many items changed."""
+        if self._t is None or not self.count() or not want:
+            return 0
+        self._upgrade()
+        have = {r["item_id"]: tuple(sorted(r.get("domains") or ()))
+                for r in self._t.search().select(["item_id", "domains"]).limit(self.count()).to_list()}
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for item_id, domains in want.items():
+            key = tuple(sorted(domains or (DEFAULT_DOMAIN,)))
+            if item_id in have and have[item_id] != key:
+                groups.setdefault(key, []).append(item_id)
+        for domains, ids in groups.items():
+            values = {"domains": "make_array(" + ", ".join(_q(d) for d in domains) + ")"}
+            for i in range(0, len(ids), RETAG_ITEMS_BATCH):
+                self._t.update(where="item_id IN (" + ", ".join(_q(x) for x in ids[i:i + RETAG_ITEMS_BATCH]) + ")",
+                               values_sql=values)
+        return sum(len(v) for v in groups.values())
 
     def delete_documents_except(self, keep: set[str]) -> int:
         if self._t is None:

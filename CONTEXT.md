@@ -112,7 +112,7 @@ Who a piece of Advice is addressed to: a founder, an investor or mentor, an empl
 _Avoid_: persona, target user
 
 **Knowledge pack**:
-A distributable snapshot of the Knowledge items — Advice, Takeaways and Document summaries with their Citations, but no Passages unless built with `--with-passages` for the private beta — that lets the coach run without ingesting anything.
+A distributable snapshot of the Knowledge items — Advice, Facts, Rules, Takeaways and Document summaries with their Citations, but no Passages unless built with `--with-passages` for the private beta — that lets the coach run without ingesting anything.
 _Avoid_: dataset, dump, index (the local store)
 
 **Private build** / **Release build**:
@@ -137,11 +137,11 @@ A question that asks about separate things ("when to raise and how to read a ter
 _Avoid_: multi-part query, multi-hop question (that is one thing needing a chain of facts, not several things)
 
 **Pack**:
-One configured agent over the Library, installed as its own plugin: its Domains, persona, Facets, Playbooks, memory, Risk tier and Eval questions. Founder Coach is the Pack `founder`; `systems` and `investor` follow.
+One configured agent over the Library, installed as its own plugin: its Domains, persona, Facets, Playbooks, memory, Risk tier and Eval questions. Founder Coach is the Pack `founder`; `coding` (coding and system design) and `investor` follow.
 _Avoid_: agent (the host is the agent), plugin (how Packs are installed), profile, Knowledge pack (the file a Pack ships)
 
 **Facet**:
-A Pack's own label on a Knowledge item, tagged after extraction from that Pack's list (Stage for founder; lifecycle and concern for systems; asset class for investor). A Domain says what something is about; a Facet sorts it inside a Pack.
+A Pack's own label on a Knowledge item, tagged after extraction from that Pack's list (Stage for founder; lifecycle and concern for coding; asset class for investor). A Domain says what something is about; a Facet sorts it inside a Pack.
 _Avoid_: tag (as a term), Topic, category
 
 **Risk tier**:
@@ -181,15 +181,27 @@ _Avoid_: genre, type
 ## Coaching
 
 **Founder**:
-The person being coached; one Founder per installation today.
+The person the founder Pack coaches; one person per installation.
 _Avoid_: user, customer, client
+
+**Engineer**:
+The person the coding Pack coaches; their Project is a system or codebase.
+_Avoid_: developer (in the coach's words), user
+
+**Investor**:
+The person the investor Pack coaches; their Project is one investment goal with every account that serves it.
+_Avoid_: client, customer (the coach is not their adviser)
+
+**Design review**:
+The coding Pack's Playbook for judging a technical design: restate it, ask for the evidence, name the single biggest risk with a Citation. A review is not a Decision; a Decision is recorded only on a yes.
+_Avoid_: code review (reading a diff is the host's job, not the coach's)
 
 **Company**:
 The Founder's startup, with its current Stage: the founder Pack's Project.
 _Avoid_: business, org
 
 **Project**:
-What one Pack's memory is kept for: a Company in founder, a system in systems, an investment goal (retirement, college) in investor, with all the accounts that serve it. A person can have several Projects in a Pack; nothing saved in one appears in another unless they ask to compare them, and each session works in one at a time.
+What one Pack's memory is kept for: a Company in founder, a system or codebase in coding, an investment goal (retirement, college) in investor, with all the accounts that serve it. A person can have several Projects in a Pack; nothing saved in one appears in another unless they ask to compare them, and each session works in one at a time.
 _Avoid_: workspace (the Workspace is where the person keeps their data), context, session
 
 **Common profile**:

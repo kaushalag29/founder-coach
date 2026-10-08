@@ -3,6 +3,189 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-07 (parallel `enrich` and coach gates)
+
+- **`ytbrain enrich --workers N`** runs the model calls in parallel with `extract`'s default (`YTBRAIN_LLM_WORKERS`),
+  progress (`(k/total)` lines, a heartbeat for slow calls, a closing summary) and stop rules: an endpoint refusal stops
+  the run, one Document's error is recorded and the rest continue, `--max-cost` starts no call after the cap.
+  A model call still unanswered after `3 × YTBRAIN_EVAL_TIMEOUT_S + 60` s (a provider that trickles bytes never trips the
+  per-request timeout) is given up on: that Document is recorded as failed, a new worker takes its place, and the next
+  `ytbrain enrich` redoes only it.
+- **`ytbrain extract` gives up on a stalled Document too.** One that reports no new step for `YTBRAIN_LLM_TIMEOUT_S + 300` s
+  (20 minutes by default) is recorded as failed and a new worker takes its place; the next run retries it. A slow Document
+  that keeps reporting steps (many chapters, repairs, backoff) is never cut off.
+- **`eval coach` says INCOMPLETE, not FAIL,** when the finished cases clear the gate and only errored ones are missing
+  (it printed `-> FAIL` and then "incomplete" on the next line). A provider's full 429 reason is kept in the error text and the
+  case trace (600 and 800 characters, from 200 and 300): "(Alibaba) Rate limit exceeded ..." was cut off.
+- **Docs:** README status line and test count, the suite count in docs/testing.md, and a list of known risks in docs/m6-plan.md.
+- **Rate limits are tracked per model.** One OpenRouter judge (`qwen/qwen3.8-flash`) being "temporarily rate-limited
+  upstream" slowed every other judge to 6 requests/min, because pacing and the 429 pause were shared by the whole process.
+  A 429 that names an upstream provider now pauses and slows only that model (its rate halves and climbs back by itself);
+  any other 429 is the account's and still slows every model. The retry notes name the model ("HTTP 429 from
+  qwen/qwen3.8-flash, retry 1/5 in 10s"). `YTBRAIN_LLM_MAX_RPM` and `YTBRAIN_EVAL_MAX_RPM` are now ceilings per model.
+  Verdicts, judges and cache keys are unchanged.
+- **`eval coach` and `eval choice` stop when the host started without the plugin.** The host's start-up report is read on the
+  first case: if the plugin's coach tools are missing (the plugin did not load, or its MCP server failed), the run stops with what the
+  host did load and records nothing, instead of caching a failing result for every case.
+- **`eval coach` and `eval choice` build each plugin's runtime first** (the plugin's own `uvx` command with `--help`). A plugin
+  never run before builds its package on first start, which can outlast the host's wait: the host then ran the case with
+  no coach tools. The host run also leaves out a founder-coach plugin synced from Cowork unless it is the plugin under test.
+- **Fixed: `eval coach --plugin <relative path>` tested nothing.** The host runs from a scratch folder, so a relative plugin path
+  pointed nowhere and the host loaded no coach (only the default `dist/plugin` worked). The path is now made absolute.
+- **`eval coach` no longer stops on a server that is still starting** (`pending`): the host reports it before it connects.
+- **A host call that started before the plugin's server connected is repeated** (up to twice, after 10 s) in `eval coach` and `eval choice`: such
+  a call has no coach tools, so its answer says nothing about the coach. A call that used a coach tool, or hit a login or limit error, is not repeated.
+- **The investor Pack's G2 asks its own 20 questions** (`ytbrain/eval/coach_cases/investor/ask.jsonl`, a draft for you to review): its
+  Tuning-set sample held two questions, one of them about a startup's marketing loan, which the investor coach rightly declines.
+- **The `ops` done line** says "eval pass (on an older index)" when the pass belongs to an index that has since changed.
+- **CI and `scripts/check.sh` assemble and validate all three plugins** (founder, coding, investor), not only the founder's.
+- Docs: M6 shown as built and under evaluation (README, library-and-packs plan); suite count corrected to nine.
+- **`eval coach --workers N`** and **`eval choice --workers N`** (default `YTBRAIN_COACH_WORKERS`, 1) run host cases in
+  parallel on your Claude plan; results, cache and spend are the same as a serial run.
+- `ops plugin --coach` now retries every Pack's gates and P12, not only the founder's; the step is named
+  `plugin:founder:coach` like the others.
+
+## 2026-10-06 (M6g: the investor coach)
+
+- **`investor-coach`**, the third Pack (private build): an educational coach for your own long-term investing. A
+  Project is a goal (retirement, college) with every account that serves it; its profile is your Investment Policy
+  Statement (targets by asset class, rebalancing band, concentration limit and exemptions, review interval).
+- **Holdings:** import Fidelity, Schwab or Vanguard positions exports (or any CSV with named columns); label each
+  holding's asset class once. `/investor-coach:review` reports allocation, drift and concentration across all
+  accounts, exact to the cent and as of the export's date; `coach_split` splits a sum by your targets.
+- **Safety:** the coach never tells you to buy, sell or hold a security and declines forecasts, timing, options,
+  leverage, crypto, tax, legal and non-US questions with a referral. New coach gate **G8** (43 cases).
+- Store schema v5 (Holdings tables; older stores upgrade with a backup). investor.gov added as a Source.
+
+## 2026-10-06 (M6f: the coding coach)
+
+- **`coding-coach`**, the second Pack (private build): an engineering coach from the coding and system-design Books
+  and talks in your Library. A Project is a system (stack, scale, SLOs, constraints, lifecycle); it keeps Goals and
+  Decisions. New Playbooks **`design-review`** (restates the design, asks for evidence, names the single biggest risk,
+  cited) and **`decision-record`** (a Decision in memory and, on a second yes, an ADR file in your repo).
+- **A Pack defines its own profile, required fields and wording** in `pack.toml`; the shared runtime speaks each Pack's
+  words. The founder coach is unchanged (its tool schemas are identical).
+- **Evaluation per Pack:** `eval coach --plugin <any coach>` uses that coach's cases and questions; `eval choice`
+  checks that each prompt reaches the right coach when several are installed (P12); `eval run|gap --only-pack-docs`.
+  `ytbrain ops plugin --coach` runs every coach's gates, then the choice check.
+- **Tagging:** a Document's Domain needs two of its Passages (or half the Document); undecided tie-breaks are cached
+  (`tag --retry-undecided`).
+- **Fix:** content tags no longer switch a Document to the neutral extraction prompt before its parity check, so
+  no talk or essay is re-extracted (167 Book chapters are, as planned). Crossing the Chasm gets its title.
+
+## 2026-10-05 (M6e: Projects and the Common profile)
+
+- **Projects** (ADR-0016): each company you coach on is a Project with its own memory, in
+  `~/.ytbrain/founder/projects/<id>/` (founder.db, FOUNDER.md, backups, exports). Nothing said about one ever shows in
+  another. A session works on one: chosen by itself when there is one; with several, the coach asks before reading or
+  saving anything. New MCP tool **`coach_project`** (list, switch, create, rename, a read-only summary on request) and
+  skill **`/founder-coach:project`**; `setup` creates the Project for a new company.
+- **Write guard:** the write tools take the Project a save was proposed for and refuse any other than the active one.
+- **Common profile** `~/.ytbrain/you.db`: name, role, timezone and answer style, shared with your other coaches and
+  Projects only when you say yes (`coach_update_profile` with `scope: "common"`); each Pack lists what it reads
+  (`common_fields` in pack.toml). New profile fields `name`, `role`, `answer_style`.
+- **Your existing memory moves itself**: the first start copies `~/.founder-coach/founder.db` into a Project named
+  after your company (checked, with a backup), moves its timezone to the Common profile, and leaves the old folder as
+  it was. Models are not downloaded again (they move to `~/.ytbrain/models` only when that folder exists).
+- **Command line:** `founder-coach projects [create|rename|use]`, `--project` on every memory command, `forget --all`
+  (every Project and the Common profile). `FOUNDER_COACH_HOME` / `--home` still pin one folder, without Projects.
+- **Coach eval gate G7** (Project isolation): two companies over two sessions, and a name shared only on a yes.
+- **Fix:** two processes creating the same store at once no longer fail with "database is locked".
+
+## 2026-10-05 (M6d: one plugin per Pack; tagging fixes from the first real run)
+
+- **Packs are defined in `packs/<id>/pack.toml`** (ADR-0016): identity (install id, display name, description, keywords),
+  Domains, memory modules, skills, MCP prompts and builds. The founder Pack (`packs/founder/pack.toml`) holds what
+  `product.toml` used to name; `product.toml` keeps what every Pack shares (author, license, repos). The founder plugin
+  builds exactly as before.
+- **`scripts/assemble_plugin.py --for <pack>`** assembles any Pack's plugin: its skills (its own `packs/<id>/skills/`
+  first, then the shared `plugin/skills/`), its `[words]` placeholders, its MCP prompts and its runtime settings, written
+  into the build only. **`ytbrain pack build --for <pack>`** ships only the items in the Pack's Domains, and the pack
+  describes only those Domains. `ytbrain ops` builds every other Pack's plugin too. Note: the founder pack now leaves out
+  coding, system-design and investment Books; they return in their own coaches (M6f, M6g).
+- **Memory modules per Pack** (goals, commitments, check-ins, decisions): context, Nudges and `coach_record` follow the
+  Pack's list; the founder Pack keeps all four.
+- **Coaches find each other** (R4): each coach's server registers itself under `~/.ytbrain/installed/` (`YTBRAIN_HOME`
+  moves it); `coach_get_context` lists the others as `other_coaches`, and the `ask` skill searches another coach's
+  knowledge for a part outside this coach's Domains (never its memory).
+- **No question dropped by the 4-part cap** (R6): the `ask` skill answers the 4 that matter most and ends with "I also have
+  N more of your questions: shall I continue?".
+- **`ytbrain eval latency`**: search p95 the way the plugin runs it (gate 1.5 s; the open M5 item).
+- **Gap questions:** a draft of 40 near-miss founder Gap questions in `data/eval/gap-questions.draft.txt` for review.
+- **Tagging, after the first dry run on the real Library** (48,833 items, 37 % close calls, 739 high-tier suggestions):
+  aliases no longer score content (one-word texts matched too much; they still match names, folders and proposals);
+  `investment` and `finance` descriptions sharpened (fundraising is finance; your own long-term portfolio is investment);
+  `ytbrain domains review --reject SOURCE:DOMAIN` (a later answer wins); the dry run says its counts are an upper bound.
+- **`not_about:` for a Domain** (domains.yaml): what it is not about, read by the tie-break model and the host but never
+  embedded. An embedding ignores "not", so the negative sentence in `investment`'s description pulled fundraising talks
+  toward it (high-tier suggestions rose from 739 to 897).
+- **Tie-breaks run in parallel (8 at a time) with a progress line, and each batch's answers are cached as they arrive.**
+  Before, 460 calls ran one after another in silence and the cache was written only at the end, so stopping the run
+  lost everything it had paid for.
+- The MCP tool snapshot changed (`other_coaches`), so the next `ops --coach` re-runs every gate.
+
+## 2026-10-05 (M6c: a subject-neutral extraction prompt; Facts and Rules)
+
+- **A second extraction variant, `neutral@1.0.0`** (ADR-0018): for any subject, no startup Category or Stage. It extracts
+  Advice with the situation it applies under (`applies_when`), **Facts** (declarative statements, quoted), Takeaways,
+  free-text topics and typed entities. Its records keep the same stored shape (category `other`, no Stages), so verify,
+  index, pack and the coach read both; Facts are verified like Advice and become `fact` items. The startup prompt and its
+  hashes are unchanged; both variants' prompts and generated schemas are pinned (`tests/golden/prompt_versions.json`).
+- **Which prompt a Document gets** (`versions.variant_for`): the neutral one for content with a Domain outside the
+  founder Pack's (coding, system-design, investment...), from its tags or a configured hint; everything once
+  `ytbrain eval parity` passes. So `ytbrain upgrade --dry-run` now lists your coding and system-design chapters
+  (`startup@2.2.0 -> neutral@1.0.0`) and their cost; startup talks and articles stay as they are.
+- **`ytbrain eval parity`**: ~30 startup talks extracted again with the neutral prompt into shadow files (the Library is
+  untouched), both verified the same way; it passes when the neutral pass rate is within 2 points and it keeps at least
+  80 % of the Verified items. Resumable, `--max-cost` (default $1).
+- **`ytbrain enrich`**: Rules (requirements stated by an authority, with conditions and who states them) and, for records
+  without any, Facts, for investment, coding and system-design Documents; separately versioned (a changed enrich prompt
+  re-runs only enrich), once per extraction, `--dry-run` with an estimate, `--max-cost`. It marks `verify` stale so the
+  new quotes are checked; `index` makes `rule` items. `ytbrain ops` ingest runs it after `tag`, then verify and index.
+- **Item kinds `fact` and `rule`** in the pack, search priors, `coach_search` (`kinds`), eval and `ytbrain search --kind`.
+  The MCP tool schema changed (`tests/golden/coach_tools.json` regenerated), so the next `ops --coach` re-runs every gate.
+
+## 2026-10-05 (M6b: Domains tagged by content)
+
+- **`ytbrain tag`** (ADR-0017, `ytbrain/tagging.py`): every Passage and item is scored against each Domain's description,
+  examples and aliases using the vectors already in the index; a cheap model (your extraction model, or
+  `YTBRAIN_TAG_MODEL`) decides only close calls between two Domains, choosing from those candidates only, at temperature
+  0, cached by text, candidates, prompt and model. A Document gets every Domain covering at least a fifth of its Passages,
+  so one talk can be `leadership` and `gtm`; items carry their own. Nothing is re-extracted or re-embedded: Domains are
+  set in place on the index and kept in `data/tags/tags.db` with their origin and scores. `--dry-run` shows close calls,
+  their estimated cost and Documents per Domain; `--max-cost` caps tie-breaks; if the model is unreachable or over the
+  cap, a close call keeps every candidate and is asked again next run.
+- **Configuration is a hint.** A Source's `domains:` or a Book's folder adds a small bonus and confirms a high-tier tag;
+  a folder that is no Domain name no longer stops `ytbrain ops` (sync notes it; content decides).
+- **High-tier tags wait for you.** An inferred `finance` or `investment` tag is *suggested* and stays out of the index's
+  Domains (so out of every pack) until a hint or `ytbrain domains review --accept SOURCE:DOMAIN` confirms it.
+- **`domains.yaml` gains `aliases`** (filled in for the seven Domains); names and aliases match whatever their case,
+  punctuation, separators or plural, and two Domains can't share a spelling. `ytbrain domains alias DOMAIN NAME`.
+- **`ytbrain domains why | review | propose | sample`**: where a Document's Domains came from; the review queue; content
+  no Domain fits, grouped and checked against the list (spelling, aliases, meaning, the model's same/narrower/new);
+  labelling sheets.
+- **`ytbrain eval tags`** scores the tagger on your labels (precision >= 90 %, recall >= 85 %, no high-tier label missed,
+  Documents >= 90 %); `--tune --save` picks thresholds that pass. Tags reach the index only after it passes:
+  `ytbrain ops` runs `tag --gated` after `index`; `tag --no-apply` stores them for review.
+- `ytbrain status` and its version counts leave out dropped Documents (7 back-matter Chapters made extract read 1,530
+  against 1,523 elsewhere).
+
+## 2026-10-05 (M6a: a prompt change no longer re-extracts the Library)
+
+- **Extraction is versioned per prompt variant** (ADR-0018, `ytbrain/extract/versions.py`). Each record and its manifest
+  row say which variant and version made it (`startup@2.2.0`; stamps from before, `2.2.0`, count as `startup`). A new
+  release is declared **compatible** (older records stay valid, read in the new shape by an `upcast`) or **breaking**
+  (only that variant's older records re-extract). Before, any `SCHEMA_VERSION` bump re-extracted every record; on your
+  Library the change marks 0 of 1,530 records stale.
+- **A prompt edit must be declared.** `tests/golden/prompt_versions.json` pins each variant's prompt hashes per Source kind;
+  changing a prompt without a new release fails a test. (The talk prompt had drifted once under 2.2.0 unnoticed: 688
+  records carry the older hash.)
+- **`ytbrain status`** lists records per extraction version (latest, valid but behind, or replaced).
+- **`ytbrain upgrade`** re-extracts valid records that a new extraction would make differently, on purpose: `--dry-run`
+  shows how many and the estimated cost (each record's own last extraction cost, else its size at the median rate),
+  `--max-cost` takes only what fits, `--variant` and `--doc` narrow it. It marks them; `extract`, `verify`, `index`
+  (or `ytbrain ops ingest --no-sync`) do the work.
+
 ## 2026-10-05 (Coach eval: errored runs can be diagnosed)
 
 - **An errored coach-eval run keeps its tool calls.** A case that stops with `error_max_turns` (or any host error) prints

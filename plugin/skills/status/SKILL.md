@@ -9,6 +9,7 @@ disable-model-invocation: true
 1. Call `coach_get_context` and `coach_corpus_status`.
 2. Report in this order, briefly:
    - **Due:** the Nudges, each with the command that handles it (`/{{id}}:check-in`, `/{{id}}:setup`).
+   - **Project:** the active one by name, and the others if there are several (`/{{id}}:project` switches).
    - **Founder:** Stage and one-liner; stale facts marked "confirm?".
    - **This week:** open Commitments; the active Goals.
    - **Knowledge:** talks and years covered; search mode (semantic, or keyword while models load, with the reason).

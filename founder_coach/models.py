@@ -39,7 +39,20 @@ def home() -> Path:
 
 
 def models_dir() -> Path:
-    p = Path(product.env("MODELS") or home() / "models").expanduser()
+    """<PREFIX>MODELS; else <PREFIX>HOME/models when the data folder is pinned; else the engine home's models/
+    (~/.ytbrain/models, shared by every coach), reading the old ~/.<id>/models until that exists, so an
+    update never downloads the models again."""
+    explicit = product.env("MODELS")
+    if explicit:
+        p = Path(explicit).expanduser()
+    elif product.env("HOME"):
+        p = home() / "models"
+    else:
+        from .installed import engine_home
+        p = engine_home() / "models"
+        old = product.default_home() / "models"
+        if not p.is_dir() and old.is_dir() and any(old.iterdir()):
+            return old
     p.mkdir(parents=True, exist_ok=True)
     return p
 

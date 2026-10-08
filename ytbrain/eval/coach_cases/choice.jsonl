@@ -1,0 +1,38 @@
+{"id": "pc-01", "expect": "founder-coach", "prompt": "How do I find my first ten customers for a B2B SaaS startup?"}
+{"id": "pc-02", "expect": "founder-coach", "prompt": "Should I raise a seed round now or wait until we have more revenue?"}
+{"id": "pc-03", "expect": "founder-coach", "prompt": "How should my cofounder and I split equity?"}
+{"id": "pc-04", "expect": "founder-coach", "prompt": "What should I focus on this week? We have 3 design partners and no revenue."}
+{"id": "pc-05", "expect": "founder-coach", "prompt": "How do I know if we've reached product-market fit?"}
+{"id": "pc-06", "expect": "founder-coach", "prompt": "I'm thinking of pricing our pilot at $500 a month. Is that too low for enterprise customers?"}
+{"id": "pc-07", "expect": "founder-coach", "prompt": "How do I hire my first engineer at a pre-seed startup?"}
+{"id": "pc-08", "expect": "founder-coach", "prompt": "Our churn is 8% monthly; what does YC say about retention before scaling sales?"}
+{"id": "pc-09", "expect": "founder-coach", "prompt": "Let's do my weekly check-in: I booked 4 demos but didn't finish the pricing page."}
+{"id": "pc-10", "expect": "founder-coach", "prompt": "How do I run a good customer interview without leading the customer?"}
+{"id": "pc-11", "expect": "founder-coach", "prompt": "What's a reasonable burn rate for a 4-person startup with 18 months of runway?"}
+{"id": "pc-12", "expect": "founder-coach", "prompt": "Should we apply to Y Combinator with only an idea and no product yet?"}
+{"id": "pc-13", "expect": "coding-coach", "prompt": "How should I design idempotent retries for our payments API?"}
+{"id": "pc-14", "expect": "coding-coach", "prompt": "When does it make sense to split a monolith into microservices?"}
+{"id": "pc-15", "expect": "coding-coach", "prompt": "Can you review this design: one Postgres primary, two read replicas and a Redis cache in front, for 5k reads per second?"}
+{"id": "pc-16", "expect": "coding-coach", "prompt": "How small should functions be, and how do I name things well in code?"}
+{"id": "pc-17", "expect": "coding-coach", "prompt": "What's the right way to handle a poison message in a Kafka consumer?"}
+{"id": "pc-18", "expect": "coding-coach", "prompt": "Strong or eventual consistency for user profile updates across regions?"}
+{"id": "pc-19", "expect": "coding-coach", "prompt": "We decided to move from REST polling to webhooks for order updates; record that as an architecture decision."}
+{"id": "pc-20", "expect": "coding-coach", "prompt": "How do I refactor a 2,000-line God class safely without breaking production?"}
+{"id": "pc-21", "expect": "coding-coach", "prompt": "How should I partition a table that grows by 50 million rows a month?"}
+{"id": "pc-22", "expect": "coding-coach", "prompt": "Is the strategy pattern worth it here, or is a switch statement fine for three payment providers?"}
+{"id": "pc-23", "expect": "coding-coach", "prompt": "How do I set SLOs and alerts for a new API so we don't page people for noise?"}
+{"id": "pc-24", "expect": "coding-coach", "prompt": "What does Designing Data-Intensive Applications say about leader election and split brain?"}
+{"id": "pc-25", "expect": "none", "prompt": "What's the capital of Australia?"}
+{"id": "pc-26", "expect": "none", "prompt": "Write a haiku about autumn leaves."}
+{"id": "pc-27", "expect": "none", "prompt": "Rename the variable tmp to total in the snippet: tmp = a + b; print(tmp)"}
+{"id": "pc-28", "expect": "none", "prompt": "Convert 72 degrees Fahrenheit to Celsius."}
+{"id": "pc-29", "expect": "none", "prompt": "Translate 'good morning' into Spanish."}
+{"id": "pc-30", "expect": "none", "prompt": "What's 17 times 23?"}
+{"id": "pc-31", "expect": "investor-coach", "prompt": "How should I split my 401(k) between stocks and bonds at 45?"}
+{"id": "pc-32", "expect": "investor-coach", "prompt": "What's a sensible rebalancing band for my portfolio?"}
+{"id": "pc-33", "expect": "investor-coach", "prompt": "Review my holdings against my investment policy statement."}
+{"id": "pc-34", "expect": "investor-coach", "prompt": "Why do index fund fees matter so much over 30 years?"}
+{"id": "pc-35", "expect": "investor-coach", "prompt": "How do I stop myself panic-selling when the market drops 20%?"}
+{"id": "pc-36", "expect": "investor-coach", "prompt": "Help me write an investment policy statement for my retirement savings."}
+{"id": "pc-37", "expect": "investor-coach", "prompt": "What does The Intelligent Investor say about margin of safety?"}
+{"id": "pc-38", "expect": "investor-coach", "prompt": "How should I invest for my daughter's college in 12 years?"}

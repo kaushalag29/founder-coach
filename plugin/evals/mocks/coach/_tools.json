@@ -2,7 +2,7 @@
  "tools": [
   {
    "name": "coach_search",
-   "description": "Search Verified advice, takeaways and talk summaries from YC talks. Each hit has an item_id\nto cite, the speaker, talk, year, a deep link to the exact second, and a verbatim quote. Split a\nmulti-part question and search once per part. When gap_suspected is true, tell the Founder\nthe corpus doesn't cover it rather than answering from memory.",
+   "description": "Search Verified advice, takeaways, facts, rules and summaries from YC talks. Each hit has an item_id\nto cite, the speaker, talk, year, a deep link to the exact second, and a verbatim quote. Split a\nmulti-part question and search once per part. When gap_suspected is true, tell the Founder\nthe corpus doesn't cover it rather than answering from memory.",
    "inputSchema": {
     "properties": {
      "domains": {
@@ -28,7 +28,9 @@
          "enum": [
           "advice",
           "takeaway",
-          "summary"
+          "summary",
+          "fact",
+          "rule"
          ],
          "type": "string"
         },
@@ -677,6 +679,23 @@
       "title": "Nudges",
       "type": "array"
      },
+     "other_coaches": {
+      "anyOf": [
+       {
+        "items": {
+         "additionalProperties": true,
+         "type": "object"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "other coaches installed here, each with its Domains: search a part of a question outside this coach's Domains with that coach's coach_search (knowledge only, never its memory)",
+      "title": "Other Coaches"
+     },
      "overdue": {
       "items": {
        "additionalProperties": true,
@@ -690,6 +709,37 @@
       "title": "Profile",
       "type": "object"
      },
+     "project": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "the active Project {id, name}: all memory above is this Project's; name it when you propose a save",
+      "title": "Project"
+     },
+     "projects": {
+      "anyOf": [
+       {
+        "items": {
+         "additionalProperties": true,
+         "type": "object"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "every Project, when there are several (coach_project switches)",
+      "title": "Projects"
+     },
      "recent_decisions": {
       "items": {
        "additionalProperties": true,
@@ -697,6 +747,22 @@
       },
       "title": "Recent Decisions",
       "type": "array"
+     },
+     "shared_fields": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "profile fields whose value comes from the Common profile the Founder's coaches share",
+      "title": "Shared Fields"
      },
      "this_week": {
       "items": {
@@ -748,20 +814,44 @@
   },
   {
    "name": "coach_update_profile",
-   "description": "Set or confirm Founder profile facts. A changed value keeps the old one in history; re-stating\nan unchanged value confirms it (profile facts go stale after 30 days). Call only after the\nFounder has approved the exact values.",
+   "description": "Set or confirm Founder profile facts. A changed value keeps the old one in history; re-stating\nan unchanged value confirms it (profile facts go stale after 30 days). Call only after the\nFounder has approved the exact values, and say which Project they are saved to.",
    "inputSchema": {
     "properties": {
      "changes": {
       "additionalProperties": true,
-      "description": "field -> value. Fields: company (company name); one_liner (what the company does, in one sentence); customer (who the customer is); stage (one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit); team_size (number of people working on the company); key_metrics (the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}); timezone (IANA time zone, e.g. Asia/Kolkata); checkin_day (preferred Check-in day: mon, tue, wed, thu, fri, sat, sun); workspace (where the Founder keeps their own data, in their words: {what: tool or place}, e.g. {\"pipeline\": \"HubSpot\", \"metrics\": \"Google Sheet 'KPIs'\", \"investor updates\": \"Drive folder 'Updates'\"})",
+      "description": "field -> value. Fields: company (company name); one_liner (what the company does, in one sentence); customer (who the customer is); stage (one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit); team_size (number of people working on the company); key_metrics (the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}); timezone (IANA time zone, e.g. Asia/Kolkata); checkin_day (preferred Check-in day: mon, tue, wed, thu, fri, sat, sun); workspace (where the Founder keeps their own data, in their words: {what: tool or place}, e.g. {\"pipeline\": \"HubSpot\", \"metrics\": \"Google Sheet 'KPIs'\", \"investor updates\": \"Drive folder 'Updates'\"}); name (what to call the person); role (the person's role, e.g. CEO, CTO, solo founder); answer_style (how they like answers, e.g. 'short, bullet points first')",
       "title": "Changes",
       "type": "object"
+     },
+     "project": {
+      "anyOf": [
+       {
+        "maxLength": 80,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "the id of the Project this save was proposed for (coach_get_context `project`); a write for any other Project than the active one is refused, so a switch between proposal and yes never saves to the wrong one",
+      "title": "Project"
      },
      "request_id": {
       "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
       "maxLength": 100,
       "minLength": 1,
       "title": "Request Id",
+      "type": "string"
+     },
+     "scope": {
+      "default": "project",
+      "description": "project (default): the active Project only. common: the Common profile every coach on this machine reads, only for timezone, name, role, answer_style, and only after the Founder said yes to sharing it with their other coaches",
+      "enum": [
+       "project",
+       "common"
+      ],
+      "title": "Scope",
       "type": "string"
      }
     },
@@ -791,6 +881,19 @@
       "title": "Replayed",
       "type": "boolean"
      },
+     "saved_to": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "where it was saved: the Project, or the Common profile",
+      "title": "Saved To"
+     },
      "updated": {
       "items": {
        "type": "string"
@@ -805,6 +908,132 @@
      "profile"
     ],
     "title": "ProfileOut",
+    "type": "object"
+   },
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   }
+  },
+  {
+   "name": "coach_project",
+   "description": "Projects keep separate memory: one per company or product the Founder works on with this coach. A\nsession works on one active Project; with several and none chosen, ask which one, then switch. create\nmakes a Project and switches to it (setup does this first); rename changes its name, never its memory;\nsummary shows another Project's profile and Goals, read-only, only when the Founder asks to look at or\ncompare it. Nothing is ever copied between Projects.",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "description": "list; switch to `project`; create `name` and switch to it; rename `project` (default: the active one) to `name`; summary of `project`, read-only",
+      "enum": [
+       "list",
+       "switch",
+       "create",
+       "rename",
+       "summary"
+      ],
+      "title": "Action",
+      "type": "string"
+     },
+     "name": {
+      "anyOf": [
+       {
+        "maxLength": 80,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "the Project's name, e.g. the company",
+      "title": "Name"
+     },
+     "project": {
+      "anyOf": [
+       {
+        "maxLength": 80,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "a Project's id or name",
+      "title": "Project"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "coach_projectArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "active": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "the active Project {id, name}, or null when none is chosen",
+      "title": "Active"
+     },
+     "mode": {
+      "description": "single: one data folder, no Projects",
+      "enum": [
+       "projects",
+       "single"
+      ],
+      "title": "Mode",
+      "type": "string"
+     },
+     "note": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Note"
+     },
+     "projects": {
+      "items": {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      "title": "Projects",
+      "type": "array"
+     },
+     "summary": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "another Project's profile and Goals (read-only)",
+      "title": "Summary"
+     }
+    },
+    "required": [
+     "mode",
+     "active",
+     "projects"
+    ],
+    "title": "ProjectOut",
     "type": "object"
    },
    "annotations": {
@@ -1067,6 +1296,20 @@
       ],
       "title": "Entry"
      },
+     "project": {
+      "anyOf": [
+       {
+        "maxLength": 80,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "the id of the Project this save was proposed for (coach_get_context `project`); a write for any other Project than the active one is refused, so a switch between proposal and yes never saves to the wrong one",
+      "title": "Project"
+     },
      "request_id": {
       "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",
       "maxLength": 100,
@@ -1154,6 +1397,20 @@
       "default": null,
       "description": "the evidence, e.g. 'shipped pricing page, 3 calls booked'",
       "title": "Note"
+     },
+     "project": {
+      "anyOf": [
+       {
+        "maxLength": 80,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "the id of the Project this save was proposed for (coach_get_context `project`); a write for any other Project than the active one is refused, so a switch between proposal and yes never saves to the wrong one",
+      "title": "Project"
      },
      "request_id": {
       "description": "A fresh unique id for this write (e.g. a UUID); reuse it only to retry the same write, which then returns the first result",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 from . import domain as D
+from . import product
 from .store import FounderStore, week_start
 
 
@@ -12,9 +13,8 @@ def nudges(store: FounderStore) -> list[dict]:
     """[{kind, message, ids?}] most important first; empty when nothing is due."""
     out: list[dict] = []
     prof = store.profile()
-    if "stage" not in prof or "company" not in prof:
-        return [{"kind": "setup", "message": "No Founder profile yet: answer the Founder's question first, then "
-                 "offer the setup Playbook once (company, customer, Stage, one Goal, Check-in day)."}]
+    if any(f not in prof for f in D.REQUIRED):
+        return [{"kind": "setup", "message": D.SETUP_NUDGE}]
     today, week = store.today(), store.this_week()
     last = store.checkins(1)
     last_day = (dt.datetime.fromisoformat(last[0]["created_at"]).astimezone(store.tz()).date() if last else None)
@@ -49,6 +49,9 @@ def nudges(store: FounderStore) -> list[dict]:
                     "message": f"{len(late)} active Goal(s) past their target date ("
                                + "; ".join(f"{g['text'][:60]} by {g['target_date']}" for g in late[:3])
                                + "): ask whether each was met, should be dropped, or gets a new date"})
+    from . import product as _p
+    if _p.has("holdings"):
+        out += _holdings_nudges(store, prof, today)
     rev = store.decisions_to_revisit()
     if rev:
         out.append({"kind": "decision_revisit", "ids": [d["id"] for d in rev],
@@ -56,8 +59,37 @@ def nudges(store: FounderStore) -> list[dict]:
     return out
 
 
+def _holdings_nudges(store: FounderStore, prof: dict, today: dt.date) -> list[dict]:
+    """The investor Pack (I4): Holdings older than the person's review interval want a fresh import before any
+    review; a policy with targets but no Holdings yet wants a first one."""
+    snaps, _ = store.holdings()
+    if not snaps:
+        if "targets" in prof:
+            return [{"kind": "holdings_missing", "message": "No Holdings yet: import a positions CSV from each "
+                     "account (coach_holdings) before a review"}]
+        return []
+    latest: dict[str, str] = {}
+    for s in snaps:
+        latest[s["account"]] = max(latest.get(s["account"], ""), s["as_of"])
+    oldest = min(latest.values())
+    days = prof.get("review_days", {}).get("value")
+    if days and (today - dt.date.fromisoformat(oldest)).days > int(days):
+        old = sorted(a for a, d in latest.items() if (today - dt.date.fromisoformat(d)).days > int(days))
+        return [{"kind": "holdings_stale", "message": f"Holdings older than your {int(days)}-day review interval ("
+                 + ", ".join(f"{a} as of {latest[a]}" for a in old) + "): re-import those positions before a review"}]
+    return []
+
+
+# A Nudge about a memory module the Pack doesn't keep is never shown (ADR-0016: modules per Pack)
+NUDGE_MODULE = {"checkin_overdue": "checkins", "open_past_commitments": "commitments",
+                "goal_past_target": "goals", "decision_revisit": "decisions", "holdings_stale": "holdings",
+                "holdings_missing": "holdings"}
+
+
 def context(store: FounderStore, detailed: bool = False) -> dict:
-    """Everything a Playbook needs to start, in one read."""
+    """Everything a Playbook needs to start, in one read: only the memory modules this Pack keeps."""
+    from . import product
+    has = product.has
     week = store.this_week()
     prof = store.profile()
     ctx = {"today": store.today().isoformat(), "week": week,
@@ -67,12 +99,12 @@ def context(store: FounderStore, detailed: bool = False) -> dict:
            "profile": prof if detailed else {f: ({"value": v["value"], "stale": True,
                                                   "confirmed_on": v["confirmed_at"][:10]} if v["stale"] else v["value"])
                                              for f, v in prof.items()},
-           "goals": store.goals("active"),
-           "this_week": store.commitments(week),
-           "overdue": store.overdue_commitments(),
-           "last_checkin": (store.checkins(1) or [None])[0],
-           "recent_decisions": store.decisions(5),
-           "nudges": nudges(store)}
+           "goals": store.goals("active") if has("goals") else [],
+           "this_week": store.commitments(week) if has("commitments") else [],
+           "overdue": store.overdue_commitments() if has("commitments") else [],
+           "last_checkin": (store.checkins(1) or [None])[0] if has("checkins") else None,
+           "recent_decisions": store.decisions(5) if has("decisions") else [],
+           "nudges": [x for x in nudges(store) if x["kind"] not in NUDGE_MODULE or has(NUDGE_MODULE[x["kind"]])]}
     if not detailed:
         for c in ctx["this_week"] + ctx["overdue"]:
             c.pop("created_at", None)
@@ -89,9 +121,9 @@ def hook_text(store: FounderStore, limit: int = 1500) -> str:
     parts = [n["message"].rstrip(".") for n in items]
     if open_now and not any(n["kind"] == "setup" for n in items):
         parts.append(f"{open_now} open Commitment(s) this week")
-    text = ("Founder coach: " + " · ".join(parts) +
-            ". If the Founder raises startup work, answer it first, then offer the matching Playbook (check-in or "
-            "setup) once; otherwise don't interrupt.")
+    text = (f"{D.COACH_NAME}: " + " · ".join(parts) + product.reword(
+        ". If the Founder raises startup work, answer it first, then offer the matching Playbook (check-in or "
+        "setup) once; otherwise don't interrupt."))
     return text[:limit]
 
 
@@ -109,7 +141,7 @@ def render_markdown(store: FounderStore) -> str:
     """FOUNDER.md: what the coach believes, for the Founder to read and correct."""
     prof = store.profile()
     week = store.this_week()
-    lines = ["# What the founder coach remembers", "",
+    lines = [f"# What the {D.COACH_NAME.lower()} remembers", "",
              f"_Updated {store.now().astimezone(store.tz()).strftime('%Y-%m-%d %H:%M %Z')}. This file is "
              "regenerated after every change; edit through the coach (\"my stage is now MVP\"), not here._", ""]
     for n in nudges(store):
@@ -161,7 +193,30 @@ def render_markdown(store: FounderStore) -> str:
                      + (f" (revisit {d['revisit_on']})" if d.get("revisit_on") else "") + _cite(store, d["citations"]))
     if not ds:
         lines.append("_None yet._")
+    from . import product as _p
+    if _p.has("holdings"):
+        snaps, _ = store.holdings()
+        lines += ["", "## Holdings", ""]
+        latest = {}
+        for s in snaps:
+            latest[s["account"]] = s
+        from .invest import money
+        lines += [f"- {a}: {money(s['total_cents'])} as of {s['as_of']} ({s['broker']} export)"
+                  for a, s in sorted(latest.items())] or ["_None imported yet._"]
     lines += ["", "## Recent changes", ""]
     for ch in store.recent_changes(10):
         lines.append(f"- {ch['at'][:16].replace('T', ' ')} {ch['op']} {ch['entity']} `{ch['entity_id']}` ({ch['source']})")
+    return "\n".join(lines) + "\n"
+
+
+def render_common_markdown(store: FounderStore) -> str:
+    """YOU.md: the Common profile every coach on this machine may read (only the fields its Pack shares)."""
+    prof = store.profile()
+    lines = ["# What your coaches share about you", "",
+             f"_Updated {store.now().astimezone(store.tz()).strftime('%Y-%m-%d %H:%M %Z')}. Each coach reads only "
+             "the fields its Pack shares; nothing about a Project is kept here. Edit through a coach, not here._", ""]
+    for f, v in prof.items():
+        lines.append(f"- **{f.replace('_', ' ')}:** {v['value']}")
+    if not prof:
+        lines.append("_Nothing yet._")
     return "\n".join(lines) + "\n"

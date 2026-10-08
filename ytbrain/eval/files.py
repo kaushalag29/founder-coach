@@ -178,3 +178,31 @@ def write_private(private: Path, split: str, labels: dict[str, dict[str, dict]],
     _write_jsonl(private / "moments.jsonl", sorted(keep + spans, key=lambda r: (r["qid"], r["moment_id"])))
     atomic_write_text(path, trec)
     return True
+
+
+def seed_doc(q: dict) -> str | None:
+    """The Document a Tuning question was generated from: its seed Moment's id without the position."""
+    m = (q.get("creation") or {}).get("seed_moment")
+    return m.rsplit("_", 1)[0] if m and "_" in m else None
+
+
+def pack_doc_ids(pack: Path) -> set[str] | None:
+    """The Documents a Knowledge pack holds items from (None: no readable pack)."""
+    import sqlite3
+    path = Path(pack) / "knowledge.sqlite"
+    if not path.exists():
+        return None
+    try:
+        db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            return {r[0] for r in db.execute("SELECT DISTINCT doc_id FROM items")}
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+
+
+def about_docs(queries: list[dict], docs: set[str] | None) -> list[dict]:
+    """The questions seeded from these Documents (all of them when `docs` is None): a Pack is scored on what it
+    holds, so the coding pack isn't marked down for founder questions it was never meant to answer."""
+    return queries if docs is None else [q for q in queries if seed_doc(q) in docs]

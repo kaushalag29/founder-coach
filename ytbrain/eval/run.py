@@ -38,7 +38,7 @@ CONFIGS = {
     "pack-no-rerank": {"rerank": False, "stage_boost": False, "backend": "pack"},
     # the full index and models on the pack's content (no Passages): separates the cost of
     # dropping Passages from the cost of the smaller ONNX models
-    "full-no-passages": {"rerank": True, "stage_boost": False, "kinds": ["advice", "takeaway", "summary"]},
+    "full-no-passages": {"rerank": True, "stage_boost": False, "kinds": ["advice", "takeaway", "summary", "fact", "rule"]},
     # candidate diversity policies (founder_coach.search.POLICIES), source-agnostic: adopted as the
     # default only when they don't lower nDCG@10 overall or for any source kind's questions
     "full-series3": {"rerank": True, "stage_boost": False, "diversity": "series3"},
@@ -50,7 +50,7 @@ CONFIGS = {
     "full-route": {"rerank": True, "stage_boost": False, "route": True},
     "pack-route": {"rerank": False, "stage_boost": False, "backend": "pack", "route": True},
 }
-PACK_KINDS = ["advice", "takeaway", "summary"]
+PACK_KINDS = ["advice", "takeaway", "summary", "fact", "rule"]
 # below this share of judged top-10 Moments, a comparison says more about the pool than the
 # system: grade the run's new Moments first (`ytbrain eval judge`)
 JUDGED_MIN = 0.90
@@ -327,13 +327,18 @@ def reachable(store, kinds: list[str] | None) -> set[str] | None:
 def evaluate(store, embed, reranker, split: str, config: str, root: Path = EVAL_DIR,
              out_dir: Path = EVAL_DATA / "runs", baseline: str | None = None,
              save_baseline: bool = False, label: str | None = None,
-             private: Path | None = EVAL_PRIVATE) -> tuple[dict, int]:
+             private: Path | None = EVAL_PRIVATE, only_docs: set[str] | None = None) -> tuple[dict, int]:
     if label and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", label):
         raise RuntimeError("--label must be lowercase letters, digits and dashes, e.g. arctic-passages")
     queries, qrels = load_set(root, split, private)
     if not queries:
         raise RuntimeError(f"no {split} questions in {root} -- run `ytbrain eval build --set {split}` first")
     answerable = [q for q in queries if q.get("answerable", True)]
+    if only_docs is not None:                     # a Pack scored on the questions about what it holds
+        from .files import about_docs
+        answerable = about_docs(answerable, only_docs)
+        if not answerable:
+            raise RuntimeError(f"no {split} questions are about this pack's Documents")
     if baseline:
         _baseline_path(out_dir, split, baseline)          # fail before a 20-minute search, not after
     runs = run_config(store, embed, reranker, answerable, config)

@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,7 +26,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import domain as D
 from . import product
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MIGRATIONS: dict[int, list[str]] = {
     1: [
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -63,8 +64,20 @@ MIGRATIONS: dict[int, list[str]] = {
              run TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL,
              version TEXT, detail TEXT NOT NULL DEFAULT '{}')""",
         "CREATE INDEX usage_at ON usage (founder_id, at)"],
+    # v5: Holdings (the investor Pack, M6g): one snapshot per account and date, its positions in cents, and the
+    # person's own asset-class label per symbol. Every store gets the tables; only a Pack with `holdings` uses them.
+    5: ["""CREATE TABLE holdings_snapshots (id TEXT PRIMARY KEY, founder_id TEXT NOT NULL, account TEXT NOT NULL,
+             as_of TEXT NOT NULL, imported_at TEXT NOT NULL, broker TEXT NOT NULL, sha256 TEXT NOT NULL,
+             source TEXT NOT NULL, total_cents INTEGER NOT NULL)""",
+        "CREATE UNIQUE INDEX holdings_once ON holdings_snapshots (founder_id, account, as_of, sha256)",
+        """CREATE TABLE positions (snapshot_id TEXT NOT NULL, symbol TEXT NOT NULL, description TEXT,
+             quantity TEXT, value_cents INTEGER NOT NULL, csv_class TEXT)""",
+        "CREATE INDEX positions_snapshot ON positions (snapshot_id)",
+        """CREATE TABLE asset_classes (founder_id TEXT NOT NULL, symbol TEXT NOT NULL, asset_class TEXT NOT NULL,
+             set_at TEXT NOT NULL, PRIMARY KEY (founder_id, symbol))"""],
 }
-TABLES = ("profile_facts", "goals", "commitments", "decisions", "checkins", "feedback", "changes")
+TABLES = ("profile_facts", "goals", "commitments", "decisions", "checkins", "feedback", "changes",
+          "holdings_snapshots", "positions", "asset_classes")
 # the usage log is kept apart from TABLES: it isn't coaching memory, so it never makes the store
 # "have data" (daily backups) and never shows in FOUNDER.md; forget, export and restore still cover it
 USAGE_OUTCOMES = ("ok", "empty", "gap", "error")
@@ -116,13 +129,22 @@ def _j(v) -> str:
 
 
 class FounderStore:
+    """One store file. A Project's memory is `founder.db` (with FOUNDER.md); the Common profile the coaches
+    share is the same kind of store named `you` (you.db, YOU.md) that keeps only D.COMMON_FIELDS (ADR-0016).
+    A Project store given `common` reads the shared facts it doesn't set itself (`common_fields`)."""
+
     def __init__(self, home: str | Path | None = None, founder_id: str = "me",
-                 clock: Callable[[], dt.datetime] | None = None):
+                 clock: Callable[[], dt.datetime] | None = None, name: str = "founder",
+                 fields: tuple[str, ...] | None = None):
         self.home = Path(home).expanduser() if home else D.home()
         self.home.mkdir(parents=True, exist_ok=True)
-        self.path = self.home / "founder.db"
+        self.name = name
+        self.path = self.home / f"{name}.db"
         self.backups = self.home / "backups"
-        self.md_path = self.home / "FOUNDER.md"
+        self.md_path = self.home / f"{name.upper()}.md"
+        self.fields = tuple(fields) if fields else tuple(D.PROFILE_FIELDS)
+        self.common: FounderStore | None = None          # the Common profile (multi-Project mode only)
+        self.common_fields: tuple[str, ...] = ()         # the shared facts this Pack reads from it
         self.fid = founder_id
         self.clock = clock or _utc_now
         self.cite_check: Callable[[list[str]], list[str]] | None = None    # -> unknown ids
@@ -136,8 +158,17 @@ class FounderStore:
         self._conn.row_factory = sqlite3.Row
         self._file = _file_key(self.path)
         try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            # Switching a new file to WAL needs a moment alone with it, and SQLite answers "locked" at once
+            # instead of waiting: two coaches opening the shared Common profile together retry for a while.
+            for attempt in range(50):
+                try:
+                    self._conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower() or attempt == 49:
+                        raise
+                    time.sleep(0.1)
             self._migrate(existed)
         except sqlite3.DatabaseError as e:
             self._conn.close()
@@ -213,7 +244,7 @@ class FounderStore:
         return self.now().isoformat(timespec="seconds")
 
     def tz(self) -> ZoneInfo:
-        name = self._current_value("timezone") or D.system_timezone()
+        name = self._current_value("timezone") or self._common_value("timezone") or D.system_timezone()
         try:
             return ZoneInfo(name)
         except (ZoneInfoNotFoundError, ValueError):
@@ -227,7 +258,7 @@ class FounderStore:
 
     def _new_id(self, kind: str) -> str:
         table = {"goal": "goals", "commitment": "commitments", "decision": "decisions", "checkin": "checkins",
-                 "feedback": "feedback"}[kind]
+                 "feedback": "feedback", "holdings": "holdings_snapshots"}[kind]
         while True:
             rid = f"{D.ID_PREFIX[kind]}-{secrets.token_hex(2)}"
             if not self.db.execute(f"SELECT 1 FROM {table} WHERE id=?", (rid,)).fetchone():
@@ -279,7 +310,7 @@ class FounderStore:
             if not self._has_data():
                 return None
             self.backups.mkdir(parents=True, exist_ok=True)
-            dest = self.backups / f"founder-{label}.db"
+            dest = self.backups / f"{self.name}-{label}.db"
             # unique per process: two hosts may take the same daily backup at the same moment
             tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
             try:
@@ -302,11 +333,11 @@ class FounderStore:
     def _backup_if_due(self) -> None:
         """The day's first write takes a backup. A failed backup is logged, never a failed write."""
         day = self.today().isoformat()                 # the Founder's day, not UTC's
-        if (self.backups / f"founder-daily-{day}.db").exists():
+        if (self.backups / f"{self.name}-daily-{day}.db").exists():
             return
         try:
             if self.backup(f"daily-{day}"):
-                daily = sorted(self.backups.glob("founder-daily-*.db"))
+                daily = sorted(self.backups.glob(f"{self.name}-daily-*.db"))
                 for old in daily[:-DAILY_BACKUPS_KEPT]:
                     old.unlink(missing_ok=True)
         except (OSError, sqlite3.Error) as e:
@@ -367,6 +398,38 @@ class FounderStore:
             if v not in D.STAGES:
                 raise StoreError(f"stage must be one of: {', '.join(D.STAGES)}")
             return v
+        if kind == "allocation":
+            from .invest import check_targets
+            try:
+                return {k: float(v) for k, v in check_targets(value).items()}
+            except ValueError as e:
+                raise StoreError(f"{field}: {e}") from None
+        if kind == "percent":
+            try:
+                n = float(str(value).rstrip("%").strip())
+            except (TypeError, ValueError):
+                raise StoreError(f"{field} must be a percent, e.g. 10") from None
+            if not 0 < n <= 100:
+                raise StoreError(f"{field} must be more than 0 and at most 100")
+            return round(n, 2)
+        if kind == "symbols":
+            items = value if isinstance(value, list) else [x for x in str(value or "").replace(",", " ").split()]
+            out = []
+            for x in items:
+                sym = re.sub(r"\s+", "", str(x)).upper()
+                if not re.fullmatch(r"[A-Z0-9.\-/]{1,12}", sym):
+                    raise StoreError(f"{field}: {x!r} isn't a ticker symbol")
+                if sym not in out:
+                    out.append(sym)
+            if len(out) > 50:
+                raise StoreError(f"{field} takes at most 50 symbols")
+            return out
+        if kind == "enum":
+            v = str(value or "").strip().lower().replace(" ", "-").replace("_", "-")
+            allowed = D.FIELD_VALUES.get(field, ())
+            if v not in allowed:
+                raise StoreError(f"{field} must be one of: {', '.join(allowed)}")
+            return v
         if kind == "int":
             try:
                 n = int(value)
@@ -417,8 +480,40 @@ class FounderStore:
         row = self._current(field)
         return json.loads(row["value"]) if row else None
 
+    def _common_value(self, field: str):
+        """A shared fact from the Common profile, when this Pack reads that field; never fails a read."""
+        if self.common is None or field not in self.common_fields:
+            return None
+        try:
+            return self.common._current_value(field)
+        except sqlite3.Error:
+            return None
+
+    def shared_fields(self) -> list[str]:
+        """The profile fields whose value comes from the Common profile (not set in this Project)."""
+        if self.common is None or not self.common_fields:
+            return []
+        try:
+            mine = set(self._own_profile())
+            return [f for f in self.common._own_profile() if f in self.common_fields and f not in mine]
+        except sqlite3.Error:
+            return []
+
     def profile(self) -> dict[str, dict]:
-        """{field: {value, since, confirmed_at, stale}} for the fields that have a value."""
+        """{field: {value, since, confirmed_at, stale}} for the fields that have a value: this store's own
+        facts, then the Common profile's for the shared fields this store doesn't set."""
+        out = self._own_profile()
+        if self.common is not None and self.common_fields:
+            try:
+                shared = self.common._own_profile()
+            except sqlite3.Error:
+                shared = {}
+            for f, v in shared.items():
+                if f in self.common_fields and f not in out:
+                    out[f] = v
+        return {f: out[f] for f in D.PROFILE_FIELDS if f in out}
+
+    def _own_profile(self) -> dict[str, dict]:
         out = {}
         cutoff = self.now() - dt.timedelta(days=D.PROFILE_STALE_DAYS)
         with self._lock:
@@ -429,7 +524,7 @@ class FounderStore:
             out[r["field"]] = {"value": json.loads(r["value"]), "since": r["valid_from"],
                                "confirmed_at": r["confirmed_at"],
                                "stale": r["field"] not in D.NEVER_STALE and confirmed < cutoff}
-        return {f: out[f] for f in D.PROFILE_FIELDS if f in out}
+        return out
 
     def profile_history(self, field: str) -> list[dict]:
         with self._lock:
@@ -446,10 +541,10 @@ class FounderStore:
     def _update_profile(self, changes: dict, source: str) -> dict:
         if not isinstance(changes, dict) or not changes:
             raise StoreError("changes must be an object of field -> value, e.g. {\"stage\": \"mvp\"}")
-        unknown = [f for f in changes if f not in D.PROFILE_FIELDS]
+        unknown = [f for f in changes if f not in self.fields]
         if unknown:
             raise StoreError(f"unknown profile field(s): {', '.join(unknown)}. Fields: "
-                             + "; ".join(f"{f} ({d[1]})" for f, d in D.PROFILE_FIELDS.items()))
+                             + "; ".join(f"{f} ({D.PROFILE_FIELDS[f][1]})" for f in self.fields))
         clean = {f: self._profile_value(f, v) for f, v in changes.items()}
 
         def apply() -> dict:
@@ -473,6 +568,25 @@ class FounderStore:
             return {"updated": updated, "confirmed": confirmed,
                     "profile": {f: v["value"] for f, v in self.profile().items()}}
         return apply()
+
+    def retire_profile(self, fields, source: str, request_id: str | None = None) -> list[str]:
+        """End this store's own value of `fields` (kept in history, logged): used when a fact moves to the
+        Common profile, so the shared value isn't hidden behind an older local one. Returns the fields ended."""
+        want = [f for f in fields if f in D.PROFILE_FIELDS]
+
+        def apply() -> dict:
+            now, done = self._iso(), []
+            for f in want:
+                cur = self._current(f)
+                if cur is None:
+                    continue
+                self.db.execute("UPDATE profile_facts SET superseded_at=? WHERE id=?", (now, cur["id"]))
+                self._change("profile", f, "move_to_common", json.loads(cur["value"]), None, source)
+                done.append(f)
+            return {"retired": done}
+        if not want:
+            return []
+        return self._transact(request_id, apply, what=("retire", want))["retired"]
 
     # ------------------------------------------------------------------ records
     def record(self, entry: dict, request_id: str | None = None, source: str = "coach_record") -> dict:
@@ -856,6 +970,87 @@ class FounderStore:
             row = self.db.execute("SELECT MIN(at) FROM changes WHERE founder_id=?", (self.fid,)).fetchone()
         return dt.datetime.fromisoformat(row[0]) if row and row[0] else None
 
+    # ------------------------------------------------------------------ Holdings (the investor Pack)
+    def import_holdings(self, snapshots, source: str, request_id: str | None = None) -> dict:
+        """Save positions snapshots (founder_coach.invest.read_positions), once each: the same account, date and
+        file again is skipped, so a retried or repeated import never doubles a Project's money."""
+        snaps = list(snapshots)
+
+        def apply() -> dict:
+            now, done, skipped = self._iso(), [], []
+            for s in snaps:
+                if self.db.execute("SELECT 1 FROM holdings_snapshots WHERE founder_id=? AND account=? AND as_of=? "
+                                   "AND sha256=?", (self.fid, s.account, s.as_of, s.sha256)).fetchone():
+                    skipped.append({"account": s.account, "as_of": s.as_of})
+                    continue
+                sid = self._new_id("holdings")
+                self.db.execute("INSERT INTO holdings_snapshots VALUES (?,?,?,?,?,?,?,?,?)",
+                                (sid, self.fid, s.account, s.as_of, now, s.broker, s.sha256, source[:200],
+                                 s.total_cents))
+                self.db.executemany("INSERT INTO positions VALUES (?,?,?,?,?,?)",
+                                    [(sid, p.symbol, (p.description or "")[:200], p.quantity, p.value_cents,
+                                      p.csv_class) for p in s.positions])
+                self._change("holdings", sid, "import", None, {"account": s.account, "as_of": s.as_of,
+                                                                "positions": len(s.positions),
+                                                                "total_cents": s.total_cents}, source[:200])
+                done.append({"id": sid, "account": s.account, "as_of": s.as_of, "positions": len(s.positions),
+                             "total_cents": s.total_cents})
+            labels = self.asset_labels()
+            unlabelled = sorted({p.symbol for s in snaps for p in s.positions
+                                 if not labels.get(p.symbol) and not p.csv_class})
+            return {"imported": done, "skipped": skipped, "unlabelled": unlabelled}
+        what = ("holdings", [(s.account, s.as_of, s.sha256) for s in snaps])
+        return self._transact(request_id, apply, what=what)
+
+    def label_assets(self, labels: dict, request_id: str | None = None, source: str = "coach_holdings") -> dict:
+        """The person's asset class for each symbol (their word wins over anything a file said)."""
+        from .invest import ASSET_CLASSES
+        if not isinstance(labels, dict) or not labels:
+            raise StoreError("labels must be an object of symbol -> asset class, e.g. {\"VTI\": \"us_equity\"}")
+        clean = {}
+        for sym, cls in labels.items():
+            s = re.sub(r"\s+", "", str(sym)).upper()
+            c = str(cls or "").strip().lower().replace(" ", "_").replace("-", "_")
+            if not s or len(s) > 40:
+                raise StoreError(f"{sym!r} isn't a symbol")
+            if c not in ASSET_CLASSES:
+                raise StoreError(f"{sym}: asset class must be one of {', '.join(ASSET_CLASSES)}, got {cls!r}")
+            clean[s] = c
+
+        def apply() -> dict:
+            now = self._iso()
+            for s, c in clean.items():
+                before = self.db.execute("SELECT asset_class FROM asset_classes WHERE founder_id=? AND symbol=?",
+                                         (self.fid, s)).fetchone()
+                self.db.execute("INSERT OR REPLACE INTO asset_classes VALUES (?,?,?,?)", (self.fid, s, c, now))
+                self._change("asset_class", s, "update" if before else "create", before[0] if before else None, c,
+                             source)
+            return {"labelled": clean}
+        return self._transact(request_id, apply, what=("labels", clean))
+
+    def asset_labels(self) -> dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self.db.execute(
+                "SELECT symbol, asset_class FROM asset_classes WHERE founder_id=?", (self.fid,))}
+
+    def holdings(self) -> tuple[list[dict], dict[str, list[dict]]]:
+        """Every snapshot (oldest first) and its positions, for founder_coach.invest.review."""
+        snaps = self._rows("SELECT * FROM holdings_snapshots WHERE founder_id=? ORDER BY as_of, imported_at")
+        pos: dict[str, list[dict]] = {s["id"]: [] for s in snaps}
+        with self._lock:
+            for r in self.db.execute("SELECT p.* FROM positions p JOIN holdings_snapshots h ON h.id = p.snapshot_id "
+                                     "WHERE h.founder_id=?", (self.fid,)):
+                pos[r["snapshot_id"]].append({"symbol": r["symbol"], "description": r["description"],
+                                              "value_cents": r["value_cents"], "csv_class": r["csv_class"]})
+        return snaps, pos
+
+    def holdings_review(self) -> dict:
+        """A review of this Project's latest Holdings against its own Investment Policy Statement (profile)."""
+        from .invest import review
+        snaps, pos = self.holdings()
+        ips = {f: v["value"] for f, v in self._own_profile().items()}
+        return review(snaps, pos, self.asset_labels(), ips, self.today())
+
     # ------------------------------------------------------------------ Founder control
     def export(self, out_dir: Path | None = None) -> dict[str, Path]:
         out_dir = Path(out_dir) if out_dir else self.home / "exports" / self.now().strftime("%Y%m%dT%H%M%SZ")
@@ -867,6 +1062,10 @@ class FounderStore:
                 "decisions": self._rows("SELECT * FROM decisions WHERE founder_id=? ORDER BY decided_at"),
                 "checkins": self._rows("SELECT * FROM checkins WHERE founder_id=? ORDER BY created_at"),
                 "feedback": self.feedback_list(),
+                "holdings": self._rows("SELECT * FROM holdings_snapshots WHERE founder_id=? ORDER BY as_of"),
+                "positions": self._rows("SELECT p.* FROM positions p JOIN holdings_snapshots h ON h.id = "
+                                        "p.snapshot_id WHERE h.founder_id=?"),
+                "asset_classes": self.asset_labels(),
                 "usage": self.usage_rows(),
                 "changes": self._rows("SELECT * FROM changes WHERE founder_id=? ORDER BY seq")}
         j, md = out_dir / "founder-export.json", out_dir / "FOUNDER.md"
@@ -908,8 +1107,8 @@ class FounderStore:
 
     # ------------------------------------------------------------------ FOUNDER.md
     def markdown(self) -> str:
-        from .nudges import render_markdown
-        return render_markdown(self)
+        from .nudges import render_common_markdown, render_markdown
+        return render_markdown(self) if self.name == "founder" else render_common_markdown(self)
 
     def _write_markdown(self) -> None:
         try:

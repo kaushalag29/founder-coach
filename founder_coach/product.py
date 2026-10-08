@@ -23,6 +23,27 @@ except (OSError, ValueError, KeyError, TypeError) as e:
 if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", ID):
     raise RuntimeError(f"product.json: id {ID!r} must be lowercase letters, digits and hyphens")
 ENV_PREFIX: str = ID.upper().replace("-", "_") + "_"
+# The Pack this plugin is (ADR-0016): its Domains and the memory modules it keeps beyond the core (profile,
+# Feedback, usage). A product.json from before Packs is the founder Pack with every module.
+MODULES = ("goals", "commitments", "checkins", "decisions")     # a product.json from before Packs: the founder's
+# `common_fields`: the Common profile facts it reads and offers to share (absent: all of them; [] none).
+PACK: dict = {"id": "founder", "domains": [], "modules": list(MODULES), **(_DATA.get("pack") or {})}
+
+
+def reword(text: str) -> str:
+    """The shared runtime's text in this Pack's words: [runtime.replace] in pack.toml (longest phrase first,
+    e.g. "Founder" -> "Engineer"). The founder Pack replaces nothing, so its text is exactly as written."""
+    rep = (PACK.get("runtime") or {}).get("replace") or {}
+    if not rep or not text:
+        return text
+    import re as _re
+    keys = sorted(rep, key=len, reverse=True)
+    return _re.sub("|".join(_re.escape(k) for k in keys), lambda m: rep[m.group(0)], text)
+
+
+def has(module: str) -> bool:
+    """This Pack keeps `module` (goals, commitments, checkins, decisions)."""
+    return module in (PACK.get("modules") or ())
 
 
 def env_name(name: str) -> str:

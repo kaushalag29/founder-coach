@@ -401,17 +401,6 @@ def test_schema_version_change_invalidates_extract():
         assert m.needs("v1", "extract", "h1", "2.0.0")
 
 
-def test_schema_bump_makes_old_records_pending():
-    with tempfile.TemporaryDirectory() as d:
-        m = Manifest(Path(d) / "m.db")
-        for v, ver in (("old", "2.0.0"), ("new", "2.1.0")):
-            m.upsert_document(v, "s")
-            m.mark(StageState(v, "extract", "ok", version=ver))
-        assert m.pending("extract") == []
-        assert m.invalidate_old_versions("extract", "2.1.0") == 1
-        assert m.pending("extract") == ["old"]
-
-
 def test_only_flagged_records_are_redone():
     with tempfile.TemporaryDirectory() as d:
         m = Manifest(Path(d) / "m.db")
@@ -1126,6 +1115,938 @@ def test_extract_parks_a_rejected_request_and_marks_verify_stale_before_saving()
     assert "0 to extract" in out.getvalue() and "1 parked" in out.getvalue()    # not retried every run
 
 
+def test_extract_gives_up_on_a_document_with_no_progress_but_not_on_a_slow_one_that_reports_steps():
+    """A provider that trickles bytes never trips the request timeout: a Document whose extraction reports no new
+    step for EXTRACT_STALL_S is recorded as failed and a fresh worker takes its place. One that is slow but keeps
+    reporting steps (many calls, retries, backoff) is left alone, so a long talk is never cut off."""
+    import io, contextlib, threading, time, types
+    from unittest import mock
+    from ytbrain import cli, config
+    from ytbrain.config import MANIFEST_DB, TRANSCRIPTS
+    try:
+        from ytbrain.extract import runner
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    m = Manifest(MANIFEST_DB)
+    ids = ("sd1", "sd2", "sd3")
+    for d in ids:
+        m.upsert_document(d, "s", title=d, published_at="2030-01-01")
+        (TRANSCRIPTS / f"{d}.json").write_text(json.dumps({"doc_id": d, "utterances": _UTTS}))
+        m.mark(StageState(d, "clean", "ok"))
+    release = threading.Event()
+
+    class Rec:
+        def __init__(self, d):
+            self.d = d
+
+        def model_dump_json(self):
+            return json.dumps({"doc_id": self.d, "highlights": [], "advice_atoms": []})
+
+    def fake(transcript, meta, chapters, on_step=None):
+        d = meta["doc_id"]
+        if d == "sd1":                       # one request that never answers
+            on_step("extracting")
+            release.wait(30)
+        elif d == "sd2":                     # slow, but a step every 0.3 s, for longer than the stall limit
+            for k in range(6):
+                on_step(f"ch{k}")
+                time.sleep(0.3)
+        return Rec(d)
+
+    def run(fn):
+        with mock.patch.object(config, "LLM_BACKEND", "fake"), mock.patch.object(runner, "extract_video", fn), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = cli.cmd_extract(types.SimpleNamespace(limit=0, workers=2, retry_failed=False, doc=list(ids)))
+        return code, out.getvalue()
+
+    try:
+        with mock.patch.object(cli, "EXTRACT_STALL_S", 0.6):
+            code, out = run(fake)
+        release.set()
+        assert code == 0 and "2 records, 1 failed" in out and "no progress for" in out, out
+        assert m.stage_status("sd1", "extract") == "failed"
+        assert m.stage_status("sd2", "extract") == "ok" and m.stage_status("sd3", "extract") == "ok", \
+            "the slow Document that kept reporting steps, and the one the replacement worker took, are saved"
+        code, out = run(lambda tr, meta, ch, on_step=None: Rec(meta["doc_id"]))
+        assert code == 0 and "1 records" in out, "the rerun does only the one that stalled"
+        assert m.stage_status("sd1", "extract") == "ok"
+    finally:
+        release.set()
+
+
+
+# --- extraction versions (ADR-0018) ----------------------------------------
+
+def _registry(*startup, neutral=None):
+    """A stand-in VARIANTS: startup releases as (version, compat[, upcast]) and an optional neutral variant."""
+    from ytbrain.extract import versions as V
+    out = {"startup": V.Variant("startup", "test", tuple(V.Release(r[0], r[1], f"r{r[0]}", *r[2:]) for r in startup))}
+    if neutral:
+        out["neutral"] = V.Variant("neutral", "test", tuple(V.Release(r[0], r[1], f"r{r[0]}") for r in neutral))
+    return out
+
+
+def test_the_prompt_registry_is_sound_and_matches_the_schema_version():
+    from ytbrain.config import SCHEMA_VERSION
+    from ytbrain.extract import versions as V
+    assert V.problems() == [], V.problems()
+    assert V.VARIANTS[V.LEGACY_VARIANT].latest == SCHEMA_VERSION, "SCHEMA_VERSION is the startup variant's latest"
+    bad = _registry(("2.3.0", "compatible"), ("2.2.0", "breaking"))
+    assert any("oldest first" in p for p in V.problems(bad)) and any("starting point" in p for p in V.problems(bad))
+
+
+def test_a_prompt_change_needs_a_new_release():
+    """L3: every variant's latest release pins its prompt hashes; editing a prompt without declaring a
+    release (compatible or breaking) fails here instead of silently drifting under one version."""
+    from ytbrain.extract import versions as V
+    pinned = json.loads((Path(__file__).parent / "golden" / "prompt_versions.json").read_text())
+    for name in V.VARIANTS:
+        key = V.stamp(name)
+        now = V.fingerprints(name)
+        assert pinned.get(key) == now, (
+            f"the {name} prompt changed ({now}) but its latest release is still {key}: add a Release to VARIANTS in "
+            f"ytbrain/extract/versions.py (compatible, with an upcast if records change shape, or breaking), bump "
+            f"SCHEMA_VERSION if the generated schema changed, and pin the new hashes in tests/golden/prompt_versions.json")
+
+
+def test_a_compatible_release_leaves_records_valid_and_a_breaking_one_redoes_only_its_variant():
+    """L1: no global re-extract. Stamps from before variants ("2.2.0") belong to the startup variant."""
+    from unittest import mock
+    from ytbrain.extract import versions as V
+    with tempfile.TemporaryDirectory() as d:
+        m = Manifest(Path(d) / "m.db")
+        stamps = {"legacy": "2.2.0", "s22": "startup@2.2.0", "s23": "startup@2.3.0", "n10": "neutral@1.0.0",
+                  "old": "2.1.0", "none": None, "alien": "other@1.0.0"}
+        for doc, ver in stamps.items():
+            m.upsert_document(doc, "s")
+            m.mark(StageState(doc, "extract", "ok", version=ver))
+        with mock.patch.dict(V.VARIANTS, _registry(("2.2.0", "breaking"), ("2.3.0", "compatible"),
+                                                   neutral=[("1.0.0", "breaking")]), clear=True):
+            assert m.invalidate_versions("extract", V.is_current, "r") == 3
+            assert sorted(m.pending("extract")) == ["alien", "none", "old"], "only unknown or replaced stamps"
+        for doc in ("alien", "none", "old"):
+            m.mark(StageState(doc, "extract", "ok", version="startup@2.3.0"))
+        with mock.patch.dict(V.VARIANTS, _registry(("2.2.0", "breaking"), ("2.3.0", "compatible"), ("3.0.0", "breaking"),
+                                                   neutral=[("1.0.0", "breaking")]), clear=True):
+            m.invalidate_versions("extract", V.is_current, "r")
+            assert "n10" not in m.pending("extract"), "a breaking startup release leaves the neutral variant alone"
+            assert len(m.pending("extract")) == 6
+        assert m.versions("extract") == {"neutral@1.0.0": 1}
+
+
+def test_an_older_record_is_read_in_the_latest_shape_by_compatible_upcasts_in_order():
+    from unittest import mock
+    from ytbrain.extract import versions as V
+    def up23(r):
+        return {**r, "facets": ["stage=" + r.get("stage", "?")]}
+    def up24(r):
+        return {**r, "facets": r["facets"] + ["v24"]}
+    reg = _registry(("2.2.0", "breaking"), ("2.3.0", "compatible", up23), ("2.4.0", "compatible", up24))
+    rec = {"stage": "mvp", "extraction_meta": {"schema_version": "2.2.0"}}
+    with mock.patch.dict(V.VARIANTS, reg, clear=True):
+        assert V.upcast(rec)["facets"] == ["stage=mvp", "v24"]
+        later = {"facets": ["x"], "extraction_meta": {"prompt_variant": "startup", "schema_version": "2.3.0"}}
+        assert V.upcast(later)["facets"] == ["x", "v24"], "only the releases after the record's own"
+        latest = {"extraction_meta": {"schema_version": "2.4.0"}}
+        assert V.upcast(latest) is latest
+    assert rec == {"stage": "mvp", "extraction_meta": {"schema_version": "2.2.0"}}, "the record itself is not changed"
+
+
+def test_extract_stamps_a_new_record_with_its_variants_latest_and_redoes_nothing_else():
+    """L4 (extraction part): new content always gets the latest version; a valid older stamp stays 'ok'."""
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import cli, config
+    from ytbrain.config import MANIFEST_DB, SCHEMA_VERSION, TRANSCRIPTS
+    try:
+        from ytbrain.extract import runner
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    m = Manifest(MANIFEST_DB)
+    for d in ("vs-new", "vs-old"):
+        m.upsert_document(d, "s", title=d, published_at="2030-01-01")
+        (TRANSCRIPTS / f"{d}.json").write_text(json.dumps({"doc_id": d, "utterances": _UTTS}))
+        m.mark(StageState(d, "clean", "ok"))
+    m.mark(StageState("vs-old", "extract", "ok", version="2.2.0"))         # written before variants existed
+    class Rec:
+        def model_dump_json(self):
+            return json.dumps({"doc_id": "vs-new", "highlights": [], "advice_atoms": [],
+                               "extraction_meta": {"prompt_variant": "startup", "schema_version": SCHEMA_VERSION}})
+    with mock.patch.object(config, "LLM_BACKEND", "fake"), \
+         mock.patch.object(runner, "extract_video", lambda *a, **k: Rec()), \
+         contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+        cli.cmd_extract(types.SimpleNamespace(limit=0, workers=1, retry_failed=False, doc=["vs-"]))
+    assert m.stage("vs-new", "extract")["version"] == f"startup@{SCHEMA_VERSION}", out.getvalue()
+    assert m.stage_status("vs-old", "extract") == "ok", "a valid older stamp is not re-extracted"
+
+
+def _upgrade_fixture(m, docs):
+    from ytbrain.config import METADATA, TRANSCRIPTS
+    for d, cost, chars in docs:
+        m.upsert_document(d, "s", title=d)
+        m.mark(StageState(d, "extract", "ok", version="startup@2.2.0"))
+        calls = [{"kind": "extract", "cost": cost}] if cost is not None else [{"kind": "extract"}]
+        (METADATA / f"{d}.json").write_text(json.dumps({"doc_id": d, "source_kind": "talk",
+                                                        "extraction_meta": {"schema_version": "2.2.0", "calls": calls}}))
+        (TRANSCRIPTS / f"{d}.json").write_text(json.dumps({"doc_id": d, "utterances": [{"text": "x" * chars}]}))
+
+
+def test_upgrade_shows_the_cost_first_and_re_extracts_only_what_fits_the_cap():
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import cli
+    from ytbrain.config import MANIFEST_DB
+    from ytbrain.extract import versions as V
+    m = Manifest(MANIFEST_DB)
+    _upgrade_fixture(m, [("up-a", 0.01, 100), ("up-b", 0.02, 100), ("up-c", None, 300), ("up-d", 0.03, 100)])
+    args = lambda **k: types.SimpleNamespace(**{"dry_run": False, "max_cost": None, "variant": None, "doc": ["up-"], **k})
+    with mock.patch.dict(V.VARIANTS, _registry(("2.2.0", "breaking")), clear=True):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_upgrade(args(dry_run=True)) == 0
+        assert "nothing to do" in out.getvalue(), "everything on the latest version: nothing to upgrade"
+    with mock.patch.dict(V.VARIANTS, _registry(("2.2.0", "breaking"), ("2.3.0", "compatible")), clear=True):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_upgrade(args(dry_run=True)) == 0
+        text = out.getvalue()
+        # up-c has no past cost: its 300 characters at the median rate (0.0002 per character) = $0.06
+        assert "4 record(s) startup@2.2.0 -> startup@2.3.0" in text and "~$0.12" in text and "dry run" in text, text
+        assert all(m.stage_status(d, "extract") == "ok" for d in ("up-a", "up-b", "up-c", "up-d"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_upgrade(args(max_cost=0.035)) == 0
+        assert "2 record(s)" in out.getvalue() and "2 more stay as they are" in out.getvalue(), out.getvalue()
+        assert {"up-a", "up-b"} <= set(m.pending("extract")) and m.stage_status("up-c", "extract") == "ok"
+        assert m.stage_status("up-d", "extract") == "ok"
+    for d in ("up-a", "up-b", "up-c", "up-d"):
+        m.tombstone([d])
+
+
+def test_upgrade_refuses_a_cap_it_cannot_estimate():
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import cli
+    from ytbrain.config import MANIFEST_DB
+    from ytbrain.extract import versions as V
+    m = Manifest(MANIFEST_DB)
+    _upgrade_fixture(m, [("upx-a", None, 100)])
+    a = types.SimpleNamespace(dry_run=False, max_cost=1.0, variant=None, doc=["upx-"])
+    with mock.patch.dict(V.VARIANTS, _registry(("2.2.0", "breaking"), ("2.3.0", "compatible")), clear=True):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_upgrade(a) == 1
+    assert "can't be honoured" in out.getvalue() and m.stage_status("upx-a", "extract") == "ok"
+    m.tombstone(["upx-a"])
+
+
+def test_status_reports_records_per_extraction_version():
+    import io, contextlib, types
+    from ytbrain import cli
+    from ytbrain.config import MANIFEST_DB, SCHEMA_VERSION
+    m = Manifest(MANIFEST_DB)
+    m.upsert_document("st-legacy", "s")
+    m.mark(StageState("st-legacy", "extract", "ok", version=SCHEMA_VERSION))
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.cmd_status(types.SimpleNamespace())
+    assert f"startup@{SCHEMA_VERSION}:" in out.getvalue() and "latest" in out.getvalue(), out.getvalue()
+    m.tombstone(["st-legacy"])
+
+
+
+# --- inferred Domains: the tag Step (ADR-0017) ---------------------------------
+
+_AXES = ["GTM", "LEAD", "FIN", "START", "NOISE", "COOK", "PEOPLE", "SALESX"]
+
+
+def _axis_embed(texts):
+    """Texts -> unit vectors on marker axes (a text with GTM and LEAD lies between them)."""
+    import math as _m
+    out = []
+    for text in texts:
+        v = [float(text.split().count(a)) for a in _AXES]
+        n = _m.sqrt(sum(x * x for x in v)) or 1.0
+        out.append([x / n for x in v])
+    return out
+
+
+def _tag_registry():
+    from ytbrain import domains as D
+    return D.parse({"default": "startup", "domains": {
+        "startup": {"description": "START startups", "risk_tier": "medium"},
+        "gtm": {"description": "GTM selling", "risk_tier": "medium", "aliases": ["go-to-market", "sales", "marketing"]},
+        "leadership": {"description": "LEAD people", "risk_tier": "low", "aliases": ["management"]},
+        "finance": {"description": "FIN money", "risk_tier": "high"}}})
+
+
+def _tag_rows():
+    rows = [("psg:d1:1", "d1", "passage", "GTM"), ("psg:d1:2", "d1", "passage", "LEAD"),
+            ("psg:d1:3", "d1", "passage", "GTM LEAD"), ("psg:d1:4", "d1", "passage", "NOISE"),
+            ("adv:d1:a1", "d1", "advice", "FIN"), ("sum:d1", "d1", "summary", "GTM"),
+            ("psg:d2:1", "d2", "passage", "FIN"), ("psg:d3:1", "d3", "passage", "NOISE")]
+    out = [{"item_id": i, "doc_id": d, "kind": k, "text": f"text {x}", "source_id": "s1" if d != "d2" else "s2"}
+           for i, d, k, x in rows]
+    return out, _axis_embed([x for *_, x in rows])
+
+
+def test_domain_names_match_whatever_their_spelling_and_aliases_cannot_collide():
+    """L9: ~30 spellings of existing Domains and their aliases all resolve to the existing Domain."""
+    from ytbrain import domains as D
+    reg = _tag_registry()
+    variants = {"gtm": ["GTM", "gtm ", "G.T.M", "Go-To-Market", "go to market", "GO_TO_MARKET", "Sales", "sale",
+                        "SALES!", "Marketing", "marketings"],
+                "leadership": ["Leadership", "leaderships", "LEADERSHIP.", "Management", "managements", "management "],
+                "startup": ["Startups", "start-up", "STARTUP", "startup's"],
+                "finance": ["Finance", "finances", "FINANCE", "finance/"]}
+    for want, names in variants.items():
+        for n in names:
+            got = reg.lookup(n)
+            assert got == want, (n, got)
+    assert sum(len(v) for v in variants.values()) >= 25
+    assert reg.lookup("cooking") is None and D.norm_key("Systems Designs") == "system-design"
+    try:
+        D.parse({"domains": {"gtm": {"aliases": ["sales"]}, "sales-ops": {"aliases": ["Sale"]}}})
+        raise AssertionError("an alias naming another Domain must be refused")
+    except D.DomainConfigError as e:
+        assert "same name as" in str(e)
+
+
+def test_add_alias_keeps_comments_and_refuses_a_name_already_taken():
+    from ytbrain import domains as D
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "domains.yaml"
+        p.write_text("# my notes\ndefault: startup\ndomains:\n  startup:\n    description: \"x\"  # keep me\n"
+                     "    risk_tier: medium\n  gtm:\n    description: \"y\"\n    risk_tier: medium\n")
+        D.add_alias("gtm", "Go To Market", p)
+        reg = D.add_alias("gtm", "selling", p)
+        assert reg.get("gtm").aliases == ("Go To Market", "selling") and "# keep me" in p.read_text()
+        assert "# my notes" in p.read_text()
+        for bad in ("go-to-market", "Startup"):
+            try:
+                D.add_alias("gtm", bad, p)
+                raise AssertionError(bad)
+            except D.DomainConfigError as e:
+                assert "already names" in str(e)
+        assert D.folder_domain("/b/Go To Market/x.pdf", reg, [Path("/b")]) == "gtm", "an alias folder is its Domain"
+
+
+def test_the_tag_step_tags_by_content_breaks_close_calls_and_holds_high_tier_tags_for_review():
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    rows, vecs = _tag_rows()
+    s = T.Settings(floor=0.5, close=0.05, share=0.2, hint_bonus=0.02, min_passages=1)   # a 3-Passage fixture
+    asked = []
+
+    def ask(batch):
+        asked.append(batch)
+        return [["leadership"] for _ in batch], 0.01, 1
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        hints = {"d2": ["finance"]}
+        res = T.run(rows, vecs, reg, _axis_embed, hints, s, ask, db, "m", say=lambda m: None)
+        it = res.items
+        assert it["psg:d1:1"].domains == ("gtm",) and it["psg:d1:1"].origin == "embedding"
+        assert it["psg:d1:3"].domains == ("leadership",) and it["psg:d1:3"].origin == "tiebreak"
+        assert asked == [[("text GTM LEAD", ["gtm", "leadership"])]], "only close calls, only their candidates"
+        assert res.docs["d1"].domains == ("leadership", "gtm"), "a talk on two subjects gets both, by Passage share"
+        assert res.docs["d1"].shares == {"gtm": 0.333, "leadership": 0.667}
+        assert it["psg:d1:4"].origin == "inherited" and it["psg:d1:4"].domains == ("leadership", "gtm")
+        assert it["sum:d1"].domains == ("leadership", "gtm") and it["sum:d1"].origin == "document"
+        assert it["adv:d1:a1"].suggested == ("finance",) and "finance" not in it["adv:d1:a1"].domains, \
+            "an unconfirmed high-tier tag is only suggested"
+        assert res.docs["d2"].domains == ("finance",) and not res.docs["d2"].suggested, "a hint confirms it"
+        assert res.docs["d3"].origin == "default" and res.docs["d3"].domains == ("startup",) and res.unplaced == ["d3"]
+        db.replace(res.items, res.docs, {"tagger_version": "1"})
+        # L8: same input, same list -> same tags, and no model call (the cache answers)
+        again = T.run(rows, vecs, reg, _axis_embed, hints, s, ask, db, "m", say=lambda m: None)
+        assert len(asked) == 1 and again.cached == 1 and again.asked == 0
+        assert {k: (v.domains, v.suggested) for k, v in again.items.items()} == \
+            {k: (v.domains, v.suggested) for k, v in res.items.items()}
+        # a confirmation for the Source releases the suggestion
+        db.confirm(["source:s1"], "finance")
+        conf = T.run(rows, vecs, reg, _axis_embed, hints, s, ask, db, "m", say=lambda m: None)
+        assert "finance" in conf.items["adv:d1:a1"].domains and not conf.items["adv:d1:a1"].suggested
+        db.close()
+
+
+def test_aliases_name_domains_but_never_score_content_and_a_rejection_is_final():
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    texts = [x for _, x in T.profile_texts(reg)]
+    assert "sales" not in texts and "management" not in texts and "GTM selling" in texts, texts
+    from ytbrain import domains as D
+    neg = D.parse({"domains": {"investment": {"description": "INV portfolios", "risk_tier": "high",
+                                              "not_about": "raising money for a startup"},
+                               "finance": {"description": "FIN money", "risk_tier": "high"}}})
+    assert all("raising" not in x for _, x in T.profile_texts(neg)), "what a Domain is not is never embedded"
+    sent = []
+    T.llm_tiebreak.__wrapped__ if hasattr(T.llm_tiebreak, "__wrapped__") else None
+    from unittest import mock
+    from ytbrain.eval import llm
+    with mock.patch.object(llm, "ask", lambda prompt, cls, model: (sent.append(prompt), llm.Answer(None))[1]):
+        T.llm_tiebreak(neg, "m")([("text", ["finance", "investment"])])
+    assert "Not about: raising money for a startup" in sent[0], "the tie-break model reads it"
+    assert T.tiebreak_key("x", ["investment"], neg, "m") != T.tiebreak_key(
+        "x", ["investment"], D.parse({"domains": {"investment": {"description": "INV portfolios", "risk_tier": "high"}}}), "m")
+    rows, vecs = _tag_rows()
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        s = T.Settings(floor=0.5, close=0.05)
+        res = T.run(rows, vecs, reg, _axis_embed, {}, s, None, db, "m", say=lambda m: None)
+        assert res.items["adv:d1:a1"].suggested == ("finance",)
+        db.reject(["source:s1"], "finance")
+        res = T.run(rows, vecs, reg, _axis_embed, {}, s, None, db, "m", say=lambda m: None)
+        assert res.items["adv:d1:a1"].suggested == () and "finance" not in res.items["adv:d1:a1"].domains
+        assert res.awaiting_review == 1, "only d2's finance (source s2) is still awaiting review"
+        db.confirm(["source:s1"], "finance")                    # the later answer wins
+        res = T.run(rows, vecs, reg, _axis_embed, {}, s, None, db, "m", say=lambda m: None)
+        assert "finance" in res.items["adv:d1:a1"].domains and not db.rejections()
+        db.close()
+
+
+def test_one_stray_passage_never_decides_a_documents_domain():
+    """A Domain needs two Passages of the Document (or half of it): one Passage of five is noise."""
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    texts = [("psg:e1:1", "e1", "LEAD"), ("psg:e1:2", "e1", "LEAD"), ("psg:e1:3", "e1", "LEAD"),
+             ("psg:e1:4", "e1", "LEAD"), ("psg:e1:5", "e1", "FIN"),                 # 1 of 5 = 20 %: noise
+             ("psg:e2:1", "e2", "LEAD"), ("psg:e2:2", "e2", "FIN"),                 # 1 of 2 = half: kept
+             ("psg:e3:1", "e3", "GTM")]                                             # one Passage: it decides
+    rows = [{"item_id": i, "doc_id": d, "kind": "passage", "text": f"text {x}", "source_id": "s"} for i, d, x in texts]
+    vecs = _axis_embed([x for *_, x in texts])
+    res = T.run(rows, vecs, reg, _axis_embed, {}, T.Settings(floor=0.5, close=0.05), None, None, "m",
+                say=lambda m: None)
+    docs = {d: set(t.domains) | set(t.suggested) for d, t in res.docs.items()}
+    assert docs == {"e1": {"leadership"}, "e2": {"leadership", "finance"}, "e3": {"gtm"}}, docs
+    old = T.run(rows, vecs, reg, _axis_embed, {}, T.Settings(floor=0.5, close=0.05, min_passages=1), None, None, "m",
+                say=lambda m: None)
+    assert "finance" in set(old.docs["e1"].suggested), "min_passages=1 is the old rule (and in the tune grid)"
+    assert T.Settings().key() != T.Settings(min_passages=1).key(), "a labelled set passes for one rule only"
+
+
+def test_a_close_call_the_model_cannot_decide_is_cached_and_not_paid_for_again():
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    rows, vecs = _tag_rows()
+    s = T.Settings(floor=0.5, close=0.05, batch=1, workers=1)
+    asked = []
+
+    def unsure(batch):
+        asked.append(batch)
+        return [[] for _ in batch], 0.01, 1
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        first = T.run(rows, vecs, reg, _axis_embed, {}, s, unsure, db, "m", say=lambda m: None)
+        assert first.unresolved == 1 and len(asked) == 1
+        again = T.run(rows, vecs, reg, _axis_embed, {}, s, unsure, db, "m", say=lambda m: None)
+        assert len(asked) == 1 and again.undecided == 1 and again.unresolved == 1, "not asked (or paid for) again"
+        assert again.items["psg:d1:3"].domains == ("gtm", "leadership"), "it keeps every candidate"
+        T.run(rows, vecs, reg, _axis_embed, {}, s, unsure, db, "m", say=lambda m: None, retry_undecided=True)
+        assert len(asked) == 2, "--retry-undecided asks again"
+        T.run(rows, vecs, reg, _axis_embed, {}, s, unsure, db, "other-model", say=lambda m: None)
+        assert len(asked) == 3, "another model is a new question"
+        db.close()
+
+
+def test_a_tie_break_that_cannot_run_keeps_every_candidate_and_respects_the_spend_cap():
+    """R8 and L13."""
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    rows, vecs = _tag_rows()
+    s = T.Settings(floor=0.5, close=0.05, batch=1, workers=1)
+
+    def down(batch):
+        raise ConnectionError("endpoint unreachable")
+    said = []
+    res = T.run(rows, vecs, reg, _axis_embed, {}, s, down, None, "m", say=said.append)
+    assert res.items["psg:d1:3"].domains == ("gtm", "leadership") and res.items["psg:d1:3"].origin == "unresolved"
+    assert res.unresolved == 1 and any("unavailable" in m for m in said)
+    rows2 = rows + [{"item_id": "psg:d4:1", "doc_id": "d4", "kind": "passage", "text": "text LEAD GTM", "source_id": "s"}]
+    vecs2 = vecs + _axis_embed(["GTM LEAD"])
+    paid = []
+
+    def costly(batch):
+        paid.append(batch)
+        return [["gtm"] for _ in batch], 1.0, 1
+    res = T.run(rows2, vecs2, reg, _axis_embed, {}, s, costly, None, "m", max_cost=0.5, say=said.append)
+    assert len(paid) == 1 and res.asked == 1 and res.unresolved == 1, "stops asking at the cap; the rest wait"
+    dry = T.run(rows2, vecs2, reg, _axis_embed, {}, s, costly, None, "m", dry_run=True, say=said.append)
+    assert len(paid) == 1 and dry.est_calls == 2, "a dry run asks nothing and estimates the calls"
+    # each batch is cached when it arrives: an interrupted run keeps what it paid for
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        calls = {"n": 0}
+
+        def stop_after_one(batch):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise ConnectionError("dropped mid-run")
+            return [["gtm"] for _ in batch], 0.01, 1
+        T.run(rows2, vecs2, reg, _axis_embed, {}, s, stop_after_one, db, "m", say=said.append)
+        assert len(db.cached([T.tiebreak_key(r["text"], ["gtm", "leadership"], reg, "m")
+                              for r in rows2 if "LEAD" in r["text"] and "GTM" in r["text"]])) >= 1
+        assert T.Settings(workers=1).key() == T.Settings(workers=16).key(), "speed never changes the gate's key"
+        db.close()
+
+
+def test_propose_groups_unplaced_content_and_runs_the_four_duplicate_checks():
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    texts = ["COOK"] * 3 + ["SALESX"] * 3 + ["PEOPLE"] * 3
+    rows = [{"item_id": f"psg:p:{i:02d}", "doc_id": "p", "kind": "passage", "text": f"{x} {i}"} for i, x in enumerate(texts)]
+    vecs = _axis_embed(texts)
+    origins = {r["item_id"]: "inherited" for r in rows}
+    answers = {"COOK": {"name": "Cooking", "description": "COOK recipes", "examples": ["How long to rest dough?"],
+                        "risk_tier": "low", "relation": "new", "existing": None},
+               "SALESX": {"name": "Sales", "description": "selling", "relation": "new"},
+               "PEOPLE": {"name": "People Ops", "description": "hr things", "relation": "narrower",
+                          "existing": "leadership"}}
+
+    def ask_json(prompt):
+        assert "gtm: GTM selling (also: go-to-market, sales, marketing)" in prompt, "the whole list goes to the model"
+        return next(v for k, v in answers.items() if f"] {k} " in prompt)
+    props = {p.name: p for p in T.propose(rows, vecs, reg, _axis_embed, ask_json, origins, min_size=3)}
+    assert props["cooking"].verdict == "new" and props["cooking"].size == 3
+    assert props["sales"].verdict == "already gtm", "an alias of an existing Domain is never proposed"
+    assert props["people-ops"].verdict == "narrower than leadership"
+    assert T.clusters(vecs, [r["item_id"] for r in rows], min_size=3) == \
+        T.clusters(vecs, [r["item_id"] for r in rows], min_size=3), "deterministic"
+
+
+def test_the_labelled_set_scores_precision_recall_and_high_tier_misses():
+    """L6/L7 gate arithmetic, and the sheets the labels are written on."""
+    import csv
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    rows, vecs = _tag_rows()
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        res = T.run(rows, vecs, reg, _axis_embed, {"d2": ["finance"]}, T.Settings(floor=0.5, close=0.05),
+                    None, db, "m", say=lambda m: None)
+        db.replace(res.items, res.docs, {})
+        items, docs = T.sample_sheets(db, {"d1": "Talk one"}, {r["item_id"]: r["text"] for r in rows}, 5, 2)
+        assert len(items) == 5 and all(r["label"] == "" for r in items) and not any(r["item_id"].startswith("sum:") for r in items)
+        assert items == T.sample_sheets(db, {"d1": "Talk one"}, {r["item_id"]: r["text"] for r in rows}, 5, 2)[0]
+        p = Path(d) / "items.csv"
+        with open(p, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=T.SHEET_COLUMNS)
+            w.writeheader()
+            w.writerows([{"item_id": "psg:d1:1", "label": "Go-To-Market"}, {"item_id": "psg:d1:2", "label": "management"},
+                         {"item_id": "adv:d1:a1", "label": "finance"}, {"item_id": "psg:d2:1", "label": "finance|startup"},
+                         {"item_id": "psg:d1:4", "label": ""}, {"item_id": "psg:d3:1", "label": "astrology"}])
+        labels, bad = T.read_labels(p, "item_id", reg)
+        assert labels == {"psg:d1:1": {"gtm"}, "psg:d1:2": {"leadership"}, "adv:d1:a1": {"finance"},
+                          "psg:d2:1": {"finance", "startup"}} and bad == ["psg:d3:1: 'astrology' is not a Domain"]
+        r = T.score_labels(labels, {"d1": {"gtm", "leadership"}}, *T.current(db), reg)
+        # adv:d1:a1 predicted leadership+gtm, suggested finance -> 1 tp, 2 fp; psg:d2:1 misses startup
+        assert (r["precision"], r["recall"]) == (round(4 / 6, 4), round(4 / 5, 4)) and r["high_missed"] == []
+        assert r["documents"] == 1.0 and not r["passed"]
+        r2 = T.score_labels({"psg:d1:1": {"gtm", "finance"}}, {}, *T.current(db), reg)
+        assert r2["high_missed"] == ["psg:d1:1: finance"] and not r2["passed"], "a missed high-tier label fails the gate"
+        db.close()
+
+
+def test_tags_reach_the_index_only_after_the_labelled_set_passes_for_this_tagger():
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    s = T.Settings(floor=0.5)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "tags.json"
+        assert "no `ytbrain eval tags`" in T.gate(reg, s, p)
+        ok = {"passed": True, "tagger_version": T.TAGGER_VERSION, "domain_list": reg.fingerprint(), "settings": s.key()}
+        p.write_text(json.dumps(ok))
+        assert T.gate(reg, s, p) is None
+        p.write_text(json.dumps({**ok, "passed": False}))
+        assert "failed" in T.gate(reg, s, p)
+        p.write_text(json.dumps(ok))
+        assert "changed" in T.gate(reg, T.Settings(floor=0.6), p), "new thresholds need a new pass"
+        from ytbrain import domains as D
+        bigger = D.parse({"domains": {"startup": {"description": "START startups", "risk_tier": "medium"},
+                                      "cooking": {"description": "COOK"}}})
+        assert "changed" in T.gate(bigger, s, p), "a new Domain needs a new pass"
+
+
+def test_status_counts_leave_out_dropped_documents():
+    with tempfile.TemporaryDirectory() as d:
+        m = Manifest(Path(d) / "m.db")
+        for doc in ("keep", "gone"):
+            m.upsert_document(doc, "s")
+            m.mark(StageState(doc, "extract", "ok", version="2.2.0"))
+        m.db.execute("UPDATE documents SET tombstoned_at='2026-01-01' WHERE doc_id='gone'")
+        m.db.commit()
+        assert m.stats()["extract"] == 1 and m.versions("extract") == {"2.2.0": 1}
+
+
+
+# --- the subject-neutral prompt, parity and enrich (ADR-0018, M6c) -----------------
+
+def _neutral_answer(quote: str) -> str:
+    return json.dumps({"title_canonical": "Replication", "summary": "s", "topics": ["database replication"],
+                       "highlights": [{"text": "h", "evidence_span": quote}],
+                       "advice_atoms": [{"atom_id": "a01", "text": "Charge from day one", "applies_when": "a paid product",
+                                         "evidence_span": quote}],
+                       "facts": [{"fact_id": "f01", "text": "Users meet weekly", "evidence_span": quote}],
+                       "entities": {"organizations": ["Acme"], "concepts": ["replication"], "tools": ["Postgres"],
+                                    "works": ["DDIA"]}})
+
+
+def test_the_neutral_prompt_extracts_facts_and_conditions_into_the_same_stored_record():
+    try:
+        from ytbrain.extract import runner, versions
+        from ytbrain.knowledge.items import build_items
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    quote = _UTTS[3]["text"]
+    sent = []
+
+    def fake(prompt, schema, **kw):
+        sent.append((prompt, schema))
+        return _neutral_answer(quote)
+    runner.BACKENDS["fake-neutral"] = fake
+    tr = {"doc_id": "nv1", "utterances": _UTTS}
+    chaps = [{"chapter_id": "c1", "title": "All", "start_ms": 0}]
+    rec = runner.extract_video(tr, {"doc_id": "nv1", "title": "T", "series": "S", "source_kind": "talk",
+                                    "prompt_variant": "neutral"}, chaps, backend="fake-neutral").model_dump()
+    props = sent[0][1]["properties"]
+    assert "facts" in props and "category" not in props and "stage_relevance" not in props, "no startup taxonomy"
+    assert "applies_when" in sent[0][0] and "not as startup advice" in sent[0][0]
+    assert (rec["category"], rec["stage_relevance"], rec["topics"]) == ("other", [], ["database replication"])
+    assert rec["advice_atoms"][0]["applies_when"] == "a paid product" and rec["facts"][0]["text"] == "Users meet weekly"
+    assert rec["entities"]["companies"] == ["Acme"] and rec["entities"]["frameworks"] == ["replication", "Postgres"]
+    em = rec["extraction_meta"]
+    assert (em["prompt_variant"], em["schema_version"]) == ("neutral", versions.VARIANTS["neutral"].latest)
+    assert em["prompt_hash"] == versions.fingerprints("neutral")["talk"]
+    report = verify.verify_record(rec, _UTTS)
+    assert report["checked"] == 3 and report["failed"] == 0 and not report["issues"], "facts are verified too"
+    items = build_items(rec, None)
+    kinds = sorted(i["kind"] for i in items)
+    assert kinds == ["advice", "fact", "summary", "takeaway"], kinds
+    adv = next(i for i in items if i["kind"] == "advice")
+    assert adv["text"].endswith("(when: a paid product)") and adv["topics"] == ["database replication"]
+    # the startup prompt is unchanged for everything else
+    sent.clear()
+    runner.BACKENDS["fake-neutral"] = lambda prompt, schema, **kw: (sent.append((prompt, schema)), _gen(quote, n_high=1))[1]
+    old = runner.extract_video(tr, {"doc_id": "nv2", "title": "T", "series": "S", "source_kind": "talk"}, chaps,
+                               backend="fake-neutral").model_dump()
+    assert "category" in sent[0][1]["properties"] and old["extraction_meta"]["prompt_variant"] == "startup"
+    assert old["extraction_meta"]["prompt_hash"] == versions.fingerprints("startup")["talk"] and old["facts"] == []
+
+
+def test_which_prompt_a_document_gets():
+    from ytbrain.extract import versions as V
+    assert V.variant_for(None, None, False) == "startup", "nothing known yet: today's prompt"
+    assert V.variant_for(None, {"startup", "gtm", "finance"}, False) == "startup"
+    assert V.variant_for(None, {"coding"}, False) == "neutral"
+    assert V.variant_for(None, {"startup", "system-design"}, False) == "startup", \
+        "a founder Domain keeps today's prompt until parity (L1)"
+    assert V.variant_for(None, {"coding", "system-design", "investment"}, False) == "neutral"
+    assert V.variant_for(None, {"startup"}, True) == "neutral", "after parity, everything new"
+    p = V.parity_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_text(json.dumps({"passed": True, "neutral": V.stamp("neutral")}))
+        assert V.parity_passed() and V.variant_for(None, {"startup"}) == "neutral"
+        p.write_text(json.dumps({"passed": True, "neutral": "neutral@0.9.0"}))
+        assert not V.parity_passed(), "a pass for an older neutral prompt doesn't count"
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def _tagdb_with(docs: dict):
+    from ytbrain import tagging as T
+    db = T.TagDB()
+    db.replace({}, {d: T.DocTag("s", tuple(doms)) for d, doms in docs.items()}, {"applied": "0"})
+    db.close()
+
+
+def test_upgrade_moves_coding_chapters_to_the_neutral_prompt_and_leaves_startup_ones():
+    import io, contextlib, types
+    from ytbrain import cli
+    from ytbrain import tagging as T
+    from ytbrain.config import MANIFEST_DB
+    m = Manifest(MANIFEST_DB)
+    _upgrade_fixture(m, [("upn-a", 0.01, 100), ("upn-b", 0.01, 100)])
+    _tagdb_with({"upn-a": ["coding"], "upn-b": ["startup"]})
+    args = types.SimpleNamespace(dry_run=True, max_cost=None, variant=None, doc=["upn-"])
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_upgrade(args) == 0
+        assert "nothing to do" in out.getvalue(), "content tags alone never switch a prompt before parity (L1)"
+        real = cli._doc_tags
+        cli._doc_tags = lambda m, ids, default=True: {d: (["coding"] if d == "upn-a" else [], "s") for d in ids}
+        try:                                          # declared: a Book in the coding folder
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                assert cli.cmd_upgrade(args) == 0
+        finally:
+            cli._doc_tags = real
+        text = out.getvalue()
+        assert "1 record(s) startup@2.2.0 -> neutral@1.0.0" in text and "~$0.01" in text, text
+    finally:
+        T.TAGS_DB.unlink(missing_ok=True)
+        m.tombstone(["upn-a", "upn-b"])
+
+
+def test_parity_compares_both_prompts_on_the_same_talks_and_resumes():
+    from ytbrain.eval import parity as PA
+    quote = _UTTS[3]["text"]
+    old = {"doc_id": "p1", "highlights": [{"text": "a", "evidence_span": quote}, {"text": "b", "evidence_span": quote}],
+           "extraction_meta": {}}
+    good = {"doc_id": "p1", "highlights": [{"text": "a", "evidence_span": quote}],
+            "facts": [{"fact_id": "f01", "text": "f", "evidence_span": quote}],
+            "advice_atoms": [{"atom_id": "a01", "text": "x", "evidence_span": quote}],
+            "extraction_meta": {"calls": [{"cost": 0.01}]}}
+    bad = {**good, "facts": [{"fact_id": "f01", "text": "f", "evidence_span": "nothing like this appears anywhere at all ok"}],
+           "advice_atoms": [], "highlights": []}
+    extracted = []
+    with tempfile.TemporaryDirectory() as d:
+        def run(new, out):
+            def extract(tr, o):
+                extracted.append(o["doc_id"])
+                return new
+            return PA.run(["p1", "p2"], lambda doc: ({**old, "doc_id": doc}, {"utterances": _UTTS}), extract,
+                          verify.verify_record, Path(d) / out, "neutral@1.0.0", say=lambda m: None)
+        r = run(good, "a")
+        assert r["passed"] and r["n"] == 2 and r["neutral_items"] == 6 and r["startup_items"] == 4 and r["cost"] == 0.02
+        assert run(good, "a")["passed"] and extracted == ["p1", "p2"], "resumed from the shadow files: no new calls"
+        r = run(bad, "b")
+        assert not r["passed"] and "pass rate" in r["why"] and "Verified items" in r["why"]
+    assert not PA.summarize([], 30, "neutral@1.0.0")["passed"]
+
+
+def test_enrich_adds_rules_and_facts_whose_quotes_verify_and_never_runs_twice():
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import cli
+    from ytbrain import enrich as E
+    from ytbrain import tagging as T
+    from ytbrain.config import MANIFEST_DB, METADATA, TRANSCRIPTS
+    from ytbrain.knowledge.items import build_items
+    quote = _UTTS[5]["text"]
+    assert E.wants({"coding"}) and not E.wants({"startup", "gtm"})
+    rec = {"doc_id": "enr-a", "source_kind": "chapter", "title_canonical": "Ch", "series": "Book", "highlights": [],
+           "advice_atoms": [], "extraction_meta": {"processed_at": "2026-10-01T00:00:00Z", "prompt_hash": "x",
+                                                   "schema_version": "2.2.0", "calls": [{"cost": 0.01}]}}
+    p, cls = E.build_prompt(rec, {"utterances": _UTTS})
+    assert cls is E.RulesAndFacts and "RULES and FACTS" in p and "Chapter: Ch" in p and "Book: Book" in p
+    assert E.build_prompt({**rec, "facts": [{"text": "x"}]}, {"utterances": _UTTS})[1] is E.RulesOnly
+    m = Manifest(MANIFEST_DB)
+    m.upsert_document("enr-a", "s", title="Ch")
+    for st in ("clean", "extract", "verify"):
+        m.mark(StageState("enr-a", st, "ok", version="2.2.0" if st == "extract" else None))
+    (METADATA / "enr-a.json").write_text(json.dumps(rec))
+    (TRANSCRIPTS / "enr-a.json").write_text(json.dumps({"doc_id": "enr-a", "utterances": _UTTS}))
+    _tagdb_with({"enr-a": ["coding"]})
+    answer = E.RulesAndFacts(rules=[E._Rule(rule_id="z9", text="Always version your API", authority="the author",
+                                            evidence_span=quote)],
+                             facts=[E._Fact(fact_id="q", text="Weekly user calls are held", evidence_span=quote)])
+    args = lambda **k: types.SimpleNamespace(**{"dry_run": False, "max_cost": None, "doc": ["enr-"], "limit": 0, **k})
+    try:
+        with mock.patch.object(E, "llm_ask", lambda model: (lambda prompt, c: (answer, 0.003))):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                assert cli.cmd_enrich(args(dry_run=True)) == 0
+            assert "1 Document(s)" in out.getvalue() and "~$0.01" in out.getvalue(), out.getvalue()
+            assert m.stage_status("enr-a", "enrich") is None
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                assert cli.cmd_enrich(args()) == 0
+            new = json.loads((METADATA / "enr-a.json").read_text())
+            assert [r["rule_id"] for r in new["rules"]] == ["r01"] and [f["fact_id"] for f in new["facts"]] == ["f01"]
+            assert new["extraction_meta"]["enrich"]["version"] == E.PROMPT_VERSION
+            assert m.stage_status("enr-a", "verify") == "stale" and m.stage("enr-a", "enrich")["version"] == E.STAMP
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                cli.cmd_enrich(args())
+            assert "0 Document(s)" in out.getvalue(), "enriched once per extraction and prompt"
+        report = verify.verify_record(new, _UTTS)
+        assert report["checked"] == 2 and report["failed"] == 0
+        rule = next(i for i in build_items(new, None) if i["kind"] == "rule")
+        assert rule["item_id"] == "rul:enr-a:r01" and rule["text"] == "Always version your API [the author]"
+    finally:
+        T.TAGS_DB.unlink(missing_ok=True)
+        m.tombstone(["enr-a"])
+
+
+
+# --- enrich runs its model calls in parallel, as extract does ---------------
+
+def _enrich_fixture(prefix: str, n: int):
+    """n coding Documents, verified and waiting to be enriched; returns (manifest, ids, the answer every call gives)."""
+    from ytbrain import enrich as E
+    from ytbrain.config import MANIFEST_DB, METADATA, TRANSCRIPTS
+    quote = _UTTS[5]["text"]
+    m = Manifest(MANIFEST_DB)
+    ids = [f"{prefix}{k}" for k in range(1, n + 1)]
+    for d in ids:
+        rec = {"doc_id": d, "source_kind": "chapter", "title_canonical": f"Ch {d}", "series": "Book", "highlights": [],
+               "advice_atoms": [], "extraction_meta": {"processed_at": "2026-10-01T00:00:00Z", "prompt_hash": "x",
+                                                       "schema_version": "2.2.0", "calls": [{"cost": 0.01}]}}
+        m.upsert_document(d, "s", title=f"Ch {d}")
+        for st in ("clean", "extract", "verify"):
+            m.mark(StageState(d, st, "ok", version="2.2.0" if st == "extract" else None))
+        (METADATA / f"{d}.json").write_text(json.dumps(rec))
+        (TRANSCRIPTS / f"{d}.json").write_text(json.dumps({"doc_id": d, "utterances": _UTTS}))
+    _tagdb_with({d: ["coding"] for d in ids})
+    answer = E.RulesAndFacts(rules=[E._Rule(rule_id="z9", text="Always version your API", authority="the author",
+                                            evidence_span=quote)],
+                             facts=[E._Fact(fact_id="q", text="Weekly user calls are held", evidence_span=quote)])
+    return m, ids, answer
+
+
+def _enrich_run(prefix, fake_ask, **kw):
+    """cmd_enrich over the Documents with this prefix, the model replaced by fake_ask(prompt, cls) -> (answer, cost)."""
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import cli
+    from ytbrain import enrich as E
+    args = types.SimpleNamespace(**{"dry_run": False, "max_cost": None, "doc": [prefix], "limit": 0, **kw})
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(E, "llm_ask", lambda model: fake_ask):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.cmd_enrich(args)
+    return code, out.getvalue(), err.getvalue()
+
+
+def _enrich_cleanup(m, ids):
+    from ytbrain import tagging as T
+    T.TAGS_DB.unlink(missing_ok=True)
+    m.tombstone(ids)
+
+
+def test_enrich_in_parallel_gives_the_same_records_and_writes_only_on_the_main_thread():
+    """`--workers N` runs the model calls on N threads; the records, the manifest states and the progress are those of a
+    serial run, and every file write happens on the calling thread (one SQLite writer, as in extract)."""
+    import threading, time
+    from unittest import mock
+    from ytbrain import cli
+    from ytbrain import enrich as E
+    from ytbrain.config import METADATA
+    results = {}
+    for tag, workers in (("enrs", 1), ("enrp", 4)):
+        m, ids, answer = _enrich_fixture(tag, 6)
+        lock, active, peak, wrote_on = threading.Lock(), [0], [0], set()
+
+        def ask(prompt, cls, answer=answer, lock=lock, active=active, peak=peak):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.1)
+            with lock:
+                active[0] -= 1
+            return answer, 0.003
+
+        real = cli.pages.write_record
+        try:
+            with mock.patch.object(cli.pages, "write_record",
+                                   lambda rec, real=real, w=wrote_on: (w.add(threading.current_thread().name), real(rec))[1]):
+                code, out, err = _enrich_run(tag, ask, workers=workers)
+            assert code == 0, (out, err)
+            assert wrote_on == {threading.current_thread().name}, "writes stay on the main thread"
+            assert f"{workers} worker(s)" in out and "(6/6)" in out and "6 Document(s) enriched, 0 failed" in out, out
+            assert all(m.stage(d, "enrich")["version"] == E.STAMP and m.stage_status(d, "verify") == "stale" for d in ids)
+            results[workers] = ([json.loads((METADATA / f"{d}.json").read_text())["rules"] for d in ids], peak[0])
+        finally:
+            _enrich_cleanup(m, ids)
+    assert results[1][1] == 1 and 2 <= results[4][1] <= 4, "serial stays serial; four workers overlap, never more than four"
+    assert results[1][0] == results[4][0], "the same records however many workers"
+
+
+def test_enrich_default_workers_are_extracts_and_the_spend_cap_stops_new_calls_only():
+    """No --workers: YTBRAIN_LLM_WORKERS, like extract. --max-cost stops dispatching; calls in flight finish, so a
+    parallel run overshoots by fewer Documents than workers; a second run does the rest and nothing twice."""
+    import threading, time
+    from unittest import mock
+    from ytbrain import config
+    m, ids, answer = _enrich_fixture("enrc", 12)
+    lock, active, peak, calls = threading.Lock(), [0], [0], []
+
+    def ask(prompt, cls):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            calls.append(1)
+        time.sleep(0.1)
+        with lock:
+            active[0] -= 1
+        return answer, 0.003
+
+    try:
+        with mock.patch.object(config, "LLM_WORKERS", 3):
+            code, out, err = _enrich_run("enrc", ask, max_cost=0.01)
+        assert code == 0 and "3 worker(s)" in out and "spend cap $0.01" in out, out
+        assert peak[0] == 3, "the default is extract's LLM_WORKERS"
+        done = [d for d in ids if m.stage_status(d, "enrich") == "ok"]
+        assert 4 <= len(done) <= 4 + 2, "at most workers - 1 Documents past the cap"
+        assert f"stopped at the spend cap" in out and f"{12 - len(done)} Document(s) wait for the next run" in out, out
+        before = len(calls)
+        code, out, err = _enrich_run("enrc", ask, workers=2)
+        assert code == 0 and len(calls) - before == 12 - len(done), "the rest, and nothing twice"
+        assert all(m.stage_status(d, "enrich") == "ok" for d in ids)
+    finally:
+        _enrich_cleanup(m, ids)
+
+
+def test_enrich_a_refusing_endpoint_stops_the_run_and_a_failing_document_does_not():
+    """BackendUnavailable stops everything (exit 1, nothing in flight marked); one Document's error is recorded and
+    the others are saved, then a rerun does only that one."""
+    import threading
+    from unittest import mock
+    from ytbrain import runstatus
+    from ytbrain.extract import runner
+    m, ids, answer = _enrich_fixture("enrf", 6)
+    bad, attempts = ids[2], []
+
+    def flaky(prompt, cls):
+        if f"Ch {bad}" in prompt:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ValueError("garbled")
+        return answer, 0.003
+
+    def refusing(prompt, cls):
+        raise runner.BackendUnavailable("credits exhausted")
+
+    try:
+        code, out, err = _enrich_run("enrf", flaky, workers=3)
+        assert code == 0 and "5 Document(s) enriched, 1 failed" in out and "FAILED" in out, out
+        assert [d for d in ids if m.stage_status(d, "enrich") == "ok"] == [d for d in ids if d != bad]
+        assert m.stage_status(bad, "enrich") != "ok"
+        code, out, err = _enrich_run("enrf", flaky, workers=3)
+        assert code == 0 and "1 Document(s) enriched" in out and len(attempts) == 2, "a rerun does only the failed one"
+    finally:
+        _enrich_cleanup(m, ids)
+    m, ids, answer = _enrich_fixture("enrx", 6)
+    try:
+        with mock.patch.object(runstatus, "record", lambda *a, **k: None):
+            code, out, err = _enrich_run("enrx", refusing, workers=3)
+        assert code == 1 and "credits exhausted" in err and "STOPPED" in out, (out, err)
+        assert all(m.stage_status(d, "enrich") is None for d in ids), "nothing in flight is marked, ok or failed"
+    finally:
+        _enrich_cleanup(m, ids)
+
+
+def test_enrich_gives_up_on_a_call_that_never_answers_and_the_rerun_does_only_that_one():
+    """A provider that hangs on one request (it trickles bytes, so no timeout trips) must not hold the whole run:
+    that Document is recorded as failed after the deadline, a fresh worker takes its place, the others are saved."""
+    import threading
+    from unittest import mock
+    from ytbrain import cli
+    m, ids, answer = _enrich_fixture("enrh", 5)
+    release = threading.Event()
+
+    def hung(prompt, cls):
+        if f"Ch {ids[1]}" in prompt:
+            release.wait(30)
+        return answer, 0.003
+
+    try:
+        with mock.patch.object(cli, "ENRICH_CALL_DEADLINE_S", 0.6):
+            code, out, err = _enrich_run("enrh", hung, workers=2)
+        release.set()
+        assert code == 0 and "4 Document(s) enriched, 1 failed" in out and "no answer after" in out, out
+        assert m.stage_status(ids[1], "enrich") != "ok" and all(m.stage_status(d, "enrich") == "ok" for d in ids if d != ids[1])
+        code, out, err = _enrich_run("enrh", lambda p, c: (answer, 0.003), workers=2)
+        assert code == 0 and "1 Document(s) enriched" in out, "the rerun does only the one that hung"
+    finally:
+        _enrich_cleanup(m, ids)
+
+
 # --- serialization + lock --------------------------------------------------
 
 def test_atomic_write_replaces_whole_file_and_leaves_no_temp():
@@ -1252,7 +2173,7 @@ def _run():
 
 def test_rate_halves_on_429_bursts_and_climbs_back():
     from ytbrain.extract import runner
-    saved = (runner._min_interval[0], runner._rpm_ceiling[0], runner._rpm_changed[0])
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
     try:
         runner.set_max_rpm(60)
         t = 1000.0
@@ -1273,19 +2194,114 @@ def test_rate_halves_on_429_bursts_and_climbs_back():
         runner.set_max_rpm(4)                                # a ceiling under the floor is respected
         assert runner._rate_limited(t2 + 9000) == 4
     finally:
-        runner._min_interval[0], runner._rpm_ceiling[0], runner._rpm_changed[0] = saved
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
 
 
 def test_a_429_right_after_a_speed_up_still_cuts_the_rate():
     from ytbrain.extract import runner
-    saved = (runner._min_interval[0], runner._rpm_ceiling[0], runner._rpm_changed[0], runner._rpm_cut[0])
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
     try:
         runner.set_max_rpm(60)
         assert runner._rate_limited(1000.0) == 30
         assert runner._went_through(1061.0) == 36            # a quiet minute: speed up
         assert runner._rate_limited(1065.0) == 18            # 4 s later a 429: cut again, not ignored
     finally:
-        runner._min_interval[0], runner._rpm_ceiling[0], runner._rpm_changed[0], runner._rpm_cut[0] = saved
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
+
+
+def test_an_upstream_429_slows_only_that_model_but_an_account_429_slows_all():
+    """OpenRouter says "qwen/x is temporarily rate-limited upstream": that model's limit. It must not hold
+    back the other judges; a 429 that names no upstream is the account's and still slows every model."""
+    from ytbrain.extract import runner
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
+    try:
+        runner.set_max_rpm(60)
+        assert runner._rate_limited(1000.0, key="qwen") == 30
+        assert runner.current_rpm("qwen") == 30 and runner.current_rpm("gemma") == 60
+        assert runner.current_rpm() == 30                    # no key: the slowest model, for "is anything throttled"
+        assert runner._went_through(1061.0, key="gemma") is None     # gemma is at its ceiling: nothing to raise
+        assert runner._went_through(1061.0, key="qwen") == 36        # each model climbs back by itself
+        assert runner.current_rpm("gemma") == 60
+        assert runner._rate_limited(2000.0, key="gemma", everyone=True) == 30
+        assert runner.current_rpm("qwen") == 18 and runner.current_rpm("gemma") == 30
+    finally:
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
+
+
+def test_a_pause_holds_one_model_unless_the_limit_is_the_accounts():
+    from unittest import mock
+    from ytbrain.extract import runner
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
+    try:
+        with mock.patch.object(runner.time, "sleep"), mock.patch.object(runner, "_say"):
+            runner._acquire_slot("https://openrouter.ai/api/v1", "gemma")      # creates both schedules
+            runner._acquire_slot("https://openrouter.ai/api/v1", "qwen")
+            runner._backoff(0, "30", "HTTP 429 from qwen", pause_all=True, key="qwen", everyone=False)
+            assert runner._pacers["qwen"].pause_until > runner.time.monotonic() + 20
+            assert runner._pacers["gemma"].pause_until == 0.0
+            runner._backoff(0, "30", "HTTP 429", pause_all=True, key="qwen", everyone=True)
+            assert runner._pacers["gemma"].pause_until > runner.time.monotonic() + 20
+    finally:
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
+
+
+def test_post_with_backoff_names_the_throttled_model_and_leaves_the_others_alone():
+    """The 429 text decides the scope: an upstream one is the body's model's alone."""
+    from types import SimpleNamespace as NS
+    from unittest import mock
+    from ytbrain.extract import runner
+    upstream = ('{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":'
+                '"qwen/qwen3.8-flash is temporarily rate-limited upstream."}}}')
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
+    notes: list[str] = []
+    runner._tls.on_step = notes.append
+    try:
+        runner.set_max_rpm(60)
+        with mock.patch("httpx.post", return_value=NS(status_code=429, text=upstream, headers={})), \
+                mock.patch.object(runner.time, "sleep"):
+            try:
+                runner._post_with_backoff("https://openrouter.ai/api/v1/chat/completions",
+                                          {"model": "qwen/qwen3.8-flash"}, 5, {})
+            except runner.RetriesExhausted:
+                pass
+            else:
+                raise AssertionError("six 429s should exhaust the retries")
+        assert runner.current_rpm("qwen/qwen3.8-flash") < 60 and runner.current_rpm("google/gemma-4-31b-it") == 60
+        assert any("slowing qwen/qwen3.8-flash to" in n for n in notes), notes
+        assert any("HTTP 429 from qwen/qwen3.8-flash, retry 1/" in n for n in notes), notes
+        notes.clear()
+        with mock.patch("httpx.post", return_value=NS(status_code=429, text="Too many requests", headers={})), \
+                mock.patch.object(runner.time, "sleep"):
+            try:
+                runner._post_with_backoff("https://openrouter.ai/api/v1/chat/completions",
+                                          {"model": "google/gemma-4-31b-it"}, 5, {})
+            except runner.RetriesExhausted:
+                pass
+        assert any("slowing every model to" in n for n in notes), notes      # no upstream named: the account's limit
+        assert runner.current_rpm("qwen/qwen3.8-flash") < 60 and runner.current_rpm("google/gemma-4-31b-it") < 60
+    finally:
+        runner._tls.on_step = None
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
+
+
+def test_the_providers_whole_429_reason_is_kept_in_the_error():
+    """"(Alibaba) Rate limit exceeded ... add your own key" sat past character 200 and was cut off."""
+    from types import SimpleNamespace as NS
+    from unittest import mock
+    from ytbrain.extract import runner
+    reason = "x" * 230 + " (Alibaba) Rate limit exceeded. Consider adding your own API key"
+    saved, runner._pacers = runner._rpm_ceiling[0], {}
+    try:
+        with mock.patch("httpx.post", return_value=NS(status_code=429, text=reason, headers={})), \
+                mock.patch.object(runner.time, "sleep"), mock.patch.object(runner, "_say"):
+            try:
+                runner._post_with_backoff("https://openrouter.ai/api/v1/chat/completions", {"model": "m"}, 5, {})
+            except runner.RetriesExhausted as e:
+                assert "adding your own API key" in str(e), str(e)
+            else:
+                raise AssertionError("six 429s should exhaust the retries")
+    finally:
+        runner._rpm_ceiling[0], runner._pacers = saved, {}
 
 
 def test_retry_after_is_honoured_but_capped():
@@ -1503,7 +2519,7 @@ def test_the_domains_command_lists_adds_and_ignores():
                 assert cli.main(["domains", "ignore", "to-read"]) == 0
                 assert cli.main(["domains"]) == 0
             text = out.getvalue()
-            assert "added `legal` (high risk)" in text and "ytbrain index" in text
+            assert "added `legal` (high risk)" in text and "ytbrain tag" in text
             assert "legal" in text and "high" in text and "ignore_folders: to-read" in text, text
             with contextlib.redirect_stderr(io.StringIO()) as err:
                 assert cli.main(["domains", "add", "legal", "--risk", "low", "--description", "x"]) == 2

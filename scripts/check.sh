@@ -1,6 +1,6 @@
 #!/bin/sh
 # What CI runs (.github/workflows/ci.yml), on your machine, before you push:
-#   sh scripts/check.sh                 # secret scan, the seven offline suites, generated files, plugin validator
+#   sh scripts/check.sh                 # secret scan, the nine offline suites, generated files, the three plugins assembled and validated
 #   PYTHON=/path/to/python sh scripts/check.sh
 # As a git pre-commit hook it runs on every `git commit`; `git commit --no-verify` skips it (docs/release.md).
 #   SKIP_VALIDATE=1 sh scripts/check.sh # without `claude plugin validate`
@@ -19,7 +19,7 @@ export REQUIRE_ALL_TESTS=1 YTBRAIN_DOTENV=0 PYTHONDONTWRITEBYTECODE=1 YTBRAIN_RO
 echo "== secret scan"
 "$PY" scripts/check_secrets.py
 
-for s in core eval pack coach plugin web books; do
+for s in core eval pack coach projects invest plugin web books; do
   echo "== test_$s"
   "$PY" "tests/test_$s.py" > "$TMP/$s.log" 2>&1 || { grep -v "^  PASS" "$TMP/$s.log" | tail -40; echo "FAILED: test_$s (a 'skipped in CI' line means an extra is missing: uv pip install -e \".[serve,pack,dev,web]\" \"lancedb>=0.39.0\")"; exit 1; }
   tail -1 "$TMP/$s.log"
@@ -37,6 +37,10 @@ from pathlib import Path
 from test_pack import HashEmbed, _build
 _build(Path('$TMP/pack'), emb=HashEmbed())")
 "$PY" scripts/assemble_plugin.py --pack "$TMP/pack" --out "$TMP/plugin" --check > "$TMP/assemble.log" 2>&1 || { cat "$TMP/assemble.log"; exit 1; }
+for pack in coding investor; do      # one plugin per Pack (ADR-0016): each assembles and checks, as in CI
+  "$PY" scripts/assemble_plugin.py --for "$pack" --pack "$TMP/pack" --out "$TMP/plugin-$pack" --check > "$TMP/assemble-$pack.log" 2>&1 \
+    || { cat "$TMP/assemble-$pack.log"; echo "FAILED: the $pack plugin does not assemble"; exit 1; }
+done
 after="$(cat founder_coach/product.json founder_coach/playbooks/*.md | cksum)"
 if [ "$before" != "$after" ]; then
   echo "FAILED: founder_coach/product.json or playbooks/ were stale; the assembler just regenerated them. Review and commit."; exit 1
@@ -44,7 +48,9 @@ fi
 
 if [ "${SKIP_VALIDATE:-0}" != "1" ] && command -v claude >/dev/null 2>&1; then
   echo "== claude plugin validate"
-  claude plugin validate "$TMP/plugin" --strict
+  for plugin in plugin plugin-coding plugin-investor; do
+    claude plugin validate "$TMP/$plugin" --strict
+  done
 else
   echo "== claude plugin validate: skipped (no claude on PATH, or SKIP_VALIDATE=1)"
 fi

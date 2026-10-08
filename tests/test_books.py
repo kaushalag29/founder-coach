@@ -712,7 +712,7 @@ def test_book_sync_warns_about_a_folder_that_is_not_a_domain_and_strict_makes_it
             for strict in (False, True):
                 said.clear()
                 res = ad.sync(m, [src], SimpleNamespace(strict_domains=strict))
-                assert any("sytem-design/" in line and "declared Domain" in line for line in said), said
+                assert any("sytem-design/" in line and "not a Domain name" in line for line in said), said
                 assert not any("finance/" in line and "declared Domain" in line for line in said)
                 assert res["code"] == 1, "the unreadable test PDFs are refused either way"
             assert (runstatus.read() or {}).get("reason") == "config", "strict tells `ops` to stop, not to retry the network"

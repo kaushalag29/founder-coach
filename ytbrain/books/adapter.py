@@ -89,10 +89,10 @@ class BookAdapter:
             claimed: dict[str, str] = {}                 # book id -> the file that registered it this run
             for folder, n in self._stray(src, files).items():
                 from ..domains import folder_key
-                say(f"  warning: {n} Book(s) in {folder}/ are not in a declared Domain, so they take "
-                    f"{', '.join(src.get('domains') or ['the default Domain'])}. Declare it: "
-                    f"`ytbrain domains add {folder_key(folder)} --risk low|medium|high --description \"...\"`; "
-                    f"or, if it only sorts files: `ytbrain domains ignore {folder}`")
+                say(f"  note: {folder}/ ({n} Book(s)) is not a Domain name, so it gives no hint; `ytbrain tag` tags its "
+                    f"Books by what they say (ADR-0017). To make the folder a Domain: `ytbrain domains add "
+                    f"{folder_key(folder)} --risk low|medium|high --description \"...\"` (or `ytbrain domains alias "
+                    f"<domain> \"{folder}\"`); if it only sorts files: `ytbrain domains ignore {folder}`")
                 if getattr(args, "strict_domains", False):
                     code = code or 1
                     config_stop = True

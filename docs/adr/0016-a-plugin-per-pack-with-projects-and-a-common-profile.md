@@ -1,10 +1,10 @@
 ---
-status: proposed
+status: accepted
 ---
 # A plugin per Pack; memory isolated per Project, with one shared Common profile
 
 Amends ADR-0015 ("one plugin and one MCP server host every installed Pack") and ADR-0012 (the data
-folder follows the product id). Each Pack installs as its own plugin (`founder-coach`, `systems-coach`,
+folder follows the product id). Each Pack installs as its own plugin (`founder-coach`, `coding-coach`,
 `investor-coach`) with its own skills, MCP server, Knowledge pack and coaching loop. Inside a Pack, the
 unit of isolation is a **Project** (a company, a system, a portfolio): its profile facts, Goals,
 Decisions, Commitments, Check-ins and holdings never appear in another Project. What is true of the
@@ -18,23 +18,28 @@ overrides; the engine id is one configured value, like ADR-0012's product id):
 ~/.ytbrain/
   you.db                          Common profile + its change log (ADR-0011 shape)
   models/                         embedder and reranker, one copy for every Pack
-  <pack>/                         founder/, systems/, investor/
-    pack/                         the installed Knowledge pack
-    projects/<project-id>.db      Pack memory of one Project: facts, Goals, Decisions, ... + its change log
-    last-project                  the last-used Project id: a new session's default (one line, written atomically)
-    exports/
+  <pack>/                         founder/, coding/, investor/
+    pack/                         a Knowledge pack installed by hand (the plugin ships its own)
+    projects/<project-id>/        one Project: founder.db (its memory + change log), FOUNDER.md,
+                                  backups/, exports/, project.json (its display name)
+    last-project                  the last-used Project id: the default of the CLI and the session hook
 ```
 
-One SQLite file per Project gives physical isolation: no query can join two Projects, a Project is
-exported, backed up or forgotten as one file, and a schema migration runs per file. `you.db` is small
+One SQLite file per Project, in its own folder, gives physical isolation: no query can join two Projects,
+a Project is exported, backed up or forgotten on its own, and a schema migration runs per file. The folder
+(not a bare file) keeps the store's existing neighbours (FOUNDER.md, daily backups, exports) beside it,
+so the store code is unchanged; the id is the folder name and never changes, a rename only edits
+`project.json`. `you.db` is small
 and opened by several plugins at once (WAL, busy timeout); writes to it are rare and confirmed.
 
 Rules that make the isolation hold:
-- Every Pack-memory read and write names its Project; the server rejects a write whose Project is not
-  the active one (a session that switched elsewhere cannot write into the old Project).
-- The active Project belongs to the session (the server holds it in memory), so two sessions in two
+- Every Pack-memory read and write goes to the session's active Project; a write may name the Project it
+  was proposed for (`project`), and the server refuses it when that is not the active one (a session that
+  switched between the proposal and the yes cannot write into the wrong Project).
+- The active Project belongs to the session (the server process holds it in memory), so two sessions in two
   Projects never read each other's memory; every context response names it, and every save prompt names
-  the Project it saves to.
+  the Project it saves to. One Project is chosen by itself; with several, a new session reads and saves no
+  memory until the person says which (the CLI and the hook default to the last one used, and say so).
 - Switching Projects is an explicit request; context lists the Pack's Project names, never their contents.
   Two Projects are read together only when the person's current message names both: summaries only,
   nothing saved, no Nudges from it.
@@ -43,9 +48,12 @@ Rules that make the isolation hold:
   memory tools.
 - An investor Project is a goal with its own Investment Policy Statement, holding several accounts.
 - Promotion from a Project to the Common profile happens only on the person's yes, and only for fields
-  the Pack declares promotable (`pack.yaml: common_fields`). The investor Pack declares none: holdings,
+  the Pack declares promotable (`pack.toml: common_fields`); sharing a fact ends the active Project's own
+  older value of it, so the shared one is what every Project reads (a Project's own value otherwise wins). The investor Pack declares none: holdings,
   amounts and its Investment Policy Statement never leave their Project.
 - No Pack reads another Pack's folder.
+- Pinning a data folder (`<PREFIX>HOME`, `--home`) keeps the single-folder layout from before Projects:
+  no Projects and no Common profile (tests, the G2-G6 evals, anyone who chose a folder).
 
 ## Considered Options
 
@@ -61,9 +69,13 @@ Rules that make the isolation hold:
 
 ## Consequences
 
-Today's `~/.founder-coach/founder.db` migrates forward once, with a backup: rows go to
-`founder/projects/<company-slug>.db`, the few person-level facts to `you.db`, each move logged in the
-change log; a re-run is a no-op and the old folder is left untouched. A question spanning two Packs is
+Today's `~/.founder-coach/founder.db` migrates forward once: copied with SQLite's backup API (consistent
+even while an older coach has it open) into `founder/projects/<company-slug>/`, checked, given a
+`founder-migrated.db` backup, and its timezone moved to `you.db` (the move logged in the change log); a
+marker file makes a re-run a no-op, a lock file keeps two starting processes from both moving it, a store
+that fails its check is not moved (and is retried at the next start), and the old folder is left untouched
+as the backup. The search models stay in `~/.founder-coach/models` until `~/.ytbrain/models` exists, so an
+update never downloads them again. A question spanning two Packs is
 answered by the host searching both plugins' knowledge when both are installed; no server searches across
 Packs, and no Pack reads another's memory.
 Project isolation becomes a release gate (G7) for every Pack.

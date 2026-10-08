@@ -1,5 +1,110 @@
 {
-  "_generated": "from product.toml by scripts/assemble_plugin.py; edit product.toml",
+  "_generated": "from packs/founder/pack.toml by scripts/assemble_plugin.py; edit that file",
   "display_name": "Founder Coach",
-  "id": "founder-coach"
+  "id": "founder-coach",
+  "pack": {
+    "id": "founder",
+    "domains": [
+      "startup",
+      "gtm",
+      "leadership",
+      "finance"
+    ],
+    "modules": [
+      "goals",
+      "commitments",
+      "checkins",
+      "decisions"
+    ],
+    "common_fields": [
+      "timezone",
+      "name",
+      "role",
+      "answer_style"
+    ],
+    "prompts": [
+      "ask",
+      "weekly-focus",
+      "check-in",
+      "setup"
+    ],
+    "profile": [
+      {
+        "name": "company",
+        "kind": "text",
+        "description": "company name",
+        "stale": true
+      },
+      {
+        "name": "one_liner",
+        "kind": "text",
+        "description": "what the company does, in one sentence",
+        "stale": true
+      },
+      {
+        "name": "customer",
+        "kind": "text",
+        "description": "who the customer is",
+        "stale": true
+      },
+      {
+        "name": "stage",
+        "kind": "stage",
+        "description": "one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit",
+        "stale": true
+      },
+      {
+        "name": "team_size",
+        "kind": "int",
+        "description": "number of people working on the company",
+        "stale": true
+      },
+      {
+        "name": "key_metrics",
+        "kind": "metrics",
+        "description": "the few numbers that matter now, e.g. {\"MRR\": \"$4k\", \"design partners\": 3}",
+        "stale": true
+      },
+      {
+        "name": "timezone",
+        "kind": "tz",
+        "description": "IANA time zone, e.g. Asia/Kolkata",
+        "stale": false
+      },
+      {
+        "name": "checkin_day",
+        "kind": "weekday",
+        "description": "preferred Check-in day: mon, tue, wed, thu, fri, sat, sun",
+        "stale": false
+      },
+      {
+        "name": "workspace",
+        "kind": "places",
+        "description": "where the Founder keeps their own data, in their words: {what: tool or place}, e.g. {\"pipeline\": \"HubSpot\", \"metrics\": \"Google Sheet 'KPIs'\", \"investor updates\": \"Drive folder 'Updates'\"}",
+        "stale": false
+      },
+      {
+        "name": "name",
+        "kind": "text",
+        "description": "what to call the person",
+        "stale": false
+      },
+      {
+        "name": "role",
+        "kind": "text",
+        "description": "the person's role, e.g. CEO, CTO, solo founder",
+        "stale": false
+      },
+      {
+        "name": "answer_style",
+        "kind": "text",
+        "description": "how they like answers, e.g. 'short, bullet points first'",
+        "stale": false
+      }
+    ],
+    "required": [
+      "company",
+      "stage"
+    ]
+  }
 }

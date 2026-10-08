@@ -18,8 +18,8 @@ knowledge, and is growing into a founder-coach served over MCP.
 ## Commands
 
 - Setup: `uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"` (what CI installs; with less, suites skip tests). Everything: `".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"`
-- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the seven suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
-- Tests: `for s in core eval pack coach plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
+- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the nine suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
+- Tests: `for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
 - CLI reference: `ytbrain --help` and `README.md`. Testing the whole system end to end (what CI covers and what only you can run): `docs/testing.md`.
 - Plugin: edit `plugin/skills/*/SKILL.md`, never `founder_coach/playbooks/*.md` or `founder_coach/product.json` (generated); `python scripts/assemble_plugin.py --pack data/pack --check` builds `dist/plugin`. `plugin/` is a template: load `dist/plugin`, not `plugin/`.
 - Repos, CI and releases: `docs/release.md` (`.github/workflows/ci.yml`, `scripts/release.py`, `scripts/check_secrets.py`).
@@ -39,10 +39,25 @@ knowledge, and is growing into a founder-coach served over MCP.
 - **Atomic writes:** write files with `pages.atomic_write_text` (temp file + rename), never in place.
 - **Damaged input goes upstream:** a missing or corrupt input sends the Document back to the Step
   that produces it (mark that Step `stale`), rather than skipping it.
-- **Schema:** any change to what the model generates (`Generated`, `Overview`, `ChapterList` in
-  `ytbrain/extract/schema.py`) bumps `SCHEMA_VERSION` in `config.py`, which re-extracts older
-  records; `tests/golden/generated_schema.json` pins it. Given fields (url, series, source_kind…)
-  may be added with defaults that match existing records, without a bump (ADR-0013).
+- **Schema and prompts (ADR-0018):** any change to what the model generates (`Generated`, `Overview`,
+  `ChapterList` in `ytbrain/extract/schema.py`) or to an extraction prompt is a new release of its prompt
+  variant in `ytbrain/extract/versions.py`, declared **compatible** (older records stay valid; add an
+  `upcast` if their shape changed) or **breaking** (they re-extract). Bump `SCHEMA_VERSION` with the
+  schema; pin the hashes in `tests/golden/generated_schema.json` and `tests/golden/prompt_versions.json`
+  (tests fail otherwise). Never re-extract the whole Library to ship a change. Given fields (url, series,
+  source_kind…) may be added with defaults that match existing records, without a release (ADR-0013).
+  Two variants today: `startup` (2.2) and the subject-neutral `neutral` (Facts, Advice with `applies_when`,
+  free-text topics); `variant_for` picks one per Document from its Domains and the parity result, and both
+  record shapes are read everywhere (verify, items). Facts and Rules are verified like Advice.
+- **Domains are inferred, against a controlled list (ADR-0017):** `ytbrain/tagging.py` tags Passages and
+  items by content; configuration (`domains:` on a Source, a Book's folder) is a hint. Never let a tagger
+  invent a Domain name (closed list, "none fits" allowed), never apply a high-tier tag without a hint or a
+  confirmation, and keep tagging deterministic (embeddings first; model tie-breaks cached). Tags reach the
+  index only after `ytbrain eval tags` passes (`tag --gated`).
+- **Packs (ADR-0016):** one plugin per Pack, defined in `packs/<id>/pack.toml` (identity, Domains, memory modules,
+  skills, MCP prompts, builds). `product.toml` holds only what every Pack shares. The founder Pack builds today's
+  plugin from the shared `plugin/skills/`; a Pack's own `packs/<id>/skills/<name>/` overrides one. Coaches find each
+  other through `~/.ytbrain/installed/` (knowledge only, never another coach's memory).
 - **Source types:** a new one is an adapter (`sync` + `clean` to the shared text-units transcript)
   registered in `ytbrain/sources.py`, plus a `SourceKind` in `ytbrain/source_kinds.py` if its Documents need a new
   Locator; nothing after `clean` may depend on the Source type (ADR-0013).

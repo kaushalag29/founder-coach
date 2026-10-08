@@ -174,7 +174,7 @@ def _check(tmp: Path, rows: list[dict], matrix, embedder) -> None:
         store.close()
 
 
-def domain_info(rows: list[dict], registry=None) -> dict:
+def domain_info(rows: list[dict], registry=None, only=None) -> dict:
     """What every declared Domain is about (description, risk tier, example questions, freshness half-life,
     web policy), from domains.yaml, whether the pack has items in it or not: the host reads it to choose
     Domains when it searches, and a declared Domain with no items is how it learns that the Library has
@@ -184,9 +184,13 @@ def domain_info(rows: list[dict], registry=None) -> dict:
     reg = registry or D.load()
     out = {}
     for name in reg.names:
+        if only is not None and name not in only:            # a Pack describes only its own Domains
+            continue
         dom = reg.get(name)
         info = {"description": dom.description, "risk_tier": dom.risk_tier,
                 "examples": list(dom.examples)[:3], "web_policy": dom.web_policy}
+        if dom.not_about:
+            info["not_about"] = dom.not_about
         if dom.half_life_days:
             info["freshness_days"] = dom.half_life_days
         out[name] = info
@@ -214,7 +218,8 @@ def content_hash(rows: list[dict], matrix, meta: dict) -> str:
 def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
                kinds: tuple[str, ...] = P.KINDS, batch: int = 64, say=print,
                source_info: dict | None = None, include_private: bool = False,
-               route: dict | None = None, calibration: dict | None = None) -> dict:
+               route: dict | None = None, calibration: dict | None = None,
+               domains: tuple[str, ...] | None = None, pack_id: str | None = None) -> dict:
     """Build out_dir/knowledge.sqlite + pack.json from `source.rows(kinds=...)`.
     A Private Source's items (your own Books, ADR-0014) are left out unless `include_private`:
     such a pack is for your own coach only, and `scripts/release.py` refuses it. `route` (settings such as
@@ -228,6 +233,11 @@ def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
     for old in out_dir.glob(f".{P.PACK_FILE}.tmp-*"):        # left by a killed build
         old.unlink(missing_ok=True)
     raw = list(source.rows(kinds=list(kinds)))
+    if domains:                    # one Pack (ADR-0016): items in any of its Domains
+        mine = set(domains)
+        before = len(raw)
+        raw = [r for r in raw if mine & set(r.get("domains") or (DEFAULT_DOMAIN,))]
+        say(f"pack: {len(raw)} of {before} items are in {pack_id or 'this Pack'}'s Domains ({', '.join(domains)})")
     private = [r for r in raw if (r.get("visibility") or "public") == "private"]
     if private and not include_private:
         say(f"pack: leaving out {len(private)} private items (your Books; `--include-private` "
@@ -258,7 +268,8 @@ def build_pack(source, embedder, out_dir: Path, *, rerank_model: str | None,
             "rerank_model": rerank_model or "none",
             "source": source_info or {},
             "private_items": len(private) if include_private else 0,
-            "domain_info": domain_info(rows),
+            "domain_info": domain_info(rows, only=set(domains) if domains else None),
+            "pack": {"id": pack_id or "", "domains": list(domains or [])},
             "router": {"enabled": route is not None, **(route or {})},
             **corpus_stats(rows)}
     if calibration and calibration.get("embed_model") == embedder.name and (calibration.get("points") or "shift" in calibration):

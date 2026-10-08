@@ -21,6 +21,12 @@ use them. A new user, or any new Document, never sees the 2.2 prompt. Older reco
 version only when an eval shows a Pack held back by them, for that Pack's Documents, or when the owner
 runs `ytbrain upgrade`; the mapping code is removed once no record uses it.
 
+Until the neutral prompt passes its parity check on startup talks (`ytbrain eval parity`), it is used only for
+Documents *declared* wholly outside the founder Pack's Domains: a Book in a coding, system-design or investment
+folder, a Source configured with such `domains`. Content tags alone never switch a Document's prompt, and a
+Document with any founder Domain keeps the startup prompt, so the founder coach's knowledge does not move before
+parity (on the 2026-10-05 Library: 167 Book chapters, against 514 had tags decided it).
+
 ## Considered Options
 
 - **One global version (today):** simple, but every improvement costs a full re-extract, so

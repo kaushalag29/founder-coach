@@ -1,18 +1,14 @@
-# The product's identity: the one place its name lives (ADR-0012).
+# What every Pack's plugin shares (ADR-0012, ADR-0016); each Pack's identity is in packs/<id>/pack.toml.
 # scripts/assemble_plugin.py writes these into everything that ships (plugin.json, .mcp.json,
 # hooks.json, the plugin's pyproject.toml, the skills; scripts/release.py writes marketplace.json) and into
-# founder_coach/product.json, which the runtime reads. To rename: edit `id`, run the
+# founder_coach/product.json, which the runtime reads. To rename a Pack: edit `id` in its pack.toml, run the
 # assembler, run the tests. A changed `id` changes the install id, the slash-command prefix,
-# the CLI, the Founder's data folder (~/.<id>) and the settings prefix (<ID>_*), so testers
+# the CLI, the data folder (~/.<id>) and the settings prefix (<ID>_*), so testers
 # reinstall and move their data folder once.
 
 [product]
-id = "founder-coach"                   # lowercase letters, digits and hyphens
-display_name = "Founder Coach"
-# What search engines, the plugin browser and GitHub show. "YC" and "Y Combinator" go here,
-# never in the id or display name.
-description = "An AI startup coach personalized to your company: cited advice from Y Combinator talks for your Stage, a weekly Focus of up to three Commitments, and Check-ins that remember what you decided. Runs locally; your data stays on this machine."
-keywords = ["startup", "founder", "ai-coach", "y-combinator", "fundraising", "angel-investors", "mcp", "claude-code-plugin"]
+# What every Pack shares. Each Pack's own identity (id, display_name, description, keywords) lives in
+# packs/<id>/pack.toml [product] (ADR-0016: one plugin per Pack); the founder Pack is today's Founder Coach.
 author = "Kaushal"
 license = "BUSL-1.1"
 

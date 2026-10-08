@@ -104,6 +104,8 @@ class ExtractionMeta(BaseModel):
     model: str
     backend: str
     schema_version: str = SCHEMA_VERSION
+    # ADR-0018: which prompt variant made the record; schema_version is that variant's version
+    prompt_variant: str = "startup"
     prompt_hash: Optional[str] = None
     passes: int = 1
     chapter_source: Literal["uploader", "llm", "none"] = "none"
@@ -149,8 +151,85 @@ class ChapterList(BaseModel):
     chapters: list[Chapter]
 
 
+# ----------------------------------------------------------------------------- the neutral variant (ADR-0018)
+# What the subject-neutral prompt generates: no startup Category or Stage, so a database chapter is not
+# forced into "product-market-fit". Its records are stored as VideoMetadata like every other (category
+# "other", no Stages, typed entities folded into Entities), plus the fields below.
+
+class NeutralAdvice(BaseModel):
+    """One atomic, imperative recommendation and the situation it is for."""
+    atom_id: str
+    text: str
+    applies_when: Optional[str] = Field(None, description="The situation or condition this applies under, in a "
+                                                          "few words, or null if it always applies")
+    evidence_span: str
+    confidence: Confidence = "medium"
+
+
+class FactAtom(BaseModel):
+    """A declarative statement that is true or false (CONTEXT.md: Fact), with its quote."""
+    fact_id: str
+    text: str = Field(..., description="One statement of fact, in your words")
+    evidence_span: str = Field(..., description="Near-verbatim quote from the text")
+    timestamp_ms: Optional[int] = Field(None, description="Derived by verify.py, never from the model")
+    match_score: Optional[float] = Field(None, description="Fuzzy match vs the text; set by verify.py")
+    confidence: Confidence = "medium"
+
+
+class RuleAtom(BaseModel):
+    """A requirement stated by an authority (CONTEXT.md: Rule), with its conditions and quote."""
+    rule_id: str
+    text: str = Field(..., description="What must or must not be done, in your words")
+    applies_when: Optional[str] = Field(None, description="The condition it applies under, or null")
+    authority: Optional[str] = Field(None, description="Who states it (a regulator, a standard, the author)")
+    evidence_span: str = Field(..., description="Near-verbatim quote from the text")
+    timestamp_ms: Optional[int] = Field(None, description="Derived by verify.py, never from the model")
+    match_score: Optional[float] = Field(None, description="Fuzzy match vs the text; set by verify.py")
+    confidence: Confidence = "medium"
+
+
+class TypedEntities(BaseModel):
+    people: list[str] = Field(default_factory=list)
+    organizations: list[str] = Field(default_factory=list)
+    concepts: list[str] = Field(default_factory=list, description="Named ideas, methods, patterns, terms")
+    works: list[str] = Field(default_factory=list, description="Books, papers, standards cited")
+    tools: list[str] = Field(default_factory=list, description="Products, languages, libraries, instruments")
+
+
+class NeutralGenerated(BaseModel):
+    """What the neutral prompt asks the model for (the constrained decoder's schema)."""
+    title_canonical: str = Field(..., description="Normalised topic title")
+    speaker: Optional[str] = Field(None, description="Best-effort from title/context; null if unclear")
+    summary: str = Field(..., description="~150 word abstract")
+    topics: list[str] = Field(default_factory=list, description="1-5 short subject labels, most specific first")
+    highlights: list[Highlight] = Field(default_factory=list)
+    advice_atoms: list[NeutralAdvice] = Field(default_factory=list)
+    facts: list[FactAtom] = Field(default_factory=list)
+    entities: TypedEntities = Field(default_factory=TypedEntities)
+    unknowns_and_gaps: list[str] = Field(default_factory=list)
+
+
+class NeutralOverview(BaseModel):
+    """Document-level fields over all windows of a long Document (neutral variant)."""
+    title_canonical: str = Field(..., description="Normalised topic title")
+    speaker: Optional[str] = Field(None, description="Best-effort from title/context; null if unclear")
+    summary: str = Field(..., description="~150 word abstract of the WHOLE text")
+    topics: list[str] = Field(default_factory=list, description="1-5 short subject labels, most specific first")
+
+
+class StoredAdvice(AdviceAtom):
+    """Advice as stored: a startup record's (Stages) or a neutral one's (the situation it applies under)."""
+    applies_when: Optional[str] = None
+
+
 class VideoMetadata(Generated):
     """The on-disk record: given fields + generated fields + provenance."""
+    advice_atoms: list[StoredAdvice] = Field(default_factory=list)
+    # The neutral variant's own fields (ADR-0018); empty on startup records, so they need no re-extract.
+    # `enrich` (ytbrain/enrich.py) can add facts and rules to either kind of record later.
+    topics: list[str] = Field(default_factory=list)
+    facts: list[FactAtom] = Field(default_factory=list)
+    rules: list[RuleAtom] = Field(default_factory=list)
     doc_id: str
     title_raw: str
     url: str

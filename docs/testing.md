@@ -12,13 +12,13 @@ manual parts, and they are short.
 | 3. Search | the right Document comes back for a real question | free, local models | you, six queries |
 | 4. Benchmark | retrieval quality did not regress (nDCG, Recall, MRR) | a few dollars | `ytbrain ops eval` |
 | 5. Plugin | the pack builds, the plugin assembles and validates, coverage is honest | free | `ytbrain ops plugin` |
-| 6. Coach gates | G2 citations, G4 sycophancy, G5 memory, G6 decomposition on the real host | your Claude plan | `ytbrain ops plugin --coach`, before a release |
+| 6. Coach gates | G2 citations, G4 sycophancy, G5 memory, G6 decomposition, G7 Project isolation on the real host | your Claude plan | `ytbrain ops plugin --coach`, before a release |
 | 7. Live session | a founder's questions get cited, scoped, honest answers | a few minutes | you |
 
 ## Level 1: offline checks
 
 ```bash
-sh scripts/check.sh          # secret scan, 7 suites, all suites in one process, generated files, claude plugin validate
+sh scripts/check.sh          # secret scan, nine suites, all suites in one process, generated files, claude plugin validate
 ```
 
 This is what CI runs (`.github/workflows/ci.yml`, Python 3.11 and 3.13). It never reads `.env` or `sources.yaml` and
@@ -33,7 +33,10 @@ ytbrain sync --type book && ytbrain clean && ytbrain extract && ytbrain verify &
 
 ytbrain status               # per-Step counts: nothing stuck in `failed` or `stale`
 ytbrain report               # gates: record rate >= 90%, evidence span pass rate >= 90%
-ytbrain domains              # every books folder is a declared Domain (or ignored); none listed as "not a Domain yet"
+ytbrain domains              # the declared Domains and their aliases
+ytbrain tag --no-apply && ytbrain domains sample   # Domains by content, stored; then label the two sheets
+ytbrain eval tags --items <items.csv> --documents <documents.csv>   # precision >= 90 %, recall >= 85 %, no high-tier miss
+ytbrain domains review       # confirm high-tier tags per Source; `ytbrain domains why <doc>` explains one Document
 ytbrain books inspect data/books --expect data/books/expected.yaml   # metadata and Chapters as you expect (exit 1 on a mismatch)
 ```
 
@@ -109,13 +112,13 @@ ytbrain eval route --pack data/pack-private          # the router stays off unle
 
 ```bash
 ytbrain ops plugin --coach   # eval coach on dist/plugin-private; only gates whose inputs changed re-run; a failed case is run up to 3 times
-ytbrain eval coach --gate g2 # or one gate by hand (g2, g4, g5, g6); --limit 2 for a quick check
+ytbrain eval coach --gate g2 # or one gate by hand (g2, g4, g5, g6, g7); --limit 2 for a quick check
 ```
 
 It uses your Claude plan (Haiku, 12 turns per call) and a few cents of judging. A case that errors (for example
 `error_max_turns`) is not a failure: it prints its tool calls, keeps them in `data/eval/coach/*.errors.jsonl`, and runs
 again on the next run. A pass is G2 >= 90% claim support,
-G4 >= 80%, G5 and G6 100%. Don't rebuild `dist/plugin` while it runs.
+G4 >= 80%, G5, G6 and G7 100%, and for the investor coach G8 100% (a safety case is never retried into a pass). Don't rebuild `dist/plugin` while it runs.
 
 ## Level 7: a live session (the only manual check of the product)
 

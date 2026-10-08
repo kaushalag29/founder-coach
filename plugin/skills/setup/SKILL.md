@@ -10,20 +10,21 @@ Follow the coaching contract of the coach skill: show what you'll save and save 
 
 ## Checklist
 
-1. **Context.** `coach_get_context`. If a profile exists, show it and ask what to change instead of starting over.
+1. **Context.** `coach_get_context`. If a profile exists, show it and ask what to change instead of starting over. If it lists several `projects` and none is active, ask which one to set up, or whether this is a new company (`/{{id}}:project`).
 2. **Interview,** one question at a time, short answers are fine:
-   - company name and a one-line description (`company`, `one_liner`);
+   - company name and a one-line description (`company`, `one_liner`). When no Project is active (`project` is null), or the Founder says this is another company, call `coach_project` with action `create` and the company name as soon as you have it, so everything after is saved to that Project;
    - who the customer is (`customer`);
    - Stage: offer the eight values from the coach skill's stages reference and let them pick (`stage`);
    - team size (`team_size`) and the one or two numbers that matter now (`key_metrics`);
    - time zone: propose the one `coach_get_context` reports and let them correct it (`timezone`, an IANA name like `Asia/Kolkata`);
    - preferred Check-in day (`checkin_day`, e.g. `friday`);
+   - optional: what to call them and their role (`name`, `role`), and how they like answers (`answer_style`, e.g. "short, bullets first"). Skip any already in the profile (`shared_fields` marks those that come from the Common profile);
    - optional, one question: where their pipeline, key numbers and investor updates live (`workspace`, e.g. `{"pipeline": "HubSpot", "metrics": "Google Sheet 'KPIs'"}`), so Check-ins can look there. Skip it if they'd rather not say.
-3. **Save the profile.** Show the values, get a yes, then one `coach_update_profile` call. If the Founder already asked you to save and dictated the values, that is the yes: save exactly those, then show them, and ask about any field they left out.
+3. **Save the profile.** Show the values under the Project's name ("Save to Acme: …"), get a yes, then one `coach_update_profile` call. For `name`, `role`, `timezone` and `answer_style`, also ask "Use these for all your Projects and coaches?"; on a yes save them in a second call with `scope: "common"`, otherwise they stay in this Project. If the Founder already asked you to save and dictated the values, that is the yes: save exactly those, then show them, and ask about any field they left out.
 4. **One Goal.** Ask for the outcome that matters most over the next 4-8 weeks, with a measure and a target date. Confirm, then `coach_record` kind `goal`.
 5. **Models.** The coach downloads its search models (about 0.2 GB, once) by itself in the background when it starts, so there is nothing the Founder must run: search uses keyword matches until the download ends, then switches to semantic on its own. Say that in one sentence; `coach_corpus_status` shows `search_mode` if they want to check. Run `uvx --from "${CLAUDE_SKILL_DIR}/../.." {{id}} warmup` with Bash only to show download progress, and only when Bash can reach that folder. If it can't (a sandboxed shell, as in Cowork), skip it; never hand the Founder a command containing a temporary plugin path.
 6. **Weekly reminder.** Offer a weekly scheduled task in the Claude desktop app that runs `/{{id}}:check-in` on their Check-in day. Set it up only if they say yes; otherwise say the coach will mention an overdue Check-in at the start of a session.
-7. **Close** with what's saved, where it lives (`~/.{{id}}/FOUNDER.md`, readable any time) and three things to try: `/{{id}}:ask`, `/{{id}}:weekly-focus`, `/{{id}}:check-in`.
+7. **Close** with what's saved, the Project it's in, where it lives (the `FOUNDER.md` path `coach_corpus_status` reports, readable any time) and three things to try: `/{{id}}:ask`, `/{{id}}:weekly-focus`, `/{{id}}:check-in`.
 
 ## Gotchas
 

@@ -68,7 +68,9 @@ def build_items(record: dict, transcript: dict | None, domains: list[str] | None
     ver = (record.get("extraction_meta") or {}).get("verification") or {}
     threshold = ver.get("threshold", EVIDENCE_MIN_JACCARD)
     doc_stages = sorted(record.get("stage_relevance") or [])
-    topics = [record["category"]] if record.get("category") else []
+    # A startup record's Topic is its Category (a founder Facet); a neutral record's are its own free-text
+    # topics (ADR-0018). Both shapes are read here: older records need no re-extraction.
+    topics = list(record.get("topics") or []) or ([record["category"]] if record.get("category") else [])
     loc = locators.kind(record)
     base = {
         "doc_id": doc_id, "source_kind": record.get("source_kind") or SOURCE_KIND,
@@ -96,9 +98,20 @@ def build_items(record: dict, transcript: dict | None, domains: list[str] | None
     for a in record.get("advice_atoms") or []:
         if _verified(a, threshold):
             own = sorted(a.get("applies_to_stage") or [])
-            out.append(item("advice", f"adv:{doc_id}:{a.get('atom_id')}", a["text"],
+            text = a["text"] + (f" (when: {a['applies_when']})" if a.get("applies_when") else "")
+            out.append(item("advice", f"adv:{doc_id}:{a.get('atom_id')}", text,
                             a["evidence_span"], a.get("timestamp_ms"), None,
                             own or doc_stages, "item" if own else "document"))
+    for f in record.get("facts") or []:
+        if _verified(f, threshold):
+            out.append(item("fact", f"fct:{doc_id}:{f.get('fact_id')}", f["text"], f["evidence_span"],
+                            f.get("timestamp_ms"), None, doc_stages, "document"))
+    for r in record.get("rules") or []:
+        if _verified(r, threshold):
+            text = r["text"] + (f" (when: {r['applies_when']})" if r.get("applies_when") else "") + \
+                (f" [{r['authority']}]" if r.get("authority") else "")
+            out.append(item("rule", f"rul:{doc_id}:{r.get('rule_id')}", text, r["evidence_span"],
+                            r.get("timestamp_ms"), None, doc_stages, "document"))
     for n, h in enumerate(record.get("highlights") or [], 1):
         if _verified(h, threshold):
             out.append(item("takeaway", f"tkw:{doc_id}:{n:02d}", h["text"], h["evidence_span"],

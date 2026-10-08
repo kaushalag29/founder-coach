@@ -1,8 +1,10 @@
 """Domains: the named subject areas of the Library (CONTEXT.md: Domain; docs/library-and-packs-plan.md).
 
-`domains.yaml` declares them; a Source tags its Documents with `domains: [...]`, and a Book in a
-folder named after a Domain belongs to it. Tags are configuration, not content: changing one
-re-tags the index in place (`ytbrain index`), it never re-fetches or re-extracts anything.
+`domains.yaml` declares them, the controlled list (ADR-0017): each with a description, example
+questions and `aliases` (other names for the same subject: `go-to-market` is `gtm`). The `tag` Step
+(ytbrain/tagging.py) tags Passages and items with Domains from this list by what they say; a
+Source's `domains: [...]` or a Book's folder is a *hint* that breaks ties (and confirms a high-tier
+tag). Tags never re-fetch, re-extract or re-embed anything.
 
 A Document may belong to several Domains, and a question may touch several: search takes a list
 of Domains and matches an item in any of them.
@@ -25,6 +27,28 @@ WEB_POLICIES = ("never", "when_gap", "always_latest")
 _NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
 
+def norm_key(text: str) -> str:
+    """One key per spelling of a subject: case, punctuation, spaces and plurals don't count, so
+    `System-Design`, `systems design` and `System_Designs` are one name, and `Sales & Marketing` is
+    `sale-and-marketing`. Used to stop a Domain or alias being added twice under another spelling."""
+    words = re.sub(r"[^a-z0-9]+", " ", re.sub(r"['’]", "", text.lower()).replace("&", " and ")).split()
+    out = []
+    for w in words:
+        if len(w) > 3 and w.endswith("ies"):
+            w = w[:-3] + "y"
+        elif len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+            w = w[:-1]
+        out.append(w)
+    return "-".join(out)
+
+
+def same_name(a: str, b: str) -> bool:
+    """Two spellings of one name: norm_key, then separators ignored too (`start-up` is `startup`,
+    `G.T.M` is `gtm`)."""
+    ka, kb = norm_key(a), norm_key(b)
+    return bool(ka) and ka.replace("-", "") == kb.replace("-", "")
+
+
 class DomainConfigError(ValueError):
     pass
 
@@ -37,6 +61,10 @@ class Domain:
     risk_tier: str = "low"
     half_life_days: int | None = None          # None: evergreen
     web_policy: str = "when_gap"
+    aliases: tuple[str, ...] = ()              # other names for the same subject (ADR-0017)
+    # what the Domain is NOT about: read by the tie-break model and the host, never embedded (an embedding
+    # ignores "not", so a negative sentence in the description pulls in exactly what it excludes)
+    not_about: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,6 +82,23 @@ class Registry:
 
     def get(self, name: str) -> Domain:
         return self.domains[name]
+
+    def lookup(self, text: str) -> str | None:
+        """The Domain a name or alias stands for, whatever its spelling (norm_key), or None."""
+        if not norm_key(text):
+            return None
+        for d in self.domains.values():
+            if same_name(text, d.name) or any(same_name(text, a) for a in d.aliases):
+                return d.name
+        return None
+
+    def fingerprint(self) -> str:
+        """Changes whenever what tagging reads changes: names, descriptions, examples, aliases, tiers."""
+        import hashlib
+        import json
+        blob = json.dumps([[d.name, d.description, list(d.examples), list(d.aliases), d.risk_tier, d.not_about]
+                           for d in self.domains.values()], ensure_ascii=False)
+        return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
     def check(self, names, where: str) -> list[str]:
         """`names` as a clean list, or DomainConfigError naming the unknown ones and the known ones."""
@@ -88,7 +133,7 @@ def parse(doc: dict | None) -> Registry:
         cfg = cfg or {}
         if not isinstance(cfg, dict):
             raise DomainConfigError(f"{where}: settings must be a mapping")
-        unknown = set(cfg) - {"description", "examples", "risk_tier", "freshness", "web_policy"}
+        unknown = set(cfg) - {"description", "examples", "risk_tier", "freshness", "web_policy", "aliases", "not_about"}
         if unknown:
             raise DomainConfigError(f"{where}: unknown setting(s) {sorted(unknown)}")
         tier = cfg.get("risk_tier", "low")
@@ -107,8 +152,20 @@ def parse(doc: dict | None) -> Registry:
         examples = cfg.get("examples") or []
         if not isinstance(examples, list) or not all(isinstance(e, str) and e.strip() for e in examples):
             raise DomainConfigError(f"{where}: examples must be a list of questions")
+        aliases = cfg.get("aliases") or []
+        if not isinstance(aliases, list) or not all(isinstance(a, str) and norm_key(a) for a in aliases):
+            raise DomainConfigError(f"{where}: aliases must be a list of other names for this Domain")
         out[name] = Domain(name, str(cfg.get("description") or "").strip(), tuple(e.strip() for e in examples),
-                           tier, half, policy)
+                           tier, half, policy, tuple(dict.fromkeys(a.strip() for a in aliases)),
+                           str(cfg.get("not_about") or "").strip())
+    seen: dict[str, str] = {}
+    for d in out.values():
+        for spelling in (d.name, *d.aliases):
+            k = norm_key(spelling).replace("-", "")
+            if k in seen and seen[k] != d.name:
+                raise DomainConfigError(f"domains.yaml: {spelling!r} of {d.name!r} is the same name as "
+                                        f"{seen[k]!r} (spelling, case and plurals don't count)")
+            seen[k] = d.name
     default = doc.get("default") or next(iter(out))
     if default not in out:
         raise DomainConfigError(f"domains.yaml: default {default!r} is not one of the declared Domains")
@@ -172,6 +229,8 @@ def folder_domain(path: str | Path | None, registry: Registry, roots: list[Path]
     for part in reversed(parts):
         if folder_key(part) in registry:
             return folder_key(part)
+        if (named := registry.lookup(part)):              # `Go To Market/` is an alias of gtm
+            return named
     return None
 
 
@@ -208,8 +267,10 @@ def stray_folders(registry: Registry, source: dict, files, roots) -> dict[str, i
 
 
 def resolve(registry: Registry, source: dict | None = None, book_path: str | Path | None = None,
-            roots: list[Path] | tuple = ()) -> list[str]:
-    """The Domains of one Document (see the module docstring for the order)."""
+            roots: list[Path] | tuple = (), default: bool = True) -> list[str]:
+    """The Domains configuration gives one Document: the Book's own `domains`, its folder, the Source's
+    `domains`, then (with `default`) the registry's default. With default=False, only what a person
+    declared: the tag Step's hints, which may also confirm a high-tier tag."""
     source = source or {}
     if book_path:
         fields = (source.get("books") or {}).get(Path(book_path).name) or {}
@@ -220,7 +281,7 @@ def resolve(registry: Registry, source: dict | None = None, book_path: str | Pat
             return [folder]
     if source.get("domains"):
         return registry.check(source["domains"], f"source {source.get('id')}")
-    return [registry.default]
+    return [registry.default] if default else []
 
 
 # ----------------------------------------------------------------------------- editing domains.yaml
@@ -289,6 +350,43 @@ def add_domain(name: str, *, risk_tier: str, description: str, examples: list[st
     if name not in reg:
         raise DomainConfigError(f"{path.name}: {name!r} did not land in `domains:`")   # never reached when parsed
     return reg
+
+
+def add_alias(name: str, alias: str, path: Path | None = None) -> Registry:
+    """Add another name for a Domain (`aliases:`), keeping comments. Refused when the alias already
+    names this or another Domain under any spelling."""
+    path = Path(path) if path else DOMAINS_FILE
+    current = load(path)
+    if name not in current:
+        raise DomainConfigError(f"{name!r} is not a Domain in {path.name}")
+    alias = alias.strip()
+    if not norm_key(alias):
+        raise DomainConfigError("an alias needs at least one letter or digit")
+    if (owner := current.lookup(alias)):
+        raise DomainConfigError(f"{alias!r} already names {owner!r}" + ("" if owner == name else
+                                f"; it can't also name {name!r}"))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next((i for i, l in enumerate(lines) if re.match(r"^domains:\s*(#.*)?$", l)), None)
+    head = next((i for i in range(start + 1 if start is not None else 0, len(lines))
+                 if re.match(rf"^(\s+){re.escape(name)}:\s*(#.*)?$", lines[i])), None)
+    if head is None:
+        raise DomainConfigError(f"{path.name}: can't find the {name!r} block")
+    ind = re.match(r"^(\s+)", lines[head]).group(1)
+    end = head + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith(ind * 2) or
+                                lines[end].lstrip().startswith("#")):
+        end += 1
+    have = list(current.get(name).aliases)
+    flow = f"{ind * 2}aliases: [" + ", ".join(_q(a) for a in have + [alias]) + "]"
+    k = next((i for i in range(head + 1, end) if re.match(rf"^{ind * 2}aliases\s*:", lines[i])), None)
+    if k is None:
+        lines[head + 1:head + 1] = [flow]
+    else:
+        j = k + 1
+        while j < end and re.match(rf"^{ind * 2}\s+-\s", lines[j]):
+            j += 1
+        lines[k:j] = [flow]
+    return _write_checked(path, "\n".join(lines) + "\n")
 
 
 def ignore_folder(folder: str, path: Path | None = None) -> Registry:

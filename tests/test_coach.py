@@ -258,14 +258,26 @@ def test_feedback_is_validated_idempotent_exported_alone_and_forgotten():
     assert s.feedback_list() == [], "forget deletes Feedback too"
 
 
+def _downgrade(s, version: int) -> None:
+    """Make a store look like schema `version`: drop what every later migration added."""
+    import re
+    from founder_coach.store import MIGRATIONS
+    for n in sorted(MIGRATIONS, reverse=True):
+        if n <= version:
+            break
+        for stmt in MIGRATIONS[n]:
+            m = re.match(r"\s*CREATE TABLE (\w+)", stmt)
+            if m:
+                s.db.execute(f"DROP TABLE IF EXISTS {m.group(1)}")
+    s.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(version),))
+
+
 def test_a_v2_store_migrates_to_v3_with_a_backup_first():
     import sqlite3
     home = Path(tempfile.mkdtemp())
     s = _store(home=home)
     s.update_profile({"company": "Acme"})
-    s.db.execute("DROP TABLE feedback")
-    s.db.execute("DROP TABLE usage")
-    s.db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+    _downgrade(s, 2)
     s.close()
     s = _store(home=home)
     from founder_coach.store import SCHEMA_VERSION
@@ -338,6 +350,49 @@ def test_the_workspace_says_where_the_founders_data_lives_and_never_goes_stale()
     s.update_profile({"workspace": {"pipeline": "Attio", "metrics": "Google Sheet 'KPIs'"}})
     assert s.profile()["workspace"]["value"]["pipeline"] == "Attio"
     assert "Attio" in N.render_markdown(s)
+
+
+def test_a_pack_without_a_memory_module_never_shows_or_keeps_it():
+    """ADR-0016: a Pack keeps only its modules; the founder Pack keeps all four."""
+    from unittest import mock
+    from founder_coach import product
+    assert all(product.has(m) for m in product.MODULES), "a product.json from before Packs is the founder Pack"
+    c = Clock()
+    s = _store(c)
+    s.update_profile({"company": "Acme", "stage": "mvp", "checkin_day": "mon"})
+    s.record({"kind": "goal", "text": "10 paying clinics", "target_date": s.today().isoformat()})
+    s.record({"kind": "decision", "text": "Use Postgres", "reasoning": "the team knows it"})
+    c.advance(days=10)
+    with mock.patch.dict(product.PACK, {"modules": ["decisions"]}):
+        ctx = N.context(s)
+        assert ctx["goals"] == [] and ctx["this_week"] == [] and ctx["last_checkin"] is None
+        assert [d["text"] for d in ctx["recent_decisions"]] == ["Use Postgres"]
+        kinds = [n["kind"] for n in ctx["nudges"]]
+        assert "goal_past_target" not in kinds and "checkin_overdue" not in kinds, kinds
+    assert "goal_past_target" in [n["kind"] for n in N.context(s)["nudges"]]
+
+
+def test_coaches_find_each_other_but_never_a_removed_one_or_themselves():
+    import json as _j
+    from founder_coach import installed, product
+    with tempfile.TemporaryDirectory() as d:
+        home, packs = Path(d) / "engine", Path(d) / "packs"
+        packs.mkdir()
+        mine, theirs = packs / "mine.sqlite", packs / "theirs.sqlite"
+        mine.write_text("x")
+        theirs.write_text("x")
+        installed.register(home, mine, {"domains": {"startup": 10, "gtm": 3}})
+        assert _j.loads((home / "installed" / f"{product.ID}.json").read_text())["domains"] == ["gtm", "startup"]
+        (home / "installed" / "coding-coach.json").write_text(_j.dumps(
+            {"display_name": "Coding Coach", "product_id": "coding-coach", "pack": "coding",
+             "domains": ["coding", "system-design"], "pack_path": str(theirs), "search_tool": "coach_search"}))
+        (home / "installed" / "gone-coach.json").write_text(_j.dumps(
+            {"display_name": "Gone", "product_id": "gone-coach", "pack_path": str(packs / "deleted.sqlite")}))
+        (home / "installed" / "broken.json").write_text("{not json")
+        got = installed.others(home)
+        assert [o["product_id"] for o in got] == ["coding-coach"] and got[0]["domains"] == ["coding", "system-design"]
+        assert installed.others(None) == [], "no engine home (tests, a bare server): nobody listed"
+        installed.register(home, None, None)                  # nothing to register: no error, no file
 
 
 def test_a_goal_past_its_target_date_is_a_nudge_until_the_founder_says_met_dropped_or_new_date():
@@ -446,7 +501,8 @@ def test_tools_keep_their_order_schemas_and_annotations():
                  "annotations": t.annotations.model_dump(exclude_none=True) if t.annotations else None,
                  "description": t.description} for t in tools]
         assert [t["name"] for t in snap] == ["coach_search", "coach_read", "coach_get_context", "coach_update_profile",
-                                             "coach_record", "coach_update", "coach_corpus_status", "coach_feedback"]
+                                             "coach_project", "coach_record", "coach_update", "coach_corpus_status",
+                                             "coach_feedback"]
         assert all(t["annotations"]["open_world_hint"] is False for t in snap)
         assert [t["name"] for t in snap if t["annotations"]["read_only_hint"]] == \
             ["coach_search", "coach_read", "coach_get_context", "coach_corpus_status"]
@@ -1043,8 +1099,7 @@ def test_u5_u6_retention_migration_export_and_forget():
     assert s.usage_rows() == [], "forget deletes the usage log too"
     # a v3 store (before the usage log) migrates, with a backup first
     s.update_profile({"company": "Acme"})
-    s.db.execute("DROP TABLE usage")
-    s.db.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+    _downgrade(s, 3)
     s.close()
     s = _store(c, home)
     from founder_coach.store import SCHEMA_VERSION

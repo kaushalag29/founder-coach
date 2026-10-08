@@ -1,6 +1,11 @@
-"""Assemble the installable plugin: plugin/ + founder_coach/ + the Knowledge pack -> dist/plugin.
+"""Assemble the installable plugin of one Pack: plugin/ + its skills + founder_coach/ + its Knowledge pack.
 
-    python scripts/assemble_plugin.py --pack PATH [--out dist/plugin] [--check] [--zip]
+    python scripts/assemble_plugin.py --pack PATH [--for founder] [--out dist/plugin] [--check] [--zip]
+
+One plugin per Pack (ADR-0016): `--for <id>` reads packs/<id>/pack.toml for the product identity, the skills
+it ships (its own packs/<id>/skills/<name>/ first, then plugin/skills/<name>/), the MCP prompts and the
+runtime's Pack settings (Domains, memory modules). The founder Pack is the default and builds exactly
+today's plugin.
 
 Steps, each safe to re-run:
 1. Regenerate founder_coach/product.json from product.toml (the product's name, ADR-0012) and
@@ -36,7 +41,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PROMPT_SKILLS = ("ask", "weekly-focus", "check-in", "setup")   # the MCP prompts the server serves
+PROMPT_SKILLS = ("ask", "weekly-focus", "check-in", "setup")   # the founder Pack's MCP prompts (its pack.toml `prompts`)
 # = founder_coach.pack's names; not imported, so the assembler runs without the runtime's dependencies
 PACK_FILE, MANIFEST_FILE = "knowledge.sqlite", "pack.json"
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store", ".pytest_cache")
@@ -44,6 +49,7 @@ FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.S)
 PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
 RENDERED = {".md", ".json", ".toml", ".yaml", ".yml", ".txt"}   # plugin files that may hold {{placeholders}}
 PRODUCT_FIELDS = ("id", "display_name", "description", "author", "license")
+SHARED_FIELDS = ("author", "license")     # product.toml: what every Pack shares
 DERIVED_FIELDS = ("env_prefix",)          # {{env_prefix}}: the runtime's environment variables, e.g. ACME_COACH_
 
 
@@ -58,20 +64,39 @@ class AssembleError(RuntimeError):
 
 # ---- the product's identity (product.toml, ADR-0012) ---------------------------------------
 
-def load_product(root: Path = ROOT) -> dict:
-    """product.toml's [product] table, checked: the one place the product's name lives."""
+def _packs():
+    """ytbrain.packs, standard library only, imported from this checkout."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from ytbrain import packs
+    return packs
+
+
+def load_product(root: Path = ROOT, pack_id: str | None = None, check_skills: bool = False) -> dict:
+    """One Pack's product identity (packs/<id>/pack.toml [product], ADR-0012 + ADR-0016) with what every Pack
+    shares (product.toml: author, license, repos), checked. `prod["pack"]` is the Pack itself."""
+    P = _packs()
+    pack_id = pack_id or P.DEFAULT_PACK
     path = root / "product.toml"
     if not path.exists():
-        raise AssembleError(f"missing {path}: it names the product (ADR-0012)")
+        raise AssembleError(f"missing {path}: it holds what every Pack shares (author, license, repos)")
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise AssembleError(f"{path} is not valid TOML: {e}") from None
-    prod = dict(data.get("product") or {})
+    shared = dict(data.get("product") or {})
+    if moved := [k for k in ("id", "display_name", "description", "keywords") if k in shared]:
+        raise AssembleError(f"{path}: {', '.join(moved)} moved to packs/<id>/pack.toml [product] (one per Pack)")
+    try:
+        pack = P.load(pack_id, root, check_skills=check_skills)
+    except P.PackError as e:
+        raise AssembleError(str(e)) from None
+    prod = {**{k: shared.get(k) for k in SHARED_FIELDS}, **pack.product}
     prod["repos"] = dict(data.get("repos") or {})
+    prod["pack"] = pack
     missing = [f for f in PRODUCT_FIELDS if not isinstance(prod.get(f), str) or not prod[f].strip()]
     if missing:
-        raise AssembleError(f"{path}: [product] needs {', '.join(missing)}")
+        raise AssembleError(f"{path} / packs/{pack_id}/pack.toml: [product] needs {', '.join(missing)}")
     if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", prod["id"]):
         raise AssembleError(f"{path}: id {prod['id']!r} must be lowercase letters, digits and hyphens "
                             "(it becomes the install id, the CLI and ~/.<id>)")
@@ -82,9 +107,11 @@ def load_product(root: Path = ROOT) -> dict:
 
 
 def product_json(prod: dict) -> str:
-    """What founder_coach/product.json holds: only what the runtime needs."""
-    return json.dumps({"_generated": "from product.toml by scripts/assemble_plugin.py; edit product.toml",
-                       "display_name": prod["display_name"], "id": prod["id"]}, indent=2) + "\n"
+    """What founder_coach/product.json holds: only what the runtime needs (its identity and its Pack)."""
+    pack = prod["pack"]
+    return json.dumps({"_generated": f"from packs/{pack.id}/pack.toml by scripts/assemble_plugin.py; edit that file",
+                       "display_name": prod["display_name"], "id": prod["id"],
+                       "pack": _packs().runtime_config(pack)}, indent=2) + "\n"
 
 
 def sync_product_json(root: Path, prod: dict) -> bool:
@@ -101,12 +128,14 @@ def sync_product_json(root: Path, prod: dict) -> bool:
 def render(text: str, prod: dict, where: str = "text", quote: bool = False) -> str:
     """Fill {{field}} placeholders from product.toml. quote=True escapes values for a JSON or
     TOML string. An unknown placeholder is an error, never shipped."""
+    words = dict(prod["pack"].words) if prod.get("pack") else {}
+    known = PRODUCT_FIELDS + DERIVED_FIELDS + tuple(words)
+
     def one(m: re.Match) -> str:
         key = m.group(1)
-        if key not in PRODUCT_FIELDS + DERIVED_FIELDS:
-            raise AssembleError(f"{where}: unknown placeholder {{{{{key}}}}} "
-                                f"(known: {', '.join(PRODUCT_FIELDS + DERIVED_FIELDS)})")
-        v = env_prefix(prod["id"]) if key == "env_prefix" else prod[key]
+        if key not in known:
+            raise AssembleError(f"{where}: unknown placeholder {{{{{key}}}}} (known: {', '.join(known)})")
+        v = env_prefix(prod["id"]) if key == "env_prefix" else words[key] if key in words else prod[key]
         return json.dumps(v)[1:-1] if quote else v
     return PLACEHOLDER.sub(one, text)
 
@@ -165,17 +194,24 @@ def prompt_text(skill_body: str, prod: dict | None = None) -> str:
     return t
 
 
-def generate_playbooks(root: Path, prod: dict | None = None) -> list[Path]:
+def generate_playbooks(root: Path, prod: dict | None = None, out_dir: Path | None = None) -> list[Path]:
+    """The Pack's MCP prompts from its skills (the single source), into founder_coach/playbooks/ (the founder
+    Pack, kept in the repo) or `out_dir` (another Pack's build)."""
     prod = prod or load_product(root)
-    out_dir = root / "founder_coach" / "playbooks"
+    pack = prod["pack"]
+    out_dir = out_dir or root / "founder_coach" / "playbooks"
     out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*.md"):
+        if old.stem not in pack.prompts and old.read_text(encoding="utf-8").startswith("<!-- generated from"):
+            old.unlink()                                 # another Pack's generated prompt: never served here
     written = []
-    for name in PROMPT_SKILLS:
-        src = root / "plugin" / "skills" / name / "SKILL.md"
+    for name in pack.prompts:
+        src = pack.skill_file(name, root)
         if not src.exists():
             raise AssembleError(f"missing skill {src}")
         _, body = split_skill(src.read_text(encoding="utf-8"))
-        header = f"<!-- generated from plugin/skills/{name}/SKILL.md by scripts/assemble_plugin.py; edit the skill -->\n"
+        rel = src.relative_to(root).as_posix()
+        header = f"<!-- generated from {rel} by scripts/assemble_plugin.py; edit the skill -->\n"
         dest = out_dir / f"{name}.md"
         new = header + prompt_text(body, prod)
         if not dest.exists() or dest.read_text(encoding="utf-8") != new:
@@ -244,16 +280,21 @@ def tools_list_from_golden(golden: Path) -> dict:
     return {"tools": tools}
 
 
-def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals: bool = False) -> dict:
+def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals: bool = False,
+             pack_id: str | None = None) -> dict:
     root, out = root.resolve(), out.resolve()
     if not pack.exists():
         raise AssembleError(f"no Knowledge pack at {pack}; build it with `ytbrain pack build` or pass --pack")
     for need in ("plugin/.claude-plugin/plugin.json", "plugin/pyproject.toml", "founder_coach/__init__.py"):
         if not (root / need).exists():
             raise AssembleError(f"missing {need} under {root}")
-    prod = load_product(root)
-    regenerated = (["product.json"] if sync_product_json(root, prod) else []) + \
-        [p.name for p in generate_playbooks(root, prod)]
+    prod = load_product(root, pack_id, check_skills=True)
+    the_pack = prod["pack"]
+    default = the_pack.id == _packs().DEFAULT_PACK
+    # the founder Pack's product.json and prompts live in the repo (the dev CLI and tests read them); another
+    # Pack's are written into its build only
+    regenerated = ((["product.json"] if sync_product_json(root, prod) else []) +
+                   [p.name for p in generate_playbooks(root, prod)]) if default else []
 
     out.parent.mkdir(parents=True, exist_ok=True)
     build = out.with_name(f".{out.name}.building-{os.getpid()}")
@@ -265,6 +306,10 @@ def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals:
         ignore = IGNORE if with_evals else shutil.ignore_patterns(
             "__pycache__", "*.pyc", ".DS_Store", ".pytest_cache", "evals")
         shutil.copytree(root / "plugin", build, ignore=ignore)
+        if (build / "skills").exists():
+            shutil.rmtree(build / "skills")              # the Pack's own skill list, from its sources
+        for name in the_pack.skills:
+            shutil.copytree(the_pack.skill_file(name, root).parent, build / "skills" / name, ignore=IGNORE)
         golden = root / "tests" / "golden" / "coach_tools.json"
         if with_evals and golden.exists() and (build / "evals").is_dir():
             mocks = build / "evals" / "mocks" / "coach"
@@ -272,8 +317,12 @@ def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals:
             (mocks / "_tools.json").write_text(json.dumps(tools_list_from_golden(golden), indent=1) + "\n")
         render_tree(build, prod)
         shutil.copytree(root / "founder_coach", build / "founder_coach", ignore=IGNORE)
+        if not default:
+            (build / "founder_coach" / "product.json").write_text(product_json(prod), encoding="utf-8")
+            generate_playbooks(root, prod, build / "founder_coach" / "playbooks")
         _copy_pack(pack, build / "pack")
-        stamp = f"{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{_tree_hash(root / 'product.toml', root / 'plugin', root / 'founder_coach')}"
+        stamp = (f"{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-"
+                 f"{_tree_hash(root / 'product.toml', the_pack.dir, root / 'plugin', root / 'founder_coach')}")
         (build / "BUILD_ID").write_text(stamp + "\n", encoding="utf-8")
         if check:
             _check(build)
@@ -286,7 +335,7 @@ def assemble(root: Path, pack: Path, out: Path, check: bool = False, with_evals:
     finally:
         if build.exists():
             shutil.rmtree(build, ignore_errors=True)
-    return {"out": str(out), "build_id": stamp, "regenerated": regenerated, "id": prod["id"]}
+    return {"out": str(out), "build_id": stamp, "regenerated": regenerated, "id": prod["id"], "pack": the_pack.id}
 
 
 def private_items(out: Path) -> int:
@@ -315,20 +364,25 @@ def zip_plugin(out: Path) -> Path:
     return target
 
 
-def _pack_env_name(root: Path = ROOT) -> str:
-    return load_product(root)["id"].upper().replace("-", "_") + "_PACK"
+def _pack_env_name(root: Path = ROOT, pack_id: str | None = None) -> str:
+    return load_product(root, pack_id)["id"].upper().replace("-", "_") + "_PACK"
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--for", dest="pack_id", default=None)
+    pack_id = pre.parse_known_args(argv)[0].pack_id
     try:
-        env_pack = _pack_env_name()
+        env_pack = _pack_env_name(ROOT, pack_id)
     except AssembleError as e:
         print(f"assemble: {e}", file=sys.stderr)
         return 2
     ap.add_argument("--pack", type=Path, default=Path(os.environ[env_pack]) if os.environ.get(env_pack) else None,
                     help=f"the Knowledge pack (file or folder) from `ytbrain pack build` (default: ${env_pack})")
-    ap.add_argument("--out", type=Path, default=ROOT / "dist" / "plugin")
+    ap.add_argument("--for", dest="pack_id", default=None, metavar="PACK",
+                    help="the Pack to assemble (packs/<id>/pack.toml; default: founder)")
+    ap.add_argument("--out", type=Path, default=None, help="default: dist/plugin for founder, dist/<product id> otherwise")
     ap.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
     ap.add_argument("--check", action="store_true", help="import the runtime and verify the pack before swapping in")
     ap.add_argument("--with-evals", action="store_true",
@@ -339,8 +393,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.pack is None:
         print(f"assemble: pass --pack PATH (or set {env_pack})", file=sys.stderr)
         return 2
+    if args.out is None:
+        try:
+            args.out = load_product(args.root, args.pack_id)["pack"].dist_dir(False, ROOT / "dist")
+        except AssembleError as e:
+            print(f"assemble: {e}", file=sys.stderr)
+            return 2
     try:
-        res = assemble(args.root, args.pack, args.out, check=args.check, with_evals=args.with_evals)
+        res = assemble(args.root, args.pack, args.out, check=args.check, with_evals=args.with_evals,
+                       pack_id=args.pack_id)
     except AssembleError as e:
         print(f"assemble: {e}", file=sys.stderr)
         return 2

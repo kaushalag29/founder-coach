@@ -1,0 +1,95 @@
+# The founder Pack (ADR-0015): today's Founder Coach. One plugin per Pack (ADR-0016).
+# Its [product] table is the product identity that used to live in product.toml (ADR-0012): the install id,
+# slash-command prefix, CLI, data folder (~/.<id>) and settings prefix (<ID>_*) all follow `id`.
+
+[pack]
+id = "founder"
+# What it answers from: items whose Domains include any of these (ytbrain pack build --for founder)
+domains = ["startup", "gtm", "leadership", "finance"]
+# Memory beyond the core (profile, Feedback, usage): the accountability loop
+modules = ["goals", "commitments", "checkins", "decisions"]
+# Facts about the person (not a Project) it reads from the Common profile ~/.ytbrain/you.db, and offers to save
+# there on a yes, so the person's other coaches know them too (ADR-0016). Leave out to share nothing.
+common_fields = ["timezone", "name", "role", "answer_style"]
+# the profile facts setup must fill before the coach stops offering it
+required = ["company", "stage"]
+skills = ["ask", "coach", "setup", "project", "status", "export", "forget", "feedback", "weekly-focus", "check-in"]
+prompts = ["ask", "weekly-focus", "check-in", "setup"]     # also served as MCP prompts (hosts without skills)
+builds = ["private", "release"]
+
+[product]
+id = "founder-coach"                   # lowercase letters, digits and hyphens
+display_name = "Founder Coach"
+# What search engines, the plugin browser and GitHub show. "YC" and "Y Combinator" go here,
+# never in the id or display name.
+description = "An AI startup coach personalized to your company: cited advice from Y Combinator talks for your Stage, a weekly Focus of up to three Commitments, and Check-ins that remember what you decided. Runs locally; your data stays on this machine."
+keywords = ["startup", "founder", "ai-coach", "y-combinator", "fundraising", "angel-investors", "mcp", "claude-code-plugin"]
+
+[words]
+person = "Founder"
+project_noun = "company"            # what one Project is about, in skills shared by every Pack
+memory = "profile, Goals, Commitments, Check-ins and Decisions"   # what a Project keeps (its modules)
+
+# What one Project (a Company) remembers about itself: the coach reads each description, and
+# coach_update_profile validates each value by its kind (text, int, enum, stage, metrics, places, tz, weekday).
+# stale = false: never asked to re-confirm (the rest are after 30 days). The person's own facts (timezone, name,
+# role, answer_style) are listed last; a Pack that leaves them out gets them anyway.
+[[profile]]
+name = "company"
+description = "company name"
+
+[[profile]]
+name = "one_liner"
+description = "what the company does, in one sentence"
+
+[[profile]]
+name = "customer"
+description = "who the customer is"
+
+[[profile]]
+name = "stage"
+kind = "stage"
+description = "one of: pre-idea, idea, mvp, pmf, growth, fundraising, scaling, exit"
+
+[[profile]]
+name = "team_size"
+kind = "int"
+description = "number of people working on the company"
+
+[[profile]]
+name = "key_metrics"
+kind = "metrics"
+description = 'the few numbers that matter now, e.g. {"MRR": "$4k", "design partners": 3}'
+
+[[profile]]
+name = "timezone"
+kind = "tz"
+description = "IANA time zone, e.g. Asia/Kolkata"
+stale = false
+
+[[profile]]
+name = "checkin_day"
+kind = "weekday"
+description = "preferred Check-in day: mon, tue, wed, thu, fri, sat, sun"
+stale = false
+
+[[profile]]
+name = "workspace"
+kind = "places"
+description = '''where the Founder keeps their own data, in their words: {what: tool or place}, e.g. {"pipeline": "HubSpot", "metrics": "Google Sheet 'KPIs'", "investor updates": "Drive folder 'Updates'"}'''
+stale = false
+
+[[profile]]
+name = "name"
+description = "what to call the person"
+stale = false
+
+[[profile]]
+name = "role"
+description = "the person's role, e.g. CEO, CTO, solo founder"
+stale = false
+
+[[profile]]
+name = "answer_style"
+description = "how they like answers, e.g. 'short, bullet points first'"
+stale = false

@@ -1,6 +1,6 @@
 # Library and Packs: from Founder Coach to "your own expert agent from your own sources"
 
-Status: **proposed** (2026-10-03); M6 and its acceptance criteria: [m6-plan.md](m6-plan.md) (2026-10-05). ADR-0015 accepted with amendments (ADR-0016, 0017, 0018); M5a, M5d and M5e built (2026-10-03), awaiting your corpus to measure them. Decisions settled in a grilling session; research behind them in
+Status: **M5 built, M6 built and under evaluation** (2026-10-07); M6 and its acceptance criteria: [m6-plan.md](m6-plan.md). ADR-0015 accepted with amendments (ADR-0016, 0017, 0018); M5a, M5d and M5e built (2026-10-03), awaiting your corpus to measure them. Decisions settled in a grilling session; research behind them in
 the Project doc `claude/ytbrain-generalization-research.md`. Architecture decision: [ADR-0015](adr/0015-one-engine-many-packs-over-one-library.md).
 
 Goal: a new Source or a new use case is configuration, not code, without losing what makes the coach
@@ -164,13 +164,13 @@ cases added (report only); p95 not yet measured.
 ### M6 — Engine and Packs
 
 **Superseded by [m6-plan.md](m6-plan.md)** (2026-10-05): versioned records, inferred Domains, neutral extraction,
-a plugin per Pack, Projects and the Common profile, the systems and investor Packs, with acceptance criteria.
+a plugin per Pack, Projects and the Common profile, the coding and investor Packs, with acceptance criteria.
 The paragraph below is the earlier sketch.
 
 ADR-0015 accepted; `pack.yaml` with generated enums; schema 3.0 with Fact and the facet Step; runtime
 split into an engine core (search, catalog, profile facts, Decisions, Feedback, usage) and optional
 modules (the founder accountability loop: Goals, Commitments, Check-ins); `packs/founder` with a parity
-test (same results on the 263 questions); `packs/systems` from your coding books (facets: lifecycle,
+test (same results on the 263 questions); `packs/coding` (plugin `coding-coach`) from your coding books (facets: lifecycle,
 concern); the engine's product id and data-folder migration with backup.
 
 ### M7 — Posts and freshness

@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import shlex
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -90,6 +90,19 @@ def _all_sources() -> list[dict]:
         sys.exit(f"sources.yaml: {e}")
 
 
+def _pack_docs_arg(args) -> set[str] | None:
+    """--only-pack-docs: the Documents of the pack being scored (None: every question counts)."""
+    if not getattr(args, "only_pack_docs", False):
+        return None
+    from .config import DATA
+    from .eval.files import pack_doc_ids
+    pack = Path(args.pack) if getattr(args, "pack", None) else DATA / "pack"
+    docs = pack_doc_ids(pack)
+    if docs is None:
+        sys.exit(f"eval: --only-pack-docs: no readable pack at {pack}")
+    return docs
+
+
 def _eval_coverage(args, store, embed) -> int:
     """`eval gap` and `eval calibrate`: is `coverage` honest? (ytbrain/eval/coverage.py)"""
     import datetime as dt
@@ -100,6 +113,12 @@ def _eval_coverage(args, store, embed) -> int:
     from .pages import atomic_write_text
     meta = getattr(store, "meta", None) or {}
     queries, qrels = load_set(EVAL_DIR, args.set, EVAL_PRIVATE)
+    if (docs := _pack_docs_arg(args)) is not None:
+        from .eval.files import about_docs
+        kept = about_docs(queries, docs)
+        print(f"eval {args.eval_cmd}: {len(kept)} of {len(queries)} question(s) are about this pack's Documents",
+              flush=True)
+        queries = kept
     say = lambda m: print(m, flush=True)
     if args.eval_cmd == "calibrate":
         rows = CV.pairs(store, embed, queries, qrels, k=args.k, say=say)
@@ -175,10 +194,11 @@ def _domains():
         sys.exit(str(e))
 
 
-def _doc_tags(m, doc_ids) -> dict[str, tuple[list[str], str]]:
+def _doc_tags(m, doc_ids, default: bool = True) -> dict[str, tuple[list[str], str]]:
     """doc_id -> (Domains, Source id), from domains.yaml, sources.yaml and the manifest. A Book's
     folder is read from its plan (data/books/plans). Without a sources.yaml every Document is
-    in the default Domain: tags are configuration and the index must still build."""
+    in the default Domain: tags are configuration and the index must still build. With
+    default=False, only what a person declared (the tag Step's hints): [] where nothing was."""
     from . import domains as D
     from .config import BOOKS_PLANS
     reg = _domains()
@@ -197,7 +217,7 @@ def _doc_tags(m, doc_ids) -> dict[str, tuple[list[str], str]]:
             roots = [(Path(p).expanduser() if Path(p).expanduser().is_absolute() else ROOT / p)
                      for p in src.get("paths") or [src["path"]]]
         try:
-            out[doc_id] = (D.resolve(reg, src, book, roots or ()), sid)
+            out[doc_id] = (D.resolve(reg, src, book, roots or (), default=default), sid)
         except D.DomainConfigError as e:
             sys.exit(str(e))
     return out
@@ -851,6 +871,12 @@ def _sync_backfill(m: Manifest, srcs: list[dict], st: _SyncState, args) -> int:
     return 0
 
 HEARTBEAT_S = 60          # multi-worker extract: report in-flight videos after this much silence
+from .config import EVAL_TIMEOUT_S as _CALL_TIMEOUT_S   # noqa: E402
+ENRICH_CALL_DEADLINE_S = 3 * _CALL_TIMEOUT_S + 60    # a model call still unanswered after this is given up on
+from .config import LLM_TIMEOUT_S as _REQUEST_TIMEOUT_S   # noqa: E402
+# extract: a Document with no new step for this long is given up on. One honest request ends within LLM_TIMEOUT_S
+# and every retry or backoff reports a step, so only a request that trickles bytes (never trips the timeout) stalls
+EXTRACT_STALL_S = _REQUEST_TIMEOUT_S + 300
 
 
 def _sweep_partial_files() -> None:
@@ -1029,9 +1055,14 @@ def cmd_extract(args) -> int:
     n = failed = 0
     if getattr(args, "retry_failed", False) and (k := m.unpark("extract")):
         print(f"extract: retrying {k} parked Document(s)", flush=True)
-    redo = m.invalidate_old_versions("extract", SCHEMA_VERSION)
+    from .extract import versions
+    # ADR-0018: only a breaking release (or an unknown stamp) makes a record stale; a compatible
+    # one leaves it valid, so a prompt change no longer re-extracts the whole Library
+    redo = m.invalidate_versions("extract", versions.is_current,
+                                 "made by a prompt version a breaking release replaced")
     if redo:
-        print(f"extract: schema is now {SCHEMA_VERSION}; {redo} older record(s) will be re-extracted")
+        print(f"extract: {redo} record(s) were made by a prompt version a breaking release replaced; "
+              f"they will be re-extracted")
     todo, waiting = _ready(m, "extract", _only(m.stage_settled_ids("clean", ("ok",)), args), args.limit)
     if todo and LLM_BACKEND == "openai":
         # Same up-front check for LM Studio / vLLM / hosted endpoints.
@@ -1148,8 +1179,18 @@ def cmd_extract(args) -> int:
     # written this one's result line.
     printed = threading.Semaphore(0)
     in_flight: dict[str, tuple[float, list[str]]] = {}   # doc_id -> (start, steps so far)
+    progress: dict[str, tuple[int, float]] = {}          # doc_id -> (steps seen, when the last new one appeared)
+    abandoned: set[str] = set()                          # Documents given up on while a call never answered
+    titles = {d: doc.get("title") for d, doc in jobs}
     for i, job in enumerate(jobs, 1):
         work.put((i, *job))
+    # ADR-0018: the prompt variant per Document, from the Domains you declared for it (a Source, a Book folder)
+    parity = versions.parity_passed()
+    known = _doc_domains(m, [j[0] for j in jobs], declared=True)
+    variant_of = {j[0]: versions.variant_for(None, known.get(j[0]), parity) for j in jobs}
+    if (n_neutral := sum(1 for v in variant_of.values() if v == "neutral")):
+        print(f"extract: {n_neutral} of {len(jobs)} Document(s) with the subject-neutral prompt "
+              f"({versions.stamp('neutral')})", flush=True)
 
     def worker() -> None:
         while not stop.is_set():
@@ -1160,7 +1201,7 @@ def cmd_extract(args) -> int:
             steps: list[str] = []
             if live:
                 _item(i, total, doc_id, doc.get("title"))
-                on_step = lambda s: print(f"{s} · ", end="", flush=True)
+                on_step = lambda s: (steps.append(s), print(f"{s} · ", end="", flush=True))
             else:
                 on_step = steps.append
             info_path = RAW / f"{doc_id}.info.json"
@@ -1181,7 +1222,7 @@ def cmd_extract(args) -> int:
                          "duration_s": doc["duration_s"], "caption_kind": doc["caption_kind"],
                          "url": doc.get("url") or tr.get("url"), "source_kind": tr.get("source_kind") or "talk",
                          "speaker": tr.get("speaker"), "private": tr.get("private"),
-                         "page_labels": tr.get("page_labels")},
+                         "page_labels": tr.get("page_labels"), "prompt_variant": variant_of.get(doc_id, "startup")},
                         fetch.uploader_chapters(info_path if info_path.exists() else None) if talk
                         else tr.get("chapters") or [],          # an article's or a Chapter's headings
                         on_step=on_step,
@@ -1223,9 +1264,29 @@ def cmd_extract(args) -> int:
         try:                                             # short waits keep Ctrl+C responsive
             doc_id, doc, record, err, steps, dt = done.get(timeout=0.5)
             last_news = time.time()
+            if doc_id in abandoned:
+                continue                                 # a late answer to a Document already given up on
         except queue.Empty:
             if not any(t.is_alive() for t in threads) and done.empty():
                 break                                    # workers gone (should not happen)
+            now = time.time()
+            for dd, (st_, stp) in list(in_flight.items()):    # one stalled request must not hold the whole run
+                seen, since = progress.get(dd, (-1, now))
+                if len(stp) != seen:
+                    progress[dd] = (len(stp), now)
+                elif now - since > EXTRACT_STALL_S and dd not in abandoned:
+                    abandoned.add(dd)
+                    in_flight.pop(dd, None)
+                    progress.pop(dd, None)
+                    k += 1
+                    if not live:
+                        _item(k, total, dd, titles[dd])
+                    why = f"no progress for {_dur(now - since)}: the provider never answered"
+                    m.fail(dd, "extract", why)
+                    print(f"FAILED {_dur(now - st_)}: {why} (the next run retries it)", flush=True)
+                    failed += 1
+                    threads.append(threading.Thread(target=worker, daemon=True, name=f"extract-{len(threads)}"))
+                    threads[-1].start()                  # its worker is stuck: a new one keeps the pace
             # Multi-worker lines print only when a video finishes; a slow one
             # (long transcript, provider retries/backoff) would look like a hang.
             if not live and time.time() - last_news >= HEARTBEAT_S:
@@ -1273,8 +1334,10 @@ def cmd_extract(args) -> int:
         # can only cause a harmless re-verify, never an unverified record marked verified.
         if m.stage_status(doc_id, "verify") is not None:
             m.mark(StageState(doc_id, "verify", "stale", error="re-extracted"))
-        pages.write_record(json.loads(record.model_dump_json()))
-        m.mark(StageState(doc_id, "extract", "ok", version=SCHEMA_VERSION, attempts=1))
+        rec = json.loads(record.model_dump_json())
+        pages.write_record(rec)
+        m.mark(StageState(doc_id, "extract", "ok", attempts=1,
+                          version=versions.stamp_of(rec.get("extraction_meta"), SCHEMA_VERSION)))
         m.succeeded(doc_id, "extract")
         (EXTRACT_FAILURES / f"{doc_id}.json").unlink(missing_ok=True)   # an old failure log
         n += 1
@@ -1437,7 +1500,9 @@ def cmd_index(args) -> int:
         store._t = None
         todo = sorted(candidates, key=lambda d: order.get(d, 10**9))
     tags = _doc_tags(m, candidates)
-    if (n_tagged := store.retag(tags)):          # Domains and Source ids are configuration: no re-embedding
+    from . import tagging
+    tagged = tagging.tagged_docs()               # the tag Step owns these Documents' Domains (ADR-0017)
+    if (n_tagged := store.retag({d: v for d, v in tags.items() if d not in tagged})):
         print(f"index: re-tagged {n_tagged} Document(s) with their Domains", flush=True)
     if not todo:
         removed = store.delete_documents_except(candidates)
@@ -1450,6 +1515,7 @@ def cmd_index(args) -> int:
             print("ok", flush=True)
         return 0
 
+    item_tags = tagging.stored_item_domains()
     print(f"index: loading {EMBED_MODEL} (the first run downloads it) ...", end=" ", flush=True)
     t0 = time.time()
     try:
@@ -1477,7 +1543,7 @@ def cmd_index(args) -> int:
         transcript = None if _unreadable_json(tpath, "utterances") else json.loads(tpath.read_text())
         _item(i, len(todo), doc_id, record.get("title_raw"))
         try:
-            rows = _index_rows(record, transcript, build_items, embed, store, EMBED_MODEL, tags)
+            rows = _index_rows(record, transcript, build_items, embed, store, EMBED_MODEL, tags, item_tags)
         except Exception as e:                       # noqa: BLE001 -- isolate one bad talk
             _step_failed(m, "index", doc_id, e)
             errors += 1
@@ -1508,10 +1574,15 @@ def cmd_index(args) -> int:
     return 0
 
 
-def _index_rows(record, transcript, build_items, embed, store, model: str, tags=None) -> list[dict]:
-    """Embed one Document's items and replace them in the index (one unit: delete + add)."""
+def _index_rows(record, transcript, build_items, embed, store, model: str, tags=None, item_tags=None) -> list[dict]:
+    """Embed one Document's items and replace them in the index (one unit: delete + add). An item the
+    tag Step already tagged keeps its Domains (`item_tags`); a new one starts with the configured ones
+    until the next `ytbrain tag`."""
     domains, source_id = (tags or {}).get(record["doc_id"], (None, ""))
     rows = build_items(record, transcript, domains, source_id)
+    for r in rows:
+        if item_tags and r["item_id"] in item_tags:
+            r["domains"] = list(item_tags[r["item_id"]])
     vectors = embed([r["indexable"] for r in rows]) if rows else []
     for r, v in zip(rows, vectors):
         r["vector"], r["embed_model"] = v, model
@@ -1593,17 +1664,229 @@ def _book_overrides() -> dict[str, dict]:
         sys.exit(f"sources.yaml: {e}")
 
 
+def _tag_inputs(cmd: str):
+    """(store, rows, vectors, embed) for the tag commands, or an exit code with the reason printed."""
+    from .config import EMBED_MODEL
+    try:
+        from .knowledge.embed import load_embedder
+        from .knowledge.store import KnowledgeStore
+        store = KnowledgeStore()
+    except RuntimeError as e:
+        print(f"{cmd}: {e}", file=sys.stderr)
+        return INDEX_MISSING_EXTRA
+    if not store.ready:
+        print(f"{cmd}: no knowledge index yet: run `ytbrain index` first", file=sys.stderr)
+        return 1
+    rows, vectors = store.tag_inputs()
+    try:
+        embed = load_embedder(store.embed_model() or EMBED_MODEL, None)
+    except Exception as e:                       # noqa: BLE001 -- download / memory / device problems
+        print(f"{cmd}: could not load the embedding model: {e}", file=sys.stderr)
+        return 1
+    return store, rows, vectors, embed
+
+
+def _tag_model() -> str:
+    from .config import LLM_MODEL
+    return os.environ.get("YTBRAIN_TAG_MODEL") or LLM_MODEL
+
+
+def cmd_tag(args) -> int:
+    """Tag Passages and items with Domains by what they say (ADR-0017): no re-extraction, no re-embedding."""
+    from . import tagging as T
+    from .config import EMBED_MODEL
+    got = _tag_inputs("tag")
+    if isinstance(got, int):
+        return got
+    store, rows, vectors, embed = got
+    reg = _domains()
+    m = Manifest(MANIFEST_DB)
+    docs = sorted({r["doc_id"] for r in rows})
+    hints = {d: v[0] for d, v in _doc_tags(m, docs, default=False).items()}
+    model, s, db = _tag_model(), T.load_settings(), T.TagDB()
+    ask = None if args.no_llm else T.llm_tiebreak(reg, model)
+    print(f"tag: {len(rows)} item(s) in {len(docs)} Document(s) against {len(reg.names)} Domain(s) "
+          f"(floor {s.floor}, close {s.close}, share {s.share})", flush=True)
+    res = T.run(rows, vectors, reg, embed, hints, s, ask, db, model, args.max_cost, args.dry_run,
+                retry_undecided=getattr(args, "retry_undecided", False))
+    print(f"tag: {res.close_calls} close call(s): {res.cached} from the cache, {res.asked} asked, "
+          f"{res.unresolved} kept every candidate" + (f" · ${res.cost:.3f} on {model}" if res.cost else ""))
+    if res.undecided:
+        print(f"tag: {res.undecided} close call(s) the model already left undecided keep every candidate (cached; "
+              f"`--retry-undecided` asks again)")
+    if res.unresolved:
+        print(f"tag: counts below are an upper bound: {res.unresolved} unresolved close call(s) count for every "
+              f"candidate Domain")
+    if args.dry_run:
+        if res.est_calls:
+            print(f"tag: a real run would ask {model} {res.est_calls} time(s) (~${res.est_calls * T.EST_COST_PER_CALL:.2f} "
+                  f"estimated; cap it with --max-cost, or --no-llm to keep every candidate)")
+    per = Counter(d for t in res.docs.values() for d in t.domains)
+    print("tag: Documents per Domain: " + ", ".join(f"{d} {n}" for d, n in sorted(per.items(), key=lambda x: -x[1])))
+    if res.awaiting_review:
+        print(f"tag: {res.awaiting_review} high-tier tag(s) await your review (they stay out of packs until "
+              f"confirmed): " + ("`ytbrain domains review` after a real run (`ytbrain tag --no-apply` stores them)"
+                                  if args.dry_run else "`ytbrain domains review`"))
+    if res.unplaced:
+        print(f"tag: {len(res.unplaced)} Document(s) matched no Domain by content (they keep their configured "
+              f"Domain or the default); `ytbrain domains propose` groups such content into proposed Domains")
+    if args.dry_run:
+        print("tag: dry run, nothing changed")
+        return 0
+    why = "--no-apply" if args.no_apply else (T.gate(reg, s) if args.gated else None)
+    meta = {**T.meta_for(reg, s, store.embed_model() or EMBED_MODEL, model), "applied": "0" if why else "1"}
+    db.replace(res.items, res.docs, meta)
+    if why:
+        print(f"tag: stored for review (`ytbrain domains why|review|sample`), not applied to the index: {why}")
+        return 0
+    n = store.set_item_domains({i: t.domains for i, t in res.items.items()})
+    print(f"tag: {n} item(s) changed Domains in the index (in place; nothing re-extracted or re-embedded)")
+    if n:
+        store.build_fulltext_index()
+        print("tag: rebuild the pack to ship them: `ytbrain pack build` (or `ytbrain ops plugin`)")
+    return 0
+
+
+def _domains_tagging(args, reg) -> int:
+    """`domains why | review | propose | sample | alias`."""
+    import csv
+    from . import domains as D
+    from . import tagging as T
+    if args.domains_cmd == "alias":
+        D.add_alias(args.name, args.alias)
+        print(f"domains: {args.alias!r} is now another name for `{args.name}`: a proposal or folder of that name "
+              f"means `{args.name}`. Run `ytbrain tag` so items scored against the new alias are re-tagged.")
+        return 0
+    if not T.TAGS_DB.exists() and args.domains_cmd != "propose":
+        print("domains: nothing tagged yet: run `ytbrain tag` first", file=sys.stderr)
+        return 1
+    db = T.TagDB()
+    m = Manifest(MANIFEST_DB)
+    titles = {r["doc_id"]: r["title"] or r["doc_id"] for r in m.documents("1=1")}
+    if args.domains_cmd == "why":
+        rows = [r for r in db.docs() if r["doc_id"].startswith(args.doc)]
+        if not rows:
+            print(f"domains why: no tagged Document starts with {args.doc!r}", file=sys.stderr)
+            return 1
+        if len(rows) > 1:
+            print(f"domains why: {len(rows)} Documents start with {args.doc!r}; say more:")
+            for r in rows[:20]:
+                print(f"  {r['doc_id']}  {titles.get(r['doc_id'], '')[:60]}")
+            return 1
+        r = rows[0]
+        print(f"{r['doc_id']}  {titles.get(r['doc_id'], '')}")
+        print(f"  Domains: {', '.join(json.loads(r['domains']))} (from {r['origin']})"
+              + (f" · suggested, awaiting review: {', '.join(json.loads(r['suggested']))}" if json.loads(r['suggested']) else ""))
+        shares = json.loads(r["shares"])
+        if shares:
+            print("  share of its Passages: " + ", ".join(f"{d} {v:.0%}" for d, v in sorted(shares.items(), key=lambda x: -x[1])))
+        print(f"  configured (hint): {', '.join(json.loads(r['hints'])) or 'none'}")
+        for it in db.items_of(r["doc_id"])[: args.items]:
+            sc = json.loads(it["scores"])
+            print(f"  {it['item_id'][:40]:40} {','.join(json.loads(it['domains'])):24} {it['origin']:10} "
+                  + " ".join(f"{d}={v:.2f}" for d, v in sc.items()))
+        return 0
+    if args.domains_cmd == "review":
+        if args.accept or args.reject:
+            for verb, specs in (("confirmed", args.accept or []), ("rejected", args.reject or [])):
+                for spec in specs:
+                    scope, _, domain = spec.rpartition(":")
+                    if not scope or domain not in reg or reg.get(domain).risk_tier != "high":
+                        print(f"domains review: {spec!r}: give SOURCE:DOMAIN (or doc:DOC_ID:DOMAIN) with a high-tier "
+                              f"Domain", file=sys.stderr)
+                        return 2
+                    key = scope if scope.startswith("doc:") else f"source:{scope}"
+                    (db.confirm if verb == "confirmed" else db.reject)([key], domain)
+                    print(f"domains review: {verb} `{domain}` for {key}")
+            print("domains review: run `ytbrain tag` to apply (cached: no model calls), then `ytbrain pack build`")
+            return 0
+        groups: dict[tuple[str, str], list[str]] = {}
+        for r in db.docs():
+            for d in json.loads(r["suggested"]):
+                groups.setdefault((r["source_id"], d), []).append(r["doc_id"])
+        if not groups:
+            print("domains review: no high-tier tags await review")
+            return 0
+        for (sid, d), docs in sorted(groups.items(), key=lambda x: -len(x[1])):
+            eg = "; ".join(titles.get(x, x)[:50] for x in docs[:3])
+            print(f"  {d} · source {sid} · {len(docs)} Document(s), e.g. {eg}")
+            print(f"      yes for all: ytbrain domains review --accept {sid}:{d}   no for all: --reject {sid}:{d}   "
+                  f"(one Document: doc:<doc_id>:{d})")
+        return 0
+    if args.domains_cmd == "sample":
+        got = _tag_inputs("domains sample")
+        if isinstance(got, int):
+            return got
+        _store, rows, _v, _e = got
+        texts = {r["item_id"]: r.get("text") or "" for r in rows}
+        items, docs = T.sample_sheets(db, titles, texts, args.n, args.docs, args.seed)
+        stamp = time.strftime("%Y%m%d")
+        paths = []
+        for name, cols, data in (("items", T.SHEET_COLUMNS, items), ("documents", T.DOC_COLUMNS, docs)):
+            p = REPORTS / f"domain-labels-{name}-{stamp}.csv"
+            with open(p, "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols)
+                w.writeheader()
+                w.writerows(data)
+            paths.append(p)
+        print(f"domains sample: {len(items)} item(s) in {paths[0]}, {len(docs)} Document(s) in {paths[1]}")
+        print("  Fill the `label` column with the Domain(s) each one is really about, separated by | "
+              "(e.g. `gtm|startup`); leave a row empty to skip it. Then: "
+              f"ytbrain eval tags --items {paths[0].name} --documents {paths[1].name}")
+        return 0
+    if args.domains_cmd == "propose":
+        from pydantic import BaseModel
+
+        from .eval import llm
+        got = _tag_inputs("domains propose")
+        if isinstance(got, int):
+            return got
+        _store, rows, vectors, embed = got
+        origins = {r["item_id"]: r["origin"] for r in db.db.execute("SELECT item_id, origin FROM item_tags")}
+
+        class Prop(BaseModel):
+            name: str
+            description: str = ""
+            examples: list[str] = []
+            risk_tier: str = "medium"
+            relation: str = "new"
+            existing: str | None = None
+
+        def ask_json(prompt):
+            a = llm.ask(prompt, Prop, _tag_model())
+            return a.value.model_dump() if a.value else None
+        props = T.propose(rows, vectors, reg, embed, ask_json, origins, min_size=args.min_size)
+        if not props:
+            print("domains propose: no group of unplaced content is big enough to suggest a Domain")
+            return 0
+        for p in props:
+            print(f"\n  {p.name} ({p.size} items) · {p.verdict} · nearest existing: {p.nearest} ({p.nearest_score:.2f})")
+            print(f"    {p.description}")
+            for x in p.texts:
+                print(f"    e.g. {' '.join(x.split())[:110]}")
+            if p.verdict == "new":
+                ex = " ".join(f'--example "{e}"' for e in p.examples)
+                print(f"    add it: ytbrain domains add {p.name} --risk {p.risk_tier} --description \"{p.description}\" {ex}")
+            elif p.verdict.startswith("alias of "):
+                print(f"    or keep it as another name: ytbrain domains alias {p.verdict.split()[-1]} \"{p.name}\"")
+        print("\n  The risk tier is your call (it decides when the coach must decline). Nothing was added.")
+        return 0
+    return 2
+
+
 def cmd_domains(args) -> int:
     """`domains list | add | ignore`: the Library's Domains in domains.yaml (CONTEXT.md: Domain). Adding one is a
     choice with a required risk tier; a books folder only becomes a Domain this way (decision #23)."""
     from . import domains as D
     try:
+        if args.domains_cmd in ("why", "review", "propose", "sample", "alias"):
+            return _domains_tagging(args, D.load())
         if args.domains_cmd == "add":
             reg = D.add_domain(args.name, risk_tier=args.risk, description=args.description,
                                examples=args.example or [], freshness=args.freshness, web_policy=args.web_policy)
             name = D.folder_key(args.name)
             print(f"domains: added `{name}` ({args.risk} risk) to {D.DOMAINS_FILE.name}; Books in a `{name}/` "
-                  f"folder now belong to it. Run `ytbrain index` (re-tags in place, no re-extraction) and "
+                  f"folder now belong to it. Run `ytbrain tag` (tags by content, in place, no re-extraction) and "
                   f"`ytbrain pack build` so the coach sees it.")
             return 0
         if args.domains_cmd == "ignore":
@@ -1621,6 +1904,8 @@ def cmd_domains(args) -> int:
         d = reg.get(name)
         fresh = "evergreen" if d.half_life_days is None else f"{d.half_life_days} days"
         print(f"  {name:16} {d.risk_tier:6} risk · {fresh:9} · web {d.web_policy:13} · {d.description[:70]}")
+        if d.aliases:
+            print(f"  {'':16} also: {', '.join(d.aliases)}")
     if reg.ignore_folders:
         print(f"  ignore_folders: {', '.join(reg.ignore_folders)}")
     stray = stray_book_folders()
@@ -1698,7 +1983,16 @@ def cmd_pack(args) -> int:
     from founder_coach import pack as P
     from .config import EMBED_MODEL, PACK_DIR, PACK_EMBED_MODEL, PACK_RERANK_MODEL
     from .pack import build_pack, describe
-    out = Path(args.out).expanduser() if args.out else PACK_DIR
+    from . import packs as PK
+    from .config import DATA
+    try:
+        the_pack = PK.load(getattr(args, "for_pack", None) or PK.DEFAULT_PACK, known_domains=_domains().names,
+                           check_skills=False)
+    except PK.PackError as e:
+        print(f"pack: {e}", file=sys.stderr)
+        return 2
+    out = Path(args.out).expanduser() if args.out else \
+        the_pack.pack_dir(bool(getattr(args, "include_private", False)), DATA)
     if args.pack_cmd == "info":
         manifest_path = P.resolve(out).with_name(P.MANIFEST_FILE)
         if not manifest_path.exists():
@@ -1737,6 +2031,7 @@ def cmd_pack(args) -> int:
                 print("pack: including private items (your Books): for your own coach only; "
                       "scripts/release.py refuses this pack (ADR-0014)", flush=True)
             manifest = build_pack(store, embedder, out, rerank_model=rerank, batch=args.batch, kinds=kinds,
+                                  domains=the_pack.domains, pack_id=the_pack.id,
                                   include_private=args.include_private,
                                   route={} if args.route else None,
                                   calibration=_saved_calibration(),
@@ -1772,16 +2067,192 @@ def _talk_info() -> dict[str, dict]:
     return out
 
 
+LATENCY_P95_S = 1.5        # M5/M6 exit: search p95 on a 16 GB M2, from the plugin's own runtime and pack
+
+
+def _eval_latency(args) -> int:
+    """Search latency the way the plugin runs it: the runtime's search on a Knowledge pack, ONNX models, one query
+    at a time after a warm-up; real questions from the Tuning sets. Writes data/eval/latency.json."""
+    import statistics
+    from founder_coach.search import search
+    from .config import EVAL_DATA, EVAL_DIR
+    from .eval.files import load_split
+    try:
+        store, embed, reranker = _load_pack(args.pack or None, rerank=not args.no_rerank)
+    except Exception as e:                       # noqa: BLE001 -- missing pack or models: say which
+        print(f"eval latency: couldn't open the pack: {e}", file=sys.stderr)
+        return 1
+    qs = [q["text"] for q in load_split(EVAL_DIR, "dev")[0] if q.get("text")][: args.n]
+    if not qs:
+        print("eval latency: no Tuning questions to time", file=sys.stderr)
+        return 1
+    for q in qs[:3]:                             # model load and caches: the first searches aren't what a Founder waits on
+        search(store, embed, q, reranker=reranker)
+    times = []
+    for q in qs:
+        t0 = time.perf_counter()
+        search(store, embed, q, reranker=reranker)
+        times.append(time.perf_counter() - t0)
+    times.sort()
+    p50 = statistics.median(times)
+    p95 = times[min(len(times) - 1, int(round(0.95 * (len(times) - 1))))]
+    res = {"queries": len(times), "p50_s": round(p50, 3), "p95_s": round(p95, 3), "max_s": round(times[-1], 3),
+           "items": store.count(), "reranker": bool(reranker), "pack": str(args.pack or "data/pack"),
+           "gate_p95_s": LATENCY_P95_S, "passed": p95 <= LATENCY_P95_S,
+           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    from .pages import atomic_write_text
+    EVAL_DATA.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(EVAL_DATA / "latency.json", json.dumps(res, indent=2))
+    print(f"eval latency: {len(times)} searches over {store.count()} items"
+          + (" with the reranker" if reranker else "") + f": p50 {p50:.2f}s, p95 {p95:.2f}s, max {times[-1]:.2f}s "
+          f"(gate p95 <= {LATENCY_P95_S}s) -> {'PASS' if res['passed'] else 'FAIL'}")
+    return 0 if res["passed"] else 1
+
+
+def _eval_parity(args) -> int:
+    """The subject-neutral prompt against the startup one on startup talks (ADR-0018, L5): shadow extractions,
+    the Library untouched. Passing makes new founder content use the neutral prompt."""
+    from .config import EVAL_DATA
+    from .eval import parity as PA
+    from .extract import runner, versions
+    from .verify import verify_record
+    m = Manifest(MANIFEST_DB)
+    ok = sorted(m.stage_settled_ids("extract", ("ok",)) & m.stage_settled_ids("verify", ("ok",)))
+    known = _doc_domains(m, ok)
+    talks = []
+    for d in ok:
+        try:
+            rec = json.loads((METADATA / f"{d}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if (rec.get("source_kind") or "talk") != "talk" or \
+                (rec.get("extraction_meta") or {}).get("prompt_variant", "startup") != "startup":
+            continue
+        if known.get(d) and not known[d] <= versions.FOUNDER_DOMAINS:
+            continue
+        talks.append(d)
+    docs = PA.sample(talks, args.n)
+    if not docs:
+        print("eval parity: no startup talk extracted with the startup prompt to compare against", file=sys.stderr)
+        return 1
+
+    def load(d):
+        return (json.loads((METADATA / f"{d}.json").read_text()), json.loads((TRANSCRIPTS / f"{d}.json").read_text()))
+
+    def extract(tr, old):
+        d = old["doc_id"]
+        doc = dict(m.get_document(d) or {})
+        info = RAW / f"{d}.info.json"
+        meta = {"doc_id": d, "title": doc.get("title") or old.get("title_raw") or "", "series": doc.get("series"),
+                "provenance": doc.get("provenance"), "published_at": doc.get("published_at"),
+                "duration_s": doc.get("duration_s"), "caption_kind": doc.get("caption_kind"),
+                "url": doc.get("url") or old.get("url"), "source_kind": "talk", "prompt_variant": "neutral"}
+        rec = runner.extract_video(tr, meta, fetch.uploader_chapters(info if info.exists() else None))
+        return json.loads(rec.model_dump_json())
+    try:
+        summary = PA.run(docs, load, extract, verify_record, EVAL_DATA / "parity", versions.stamp("neutral"),
+                         args.max_cost)
+    except (runner.BackendUnavailable, runner.RequestRejected) as e:
+        print(f"eval parity: the model endpoint refused: {e}", file=sys.stderr)
+        return 1
+    from .pages import atomic_write_text
+    atomic_write_text(versions.parity_file(), json.dumps(summary, indent=2))
+    if summary["n"]:
+        print(f"eval parity: {summary['n']} talk(s): verifier pass rate {summary['neutral_pass_rate']:.1%} neutral vs "
+              f"{summary['startup_pass_rate']:.1%} startup; Verified items {summary['neutral_items']} vs "
+              f"{summary['startup_items']} · ${summary.get('cost', 0):.3f}")
+    print(f"eval parity: {'PASS: new founder content uses the neutral prompt' if summary['passed'] else 'FAIL'}"
+          + (f" ({summary['why']})" if summary.get("why") else ""))
+    return 0 if summary["passed"] else 1
+
+
+def _eval_tags(args) -> int:
+    """The tagger against your labelled sheets (`ytbrain domains sample`), or the best thresholds for them."""
+    from . import tagging as T
+    from .config import EVAL_DATA
+    reg = _domains()
+    def find(name):
+        p = Path(name)
+        return p if p.exists() else REPORTS / name
+    items, bad = T.read_labels(find(args.items), "item_id", reg)
+    docs, bad2 = (T.read_labels(find(args.documents), "doc_id", reg) if args.documents else ({}, []))
+    for b in bad + bad2:
+        print(f"eval tags: {b}", file=sys.stderr)
+    if not items:
+        print("eval tags: no labelled rows in the sheet (fill the `label` column)", file=sys.stderr)
+        return 2
+    if not T.TAGS_DB.exists():
+        print("eval tags: nothing tagged yet: run `ytbrain tag` first", file=sys.stderr)
+        return 1
+    db = T.TagDB()
+    if args.tune:
+        got = _tag_inputs("eval tags")
+        if isinstance(got, int):
+            return got
+        _store, rows, vectors, embed = got
+        m = Manifest(MANIFEST_DB)
+        hints = {d: v[0] for d, v in _doc_tags(m, sorted({r["doc_id"] for r in rows}), default=False).items()}
+        ranked = T.tune(rows, vectors, reg, embed, hints, items, docs, db, _tag_model())
+        print("eval tags: best settings on your labels (cached tie-breaks only):")
+        for s, r in ranked[:5]:
+            print(f"  floor {s.floor} close {s.close} share {s.share}: precision {r['precision']:.0%}, recall "
+                  f"{r['recall']:.0%}, high-tier missed {len(r['high_missed'])}, documents "
+                  f"{(r['documents'] or 0):.0%}{' PASS' if r['passed'] else ''}")
+        if args.save:
+            T.save_settings(ranked[0][0])
+            print(f"eval tags: saved to {T.SETTINGS_FILE}; run `ytbrain tag` to apply")
+        return 0
+    r = T.score_labels(items, docs, *T.current(db), reg)
+    g = T.GATE
+    print(f"eval tags: {r['items']} item(s): precision {r['precision']:.0%} (gate {g['precision']:.0%}), "
+          f"recall {r['recall']:.0%} (gate {g['recall']:.0%}), high-tier labels missed {len(r['high_missed'])} (gate 0)")
+    for x in r["high_missed"][:10]:
+        print(f"  missed: {x}")
+    if r["documents"] is not None:
+        print(f"eval tags: {r['documents_n']} Document(s): {r['documents']:.0%} have every labelled Domain and at most "
+              f"one extra (gate {g['documents']:.0%})")
+    if r["missing"]:
+        print(f"eval tags: {len(r['missing'])} labelled id(s) are no longer tagged (re-indexed or dropped); skipped")
+    meta = {k: db.meta(k) for k in ("tagger_version", "domain_list", "settings", "tiebreak_model")}
+    EVAL_DATA.mkdir(parents=True, exist_ok=True)
+    from .pages import atomic_write_text
+    atomic_write_text(EVAL_DATA / "tags.json", json.dumps({**r, **meta, "items_sheet": str(args.items),
+                                                            "documents_sheet": str(args.documents or "")}, indent=2))
+    print(f"eval tags: {'PASS' if r['passed'] else 'FAIL'}" + ("" if r["passed"] else
+          " (`ytbrain eval tags --tune` finds better thresholds on these labels)"))
+    return 0 if r["passed"] else 1
+
+
 def cmd_eval(args) -> int:
     """Build, run or inspect the eval benchmark (docs/eval-spec.md)."""
     import datetime as dt
     from .config import EVAL_DATA, EVAL_DIR, EVAL_PRIVATE
     from .eval.splits import TUNING_SPLITS
     from .eval.db import EvalDB
+    if args.eval_cmd == "tags":
+        return _eval_tags(args)
+    if args.eval_cmd == "parity":
+        return _eval_parity(args)
+    if args.eval_cmd == "latency":
+        return _eval_latency(args)
+    if args.eval_cmd == "choice":
+        import shutil as _sh
+        from .eval import coach
+        plugins = [Path(x).resolve() for x in (args.plugin or [])]     # the host runs from another folder
+        if len(plugins) < 2 or not all((x / ".claude-plugin" / "plugin.json").exists() for x in plugins):
+            print("eval choice: pass two or more assembled plugins, e.g. --plugin dist/plugin-private "
+                  "--plugin dist/coding-coach-private", file=sys.stderr)
+            return 1
+        if not _sh.which("claude"):
+            print("eval choice: the `claude` CLI isn't on PATH", file=sys.stderr)
+            return 1
+        _, code = coach.run_choice(plugins, limit=args.limit, workers=args.workers,
+                                   model=None if args.model == "default" else (args.model or coach.DEFAULT_MODEL))
+        return code
     if args.eval_cmd == "coach":
         import shutil as _sh
         from .eval import build, coach
-        plugin = Path(args.plugin) if args.plugin else ROOT / "dist" / "plugin"
+        plugin = (Path(args.plugin) if args.plugin else ROOT / "dist" / "plugin").resolve()   # the host runs from another folder
         if not (plugin / ".claude-plugin" / "plugin.json").exists() or not (plugin / "pack").exists():
             print(f"eval coach: no assembled plugin at {plugin}; run "
                   f"`python scripts/assemble_plugin.py --pack data/pack --check` first", file=sys.stderr)
@@ -1789,6 +2260,9 @@ def cmd_eval(args) -> int:
         if not _sh.which("claude"):
             print("eval coach: the `claude` CLI isn't on PATH (it runs the cases as a Founder would)", file=sys.stderr)
             return 1
+        target = coach.use_plugin(plugin)
+        if target["pack"] != "founder":
+            print(f"eval coach: {target['id']} (the {target['pack']} Pack)")
         env = build.Env(db=EvalDB(EVAL_DATA / "eval.db"))
         err = build.preflight(env, generator=False)     # the coach eval uses only the judges
         if err:
@@ -1809,9 +2283,9 @@ def cmd_eval(args) -> int:
             print(f"eval coach: host model {model or 'your Claude Code default'} on your Claude plan, at most "
                   f"{args.max_turns} turns per call"
                   + ("" if model != "haiku" else " (sign a release off with --model sonnet)"))
-        _, code = coach.run_gates(env, args.gate or ["g2", "g4", "g5", "g6"], plugin,
+        _, code = coach.run_gates(env, args.gate or ["g2", "g4", "g5", "g6", "g7", "g8"], plugin,
                                   limit=args.limit or None, max_cost=args.max_cost, model=model,
-                                  max_turns=args.max_turns, host=host)
+                                  max_turns=args.max_turns, host=host, workers=args.workers)
         return code
     if args.eval_cmd == "status":
         for label, path in (("benchmark", EVAL_DATA / "eval.db"), ("smoke", EVAL_DATA / "smoke" / "eval.db")):
@@ -1918,7 +2392,8 @@ def cmd_eval(args) -> int:
                                     root=smoke / "eval" if args.smoke else EVAL_DIR,
                                     out_dir=(smoke if args.smoke else EVAL_DATA) / "runs",
                                     baseline=args.compare, save_baseline=args.save_baseline,
-                                    label=args.label, private=smoke / "private" if args.smoke else EVAL_PRIVATE)
+                                    label=args.label, private=smoke / "private" if args.smoke else EVAL_PRIVATE,
+                                    only_docs=_pack_docs_arg(args))
         except RuntimeError as e:
             print(f"eval: {e}", file=sys.stderr)
             return 1
@@ -2243,8 +2718,289 @@ def cmd_ops(args) -> int:
 
 
 def cmd_status(args) -> int:
-    """Per-stage counts from the manifest."""
-    print(Manifest(MANIFEST_DB).export())
+    """Per-stage counts from the manifest, and the extraction versions records were made with."""
+    m = Manifest(MANIFEST_DB)
+    print(m.export())
+    from .extract import versions
+    by: dict[str, int] = {}
+    for raw, n in m.versions("extract").items():
+        variant, version = versions.parse_stamp(raw)
+        key = f"{variant}@{version}" if version else "(no version recorded)"
+        by[key] = by.get(key, 0) + n
+    if by:
+        print("extract versions (ADR-0018):")
+        for key, n in sorted(by.items()):
+            state = ("latest" if versions.is_latest(key) else
+                     "valid, behind the latest (`ytbrain upgrade --dry-run` to see the cost)" if versions.is_current(key)
+                     else "replaced by a breaking release: the next `ytbrain extract` redoes them")
+            print(f"  {key}: {n} record(s) · {state}")
+    enriched = m.versions("enrich")
+    if enriched:
+        print("enrich (ADR-0018): " + ", ".join(f"{v}: {n}" for v, n in enriched.items()))
+    return 0
+
+
+def _doc_domains(m, doc_ids, declared: bool = False) -> dict[str, set[str]]:
+    """What is known of each Document's Domains before (re-)extracting it: its configured hints and its last
+    tags (applied or stored for review); enrich takes both. declared=True: only what you declared (a Source's
+    Domains, a Book's folder), which is how the prompt variant is chosen before the neutral prompt's parity
+    check: content tags alone never switch a Document's prompt, so no talk or essay is re-extracted (L1)."""
+    from . import tagging
+    out = {d: set(v[0]) for d, v in _doc_tags(m, doc_ids, default=False).items()}
+    if declared:
+        return out
+    if tagging.TAGS_DB.exists():
+        db = tagging.TagDB()
+        try:
+            for r in db.docs():
+                if r["doc_id"] in out:
+                    out[r["doc_id"]] |= set(json.loads(r["domains"])) | set(json.loads(r["suggested"]))
+        finally:
+            db.close()
+    return out
+
+
+def cmd_enrich(args) -> int:
+    """Add Rules (and Facts to records without any) for investment, coding and system-design Documents (ADR-0018)."""
+    from . import enrich as E
+    from .extract import runner
+    m = Manifest(MANIFEST_DB)
+    ok = sorted(_only(m.stage_settled_ids("extract", ("ok",)) & m.stage_settled_ids("verify", ("ok",)), args))
+    known = _doc_domains(m, ok)
+    todo = []
+    for d in ok:
+        if not E.wants(known.get(d)):
+            continue
+        try:
+            rec = json.loads((METADATA / f"{d}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if m.stage_status(d, "enrich") != "parked" and m.needs(d, "enrich", E.record_identity(rec), E.STAMP):
+            todo.append((d, rec))
+    if args.limit:
+        todo = todo[:args.limit]
+    # estimate: a record's own extraction cost (enrich reads the same text), else its size at the median rate
+    sizes, own = {}, {}
+    for d, rec in todo:
+        try:
+            tr = json.loads((TRANSCRIPTS / f"{d}.json").read_text())
+            sizes[d] = sum(len(u.get("text", "")) for u in tr.get("utterances") or [])
+        except (OSError, ValueError):
+            sizes[d] = 0
+        costs = [c.get("cost") for c in (rec.get("extraction_meta") or {}).get("calls") or []
+                 if isinstance(c.get("cost"), (int, float))]
+        own[d] = sum(costs) if costs else None
+    rates = sorted(own[d] / sizes[d] for d, _ in todo if own[d] is not None and sizes[d])
+    rate = rates[len(rates) // 2] if rates else None
+    est = sum(own[d] if own[d] is not None else (sizes[d] * rate if rate is not None else 0) for d, _ in todo)
+    print(f"enrich: {len(todo)} Document(s) in {', '.join(sorted(E.ENRICH_DOMAINS))} to enrich ({E.STAMP}); "
+          f"~${est:.2f} estimated from their extraction" + ("" if rate is not None or not todo else " (no past cost)"))
+    if args.dry_run or not todo:
+        if args.dry_run:
+            print("enrich: dry run, nothing changed")
+        return 0
+    model = os.environ.get("YTBRAIN_ENRICH_MODEL") or _tag_model()
+    ask = E.llm_ask(model)
+    from .config import LLM_BACKEND, LLM_BASE_URL, LLM_MAX_RPM, LLM_WORKERS
+    workers = max(1, int(getattr(args, "workers", 0) or LLM_WORKERS))
+    endpoint = os.environ.get("YTBRAIN_LLM_BASE_URL", LLM_BASE_URL)
+    local = LLM_BACKEND == "ollama" or runner.is_local_endpoint(endpoint)
+    pacing = "no rate pacing (local server)" if local else f"<= {LLM_MAX_RPM:g} requests/min shared"
+    print(f"enrich: {len(todo)} to enrich with {model}, {workers} worker(s), {pacing}"
+          + (f", spend cap ${args.max_cost:g}" if args.max_cost is not None else ""), flush=True)
+    if workers > 1 and local:
+        print(f"  note: a local server only runs these in parallel if it allows it "
+              f"(LM Studio: Max Concurrent Predictions >= {workers}); otherwise they just queue.", flush=True)
+
+    # Same shape as `extract`: workers only make model calls; every manifest and file write stays on this
+    # thread, in completion order, so SQLite has one writer. Ctrl+C: finished Documents are saved and the ones in
+    # flight were never marked, so the next run does them. The spend cap stops new calls the moment the calls made
+    # add up to it (counted when a call returns, not when this thread gets to it); those in flight finish.
+    total = len(todo)
+    live = workers == 1              # 1 worker: print each Document before its call, as extract does
+    titles = {d: str(rec.get("title_canonical") or rec.get("title") or "") for d, rec in todo}
+    work: queue.Queue = queue.Queue()
+    done: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    printed = threading.Semaphore(0)
+    in_flight: dict[str, float] = {}
+    abandoned: set[str] = set()      # calls given up on (a provider that trickles bytes never trips a timeout)
+    paid, paid_lock = [0.0], threading.Lock()
+    over_cap = lambda: args.max_cost is not None and paid[0] >= args.max_cost
+    for i, (d, rec) in enumerate(todo, 1):
+        work.put((i, d, rec))
+
+    def worker() -> None:
+        while not (stop.is_set() or over_cap()):
+            try:
+                i, d, rec = work.get_nowait()
+            except queue.Empty:
+                return
+            if live:
+                _item(i, total, d, titles[d])
+            t0 = time.time()
+            in_flight[d] = t0
+            answer, cost, err = None, 0.0, None
+            try:
+                tr = json.loads((TRANSCRIPTS / f"{d}.json").read_text())
+                prompt, cls = E.build_prompt(rec, tr)
+                answer, cost = ask(prompt, cls)
+            except Exception as e:                       # noqa: BLE001 -- one Document, not the run
+                err = e
+            in_flight.pop(d, None)
+            with paid_lock:
+                paid[0] += cost or 0.0
+            done.put((d, rec, answer, cost or 0.0, err, time.time() - t0))
+            if live:
+                printed.acquire()
+
+    # daemon threads: Ctrl+C exits at once instead of waiting on in-flight calls
+    threads = [threading.Thread(target=worker, daemon=True, name=f"enrich-{k}") for k in range(min(workers, total))]
+    started = time.time()
+    for t in threads:
+        t.start()
+    spent, n, failed, k = 0.0, 0, 0, 0
+    last_news = time.time()
+    while k < total:
+        try:                                             # short waits keep Ctrl+C responsive
+            d, rec, answer, cost, err, dt = done.get(timeout=0.5)
+            last_news = time.time()
+            if d in abandoned:
+                continue                                 # a late answer to a call already given up on
+        except queue.Empty:
+            if not any(t.is_alive() for t in threads) and done.empty():
+                break                                    # the spend cap or a refusal stopped the workers
+            now = time.time()
+            for dd, st_ in list(in_flight.items()):      # one hung call must not hold the whole run
+                if now - st_ > ENRICH_CALL_DEADLINE_S and dd not in abandoned:
+                    abandoned.add(dd)
+                    in_flight.pop(dd, None)
+                    k += 1
+                    if not live:
+                        _item(k, total, dd, titles[dd])
+                    _step_failed(m, "enrich", dd, TimeoutError(f"no answer after {_dur(now - st_)}"))
+                    failed += 1
+                    threads.append(threading.Thread(target=worker, daemon=True, name=f"enrich-{len(threads)}"))
+                    threads[-1].start()                  # its worker is stuck: a new one keeps the pace
+            if not live and time.time() - last_news >= HEARTBEAT_S:
+                last_news = time.time()
+                for dd, st_ in list(in_flight.items()):
+                    print(f"    ... still working on {dd} ({_dur(time.time() - st_)}): waiting for the model",
+                          flush=True)
+            continue
+        k += 1
+        if not live:
+            _item(k, total, d, titles[d])
+        if isinstance(err, runner.BackendUnavailable):
+            stop.set()
+            from . import runstatus
+            runstatus.record("network" if runstatus.classify(err) == "network" else "endpoint", str(err))
+            print("STOPPED", flush=True)
+            print(f"\nenrich: the model endpoint refused further work -- {err}\n"
+                  f"  Documents in flight were not marked failed. Fix the model / key / credits "
+                  f"(or wait for the quota to reset) and re-run.", file=sys.stderr)
+            print(f"\nenrich: {n} Document(s) enriched before stopping, ${spent:.3f}")
+            return 1
+        spent += cost
+        if err is not None or answer is None:
+            _step_failed(m, "enrich", d, err or ValueError("no valid answer after a repair"))
+            failed += 1
+        else:
+            new = E.apply(rec, answer, model, cost)
+            if m.stage_status(d, "verify") is not None:    # before the write: a crash can only cause a harmless re-verify
+                m.mark(StageState(d, "verify", "stale", error="enriched: new quotes to check"))
+            pages.write_record(new)
+            m.mark(StageState(d, "enrich", "ok", input_hash=E.record_identity(new), version=E.STAMP, attempts=1))
+            n += 1
+            print(f"{len(new.get('rules') or [])} rule(s), {new['extraction_meta']['enrich']['facts_added']} fact(s) added"
+                  f" · ${cost:.3f} · {_dur(dt)}", flush=True)
+        printed.release()
+    if over_cap() and k < total:
+        print(f"enrich: stopped at the spend cap (${spent:.3f}); {total - k} Document(s) wait for the next run")
+    print(f"\nenrich: {n} Document(s) enriched, {failed} failed, ${spent:.3f} in {_dur(time.time() - started)}"
+          + (" (failed ones retry on the next run)" if failed else "")
+          + "; run `ytbrain verify && ytbrain index` to check their quotes and index them")
+    return 0
+
+
+def _upgrade_candidates(m: Manifest, args) -> list[dict]:
+    """Valid records that are not what extracting them today would produce: an older version of
+    their variant, or a variant new content of their kind no longer uses (ADR-0018). Each with
+    the cost of its last extraction when the record kept it, and its text size."""
+    from .extract import versions
+    rows = m.db.execute(
+        "SELECT s.doc_id, s.version FROM stage_state s JOIN documents d ON d.doc_id = s.doc_id "
+        "WHERE s.stage='extract' AND s.status='ok' AND d.tombstoned_at IS NULL ORDER BY s.doc_id").fetchall()
+    keep = _only({r["doc_id"] for r in rows}, args)
+    known = _doc_domains(m, sorted(keep), declared=True)
+    parity = versions.parity_passed()
+    out = []
+    for r in rows:
+        if r["doc_id"] not in keep:
+            continue
+        variant, version = versions.parse_stamp(r["version"])
+        have = f"{variant}@{version}"
+        if not versions.is_current(have):
+            continue                                   # stale: `ytbrain extract` redoes it anyway
+        try:
+            rec = json.loads((METADATA / f"{r['doc_id']}.json").read_text())
+        except (OSError, ValueError):
+            rec = {}
+        want = versions.stamp(versions.variant_for(rec.get("source_kind"), known.get(r["doc_id"]), parity))
+        if have == want or (getattr(args, "variant", None) and variant != args.variant):
+            continue
+        costs = [c.get("cost") for c in (rec.get("extraction_meta") or {}).get("calls") or []
+                 if isinstance(c.get("cost"), (int, float))]
+        try:
+            t = json.loads((TRANSCRIPTS / f"{r['doc_id']}.json").read_text())
+            chars = sum(len(u.get("text", "")) for u in t.get("utterances") or [])
+        except (OSError, ValueError):
+            chars = 0
+        out.append({"doc_id": r["doc_id"], "have": have, "want": want,
+                    "cost": sum(costs) if costs else None, "chars": chars})
+    return out
+
+
+def cmd_upgrade(args) -> int:
+    """Re-extract valid records made by an older prompt version, on purpose and within a spend cap."""
+    m = Manifest(MANIFEST_DB)
+    cands = _upgrade_candidates(m, args)
+    if not cands:
+        print("upgrade: every record is on the prompt version a new extraction would use; nothing to do")
+        return 0
+    # estimate: a record's own last extraction cost, else its size at the median cost per character
+    rates = sorted(c["cost"] / c["chars"] for c in cands if c["cost"] is not None and c["chars"])
+    rate = rates[len(rates) // 2] if rates else None
+    for c in cands:
+        c["estimate"] = c["cost"] if c["cost"] is not None else (c["chars"] * rate if rate is not None else None)
+    unknown = sum(1 for c in cands if c["estimate"] is None)
+    if unknown and args.max_cost is not None:
+        print(f"upgrade: {unknown} record(s) have no past extraction cost to estimate from, so --max-cost "
+              f"can't be honoured; narrow the run with --doc or --variant, or leave out --max-cost")
+        return 1
+    chosen, total = [], 0.0
+    for c in cands:
+        est = c["estimate"] or 0.0
+        if args.max_cost is not None and total + est > args.max_cost:
+            break
+        chosen.append(c)
+        total += est
+    groups: dict[tuple[str, str], int] = {}
+    for c in chosen:
+        groups[(c["have"], c["want"])] = groups.get((c["have"], c["want"]), 0) + 1
+    for (have, want), n in sorted(groups.items()):
+        print(f"upgrade: {n} record(s) {have} -> {want}")
+    est = f"~${total:.2f}" + (" (part unknown: no past cost)" if unknown else "")
+    left = len(cands) - len(chosen)
+    print(f"upgrade: {len(chosen)} record(s), {est} estimated from their last extraction"
+          + (f"; {left} more stay as they are (over --max-cost ${args.max_cost:g})" if left else ""))
+    if args.dry_run or not chosen:
+        if args.dry_run:
+            print("upgrade: dry run, nothing changed")
+        return 0
+    n = m.invalidate_docs("extract", [c["doc_id"] for c in chosen], "upgrade to the latest prompt version")
+    print(f"upgrade: marked {n} record(s) for re-extraction: run `ytbrain extract && ytbrain verify && "
+          f"ytbrain index` (or `ytbrain ops ingest --no-sync`)")
     return 0
 
 
@@ -2331,7 +3087,8 @@ def coach_env_file_vars() -> dict[str, str]:
     return {"EVAL_" + name: os.environ.get(name) or str(DOTENV)}
 
 
-MUTATING = {"sync", "clean", "extract", "verify", "index", "pages", "refresh", "run", "invalidate", "eval", "drop"}
+MUTATING = {"sync", "clean", "extract", "verify", "index", "pages", "refresh", "run", "invalidate", "eval", "drop",
+            "upgrade", "tag", "enrich"}
 
 
 def rerun_command(argv=None) -> str:
@@ -2408,7 +3165,7 @@ def main(argv=None) -> int:
                                         "fundraising", "scaling", "exit"],
                     help="the Founder's Stage: boosts matching items")
     sp.add_argument("--require-stage", action="store_true", help="only items tagged with --stage")
-    sp.add_argument("--kind", action="append", choices=["advice", "takeaway", "summary", "passage"],
+    sp.add_argument("--kind", action="append", choices=["advice", "takeaway", "summary", "fact", "rule", "passage"],
                     help="restrict to these kinds (repeatable)")
     from .extract.schema import Category
     sp.add_argument("--topic", action="append", choices=[c.value for c in Category],
@@ -2429,6 +3186,27 @@ def main(argv=None) -> int:
     sp.add_argument("--seed", type=int, default=ACCEPT_SAMPLE_SEED, help="fixed for reproducibility")
     sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
     add("status", cmd_status)
+    sp = add("enrich", cmd_enrich, "max Documents to enrich")
+    sp.add_argument("--dry-run", action="store_true", help="how many Documents and the estimated cost; change nothing")
+    sp.add_argument("--workers", type=int, default=0,
+                    help="parallel LLM calls (default: YTBRAIN_LLM_WORKERS or 1, as for extract)")
+    sp.add_argument("--max-cost", type=float, default=None, metavar="USD", help="stop at this spend")
+    sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
+    sp = add("tag", cmd_tag)
+    sp.add_argument("--dry-run", action="store_true", help="show what would change and what the tie-breaks would cost")
+    sp.add_argument("--max-cost", type=float, default=None, metavar="USD", help="stop asking the tie-break model at this spend")
+    sp.add_argument("--no-llm", action="store_true", help="no tie-break calls: close calls keep every candidate")
+    sp.add_argument("--retry-undecided", action="store_true",
+                    help="ask again about close calls the model already left undecided (cached otherwise)")
+    sp.add_argument("--no-apply", action="store_true", help="store the tags for review and labelling; leave the index's Domains")
+    sp.add_argument("--gated", action="store_true", help="apply only when `ytbrain eval tags` passed for this tagger, "
+                                                          "Domain list and thresholds (what `ytbrain ops` runs)")
+    sp = add("upgrade", cmd_upgrade)
+    sp.add_argument("--dry-run", action="store_true", help="show what would be re-extracted and its cost; change nothing")
+    sp.add_argument("--max-cost", type=float, default=None, metavar="USD",
+                    help="re-extract only as many records as fit this estimated spend")
+    sp.add_argument("--variant", default=None, metavar="NAME", help="only records of this prompt variant")
+    sp.add_argument("--doc", action="append", metavar="PREFIX", help=DOC_HELP)
     sp = add("invalidate", cmd_invalidate)
     sp.add_argument("stage", choices=["fetch", "clean", "extract", "verify", "index"],
                     help="stage to re-run")
@@ -2472,6 +3250,8 @@ def main(argv=None) -> int:
                     default="full", help="pack configs search the Knowledge pack (see --pack)")
     er.add_argument("--pack", default=None, metavar="PATH",
                     help="Knowledge pack for pack configs (default data/pack)")
+    er.add_argument("--only-pack-docs", action="store_true",
+                    help="score only the questions seeded from the pack's own Documents (a Pack other than founder)")
     er.add_argument("--compare", metavar="CONFIG", help="compare with the saved baseline of CONFIG")
     er.add_argument("--save-baseline", action="store_true", help="store this result as the baseline")
     er.add_argument("--smoke", action="store_true", help="score the scratch benchmark from build --limit")
@@ -2495,11 +3275,36 @@ def main(argv=None) -> int:
     egap.add_argument("--set", choices=list(_eval_sets), default="all")
     egap.add_argument("--pack", default=None, metavar="PATH", help="the Knowledge pack to measure (default data/pack)")
     egap.add_argument("--questions", default=None, metavar="FILE", help="your Gap questions (default data/eval/gap-questions.txt)")
+    egap.add_argument("--only-pack-docs", action="store_true",
+                      help="answerable questions only from the pack's own Documents (a Pack other than founder)")
     egap.add_argument("--tune", action="store_true", help="save the recommended shift for the next `pack build`")
     esub.add_parser("status", help="progress and spend of each split")
-    ec = esub.add_parser("coach", help="gates G2/G4/G5/G6: the coach's answers and memory through the real host "
+    elat = esub.add_parser("latency", help="search p95 the way the plugin runs it (its runtime, a Knowledge pack, "
+                                            "ONNX models); gate 1.5 s")
+    elat.add_argument("--pack", default=None, metavar="PATH", help="the pack to time (default data/pack)")
+    elat.add_argument("--n", type=int, default=100, help="questions to time (default 100)")
+    elat.add_argument("--no-rerank", action="store_true", help="time without the reranker even if the pack names one")
+    epa = esub.add_parser("parity", help="the subject-neutral extraction prompt vs the startup one on startup talks "
+                                         "(shadow extractions; the Library is untouched)")
+    epa.add_argument("--n", type=int, default=30, help="talks to compare (default 30)")
+    epa.add_argument("--max-cost", type=float, default=1.0, metavar="USD", help="spend cap (default $1)")
+    etg = esub.add_parser("tags", help="the tag Step against your labelled sheets (`ytbrain domains sample`): "
+                                       "precision, recall, high-tier misses, Documents")
+    etg.add_argument("--items", required=True, metavar="CSV", help="the filled item sheet (a path, or a name in data/reports)")
+    etg.add_argument("--documents", default=None, metavar="CSV", help="the filled Document sheet")
+    etg.add_argument("--tune", action="store_true", help="score every threshold setting on these labels, best first")
+    etg.add_argument("--save", action="store_true", help="with --tune: keep the best for the next `ytbrain tag`")
+    ech = esub.add_parser("choice", help="P12: with several coaches installed, does each prompt reach the right one "
+                                         "(the real host, your Claude plan; no judges)")
+    ech.add_argument("--plugin", action="append", metavar="DIR", required=True,
+                     help="an assembled plugin; pass two or more (dist/plugin-private, dist/coding-coach-private, ...)")
+    ech.add_argument("--limit", type=int, default=0, help="first N prompts (a quick check)")
+    ech.add_argument("--model", default=None, metavar="MODEL", help="host model (default haiku; 'default' for yours)")
+    ech.add_argument("--workers", type=int, default=0,
+                     help="host runs at a time (default: YTBRAIN_COACH_WORKERS or 1; each is a `claude -p` on your plan)")
+    ec = esub.add_parser("coach", help="gates G2/G4/G5/G6/G7: the coach's answers and memory through the real host "
                                         "(`claude -p` with the assembled plugin), graded by the judges")
-    ec.add_argument("--gate", action="append", choices=["g2", "g4", "g5", "g6"],
+    ec.add_argument("--gate", action="append", choices=["g2", "g4", "g5", "g6", "g7", "g8"],
                     help="repeatable (default: all four)")
     ec.add_argument("--plugin", default=None, metavar="DIR", help="assembled plugin (default dist/plugin)")
     ec.add_argument("--limit", type=int, default=0, help="first N cases per gate (a quick check)")
@@ -2507,6 +3312,8 @@ def main(argv=None) -> int:
                     help="haiku (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus or 'default' (your Claude Code "
                          "default); with --host openrouter an OpenRouter id. Results are kept per model.")
     ec.add_argument("--max-turns", type=int, default=12, help="agentic turns per host call (default 12)")
+    ec.add_argument("--workers", type=int, default=0,
+                    help="cases at a time (default: YTBRAIN_COACH_WORKERS or 1; each is a `claude -p` on your plan)")
     ec.add_argument("--host", choices=["claude", "openrouter"], default="claude",
                     help="claude (default): the local Claude Code on your Claude plan, with the token-saving setup "
                          "(Haiku, turn cap, no repo context). openrouter: through OpenRouter, paid per token (key "
@@ -2572,6 +3379,23 @@ def main(argv=None) -> int:
     da.add_argument("--web-policy", default="when_gap", choices=["never", "when_gap", "always_latest"])
     di = dsub.add_parser("ignore", help="mark a books folder as one that only sorts files (ignore_folders)")
     di.add_argument("folder")
+    dl = dsub.add_parser("alias", help="another name for a Domain (`go-to-market` is `gtm`)")
+    dl.add_argument("name", help="the Domain")
+    dl.add_argument("alias", help="the other name")
+    dw = dsub.add_parser("why", help="why a Document has its Domains: shares, hints, each item's scores")
+    dw.add_argument("doc", metavar="DOC_ID_PREFIX")
+    dw.add_argument("--items", type=int, default=20, help="items to list (default 20)")
+    dr = dsub.add_parser("review", help="high-tier tags awaiting your confirmation, grouped by Source")
+    dr.add_argument("--accept", action="append", metavar="SOURCE:DOMAIN",
+                    help="confirm a group (repeatable); doc:DOC_ID:DOMAIN for one Document")
+    dr.add_argument("--reject", action="append", metavar="SOURCE:DOMAIN",
+                    help="never suggest this Domain there again (repeatable); doc:DOC_ID:DOMAIN for one Document")
+    dp = dsub.add_parser("propose", help="group content no Domain fits and propose Domains, after the duplicate checks")
+    dp.add_argument("--min-size", type=int, default=15, help="smallest group worth a Domain (default 15 items)")
+    ds = dsub.add_parser("sample", help="labelling sheets for `ytbrain eval tags` (items and Documents)")
+    ds.add_argument("--n", type=int, default=100, help="items (default 100)")
+    ds.add_argument("--docs", type=int, default=30, help="Documents (default 30)")
+    ds.add_argument("--seed", type=int, default=7)
 
     sp = sub.add_parser("books", help="PDF Books (ADR-0014): inspect how a PDF would be split into Chapters")
     sp.set_defaults(func=cmd_books, limit=0, workers=0)
@@ -2608,7 +3432,11 @@ def main(argv=None) -> int:
                          "chooses Domains until `eval run --config pack-route` shows it doesn't lose)")
     pi = psub.add_parser("info", help="describe the pack and verify its checksum")
     for x in (pb, pi):
-        x.add_argument("--out", default=None, metavar="DIR", help="pack folder (default data/pack)")
+        x.add_argument("--for", dest="for_pack", default=None, metavar="PACK",
+                       help="the Pack (packs/<id>/pack.toml): its Domains' items only (default founder)")
+        x.add_argument("--out", default=None, metavar="DIR",
+                       help="pack folder (default: data/pack, data/pack-private with --include-private; "
+                            "data/packs/<id>/... for another Pack)")
     for e in (eb, er, ert):
         e.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"])
 
@@ -2624,6 +3452,8 @@ def main(argv=None) -> int:
     # (scores a saved run; its result file is written atomically)
     read_only = args.cmd == "eval" and getattr(args, "eval_cmd", "") in ("status", "rescore", "coach", "route", "gap", "calibrate") \
         and not getattr(args, "save_baseline", False) and not getattr(args, "refresh_baseline", False)
+    read_only = read_only or (args.cmd in ("upgrade", "tag", "enrich") and args.dry_run) or \
+        (args.cmd == "eval" and getattr(args, "eval_cmd", "") in ("tags", "parity", "latency"))
     if args.cmd not in MUTATING or read_only:
         return args.func(args)
     try:

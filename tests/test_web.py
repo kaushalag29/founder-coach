@@ -932,8 +932,9 @@ def test_ac12_the_generated_schema_is_pinned_to_its_version():
     digest = hashlib.sha256(blob.encode()).hexdigest()[:16]
     pinned = json.loads((ROOT / "tests" / "golden" / "generated_schema.json").read_text())
     assert pinned.get(SCHEMA_VERSION) == digest, (
-        f"the generated schema changed ({digest}) but SCHEMA_VERSION is still {SCHEMA_VERSION}: bump it "
-        "(existing records get re-extracted), then add the new digest to tests/golden/generated_schema.json")
+        f"the generated schema changed ({digest}) but SCHEMA_VERSION is still {SCHEMA_VERSION}: bump it, declare the "
+        "release compatible or breaking in ytbrain/extract/versions.py (ADR-0018), then add the new digest to "
+        "tests/golden/generated_schema.json")
 
 
 if __name__ == "__main__":

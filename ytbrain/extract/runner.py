@@ -36,7 +36,7 @@ from ..config import (EXTRACT_MAX_REPAIRS, GROUNDING_RETRY_BELOW, LLM_BACKEND, L
                       SINGLE_CALL_MAX_TOKENS, TOKENS_PER_WORD,
                       WORDS_PER_ADVICE, WORDS_PER_HIGHLIGHT)
 from .. import source_kinds
-from . import prompts
+from . import prompts, versions
 from .schema import (AdviceAtom, Chapter, ChapterList, ExtractionMeta, Generated, Highlight,
                      Overview, VideoMetadata)
 
@@ -126,18 +126,41 @@ def openai_compatible_json(prompt: str, schema: dict, model: str = LLM_MODEL,
 
 
 # --- pacing shared by every worker thread ---------------------------------
-# One schedule for the whole process: each call reserves the next free slot
-# (LLM_MIN_INTERVAL_S apart), so N workers together still stay under
-# LLM_MAX_RPM. A 429 on any worker pauses ALL of them (_pause_until) -- the
-# limit is per account, so the other workers would only hit it too.
+# One schedule PER MODEL for the whole process: each call reserves the next free slot of its
+# model (60/rate seconds apart), so N workers together still stay under the ceiling. A 429 that
+# names an upstream provider ("qwen/x is temporarily rate-limited upstream") belongs to that
+# model alone: it pauses and slows only that model's calls, so a throttled judge doesn't hold
+# the others back. Any other 429 is the account's limit and pauses and slows every model.
 _pace_lock = threading.Lock()
-_min_interval = [LLM_MIN_INTERVAL_S]   # set_max_rpm() changes it (eval runs faster than extract)
-_next_slot = [0.0]
-_pause_until = [0.0]
-_rpm_ceiling = [60.0 / LLM_MIN_INTERVAL_S]   # what the user allowed; the working rate adapts below it
-_rpm_changed = [0.0]                          # monotonic time of the last cut or raise
-_rpm_cut = [0.0]         # when the rate was last CUT: a 429 burst counts once (raises don't count)
+_rpm_ceiling = [60.0 / LLM_MIN_INTERVAL_S]   # what the user allowed, per model; the working rate adapts below it
 _tls = threading.local()          # per-thread progress callback, see _say()
+
+
+class _Pacer:
+    """One model's schedule: its spacing, its next free slot, its pause, and when its rate last changed."""
+    __slots__ = ("min_interval", "next_slot", "pause_until", "changed", "cut")
+
+    def __init__(self, rpm: float):
+        self.min_interval = 60.0 / rpm
+        self.next_slot = self.pause_until = 0.0
+        self.changed = 0.0       # monotonic time of the last cut or raise
+        self.cut = 0.0           # when the rate was last CUT: a 429 burst counts once (raises don't count)
+
+    @property
+    def rpm(self) -> float:
+        return 60.0 / self.min_interval
+
+
+_pacers: dict[str, _Pacer] = {}
+
+
+def _pacer(key: str | None) -> _Pacer:
+    """The schedule for `key` (a model name; None for calls that name none). Caller holds _pace_lock."""
+    k = key or ""
+    p = _pacers.get(k)
+    if p is None:
+        p = _pacers[k] = _Pacer(_rpm_ceiling[0])
+    return p
 
 
 def _say(msg: str) -> None:
@@ -160,62 +183,82 @@ def is_local_endpoint(url: str) -> bool:
             or host.startswith("127.") or host.endswith(".local"))
 
 
-def _acquire_slot(url: str) -> None:
+def _acquire_slot(url: str, key: str | None = None) -> None:
     if is_local_endpoint(url):
         return
     with _pace_lock:
+        p = _pacer(key)
         now = time.monotonic()
-        t = max(now, _next_slot[0], _pause_until[0])
-        _next_slot[0] = t + _min_interval[0]
+        t = max(now, p.next_slot, p.pause_until)
+        p.next_slot = t + p.min_interval
     if t > now:
         time.sleep(t - now)
 
 
 def set_max_rpm(rpm: float) -> None:
-    """Change the shared requests-per-minute ceiling for this process (and start at it)."""
+    """Change the requests-per-minute ceiling (per model) for this process, and start every model at it."""
     with _pace_lock:
         _rpm_ceiling[0] = max(1.0, float(rpm))
-        _min_interval[0] = 60.0 / _rpm_ceiling[0]
-        _rpm_changed[0] = _rpm_cut[0] = 0.0
+        for p in _pacers.values():
+            p.min_interval = 60.0 / _rpm_ceiling[0]
+            p.changed = p.cut = 0.0
 
 
-def current_rpm() -> float:
-    """The working requests-per-minute rate right now (at most the ceiling)."""
-    return 60.0 / _min_interval[0]
+def current_rpm(key: str | None = None) -> float:
+    """The working requests-per-minute rate right now (at most the ceiling): that of model `key`, or
+    with no key the slowest model's, so "is anything being throttled" is one comparison with rpm_ceiling()."""
+    with _pace_lock:
+        if key is not None:
+            return _pacer(key).rpm
+        return min((p.rpm for p in _pacers.values()), default=_rpm_ceiling[0])
 
 
 def rpm_ceiling() -> float:
     return _rpm_ceiling[0]
 
 
-def _rate_limited(now: float | None = None) -> float | None:
-    """A hosted API said 429: halve the working rate for every worker. Several workers
-    usually get the same burst of 429s, so only one cut per RPM_CUT_COOLDOWN_S counts.
-    Returns the new rate, or None when this 429 belongs to a burst already handled."""
+def _rate_limited(now: float | None = None, key: str | None = None, everyone: bool = False) -> float | None:
+    """A hosted API said 429: halve the working rate of model `key` (of every model when the limit is
+    the account's: `everyone`). Several workers usually get the same burst of 429s, so only one cut per
+    RPM_CUT_COOLDOWN_S counts. Returns the new rate of `key`, or None when this 429 belongs to a burst
+    already handled."""
     now = time.monotonic() if now is None else now
     with _pace_lock:
-        # only a recent CUT makes this 429 part of a burst already handled; a recent raise
-        # (the rate just went up) is exactly when a new 429 must cut again
-        if _rpm_cut[0] and now - _rpm_cut[0] < RPM_CUT_COOLDOWN_S and current_rpm() < _rpm_ceiling[0]:
-            return None
-        rate = max(min(RPM_FLOOR, _rpm_ceiling[0]), current_rpm() / 2)
-        _min_interval[0] = 60.0 / rate
-        _rpm_changed[0] = _rpm_cut[0] = now
-        return rate
+        mine = _pacer(key)
+        result = None
+        for p in (list(_pacers.values()) if everyone else [mine]):
+            # only a recent CUT makes this 429 part of a burst already handled; a recent raise
+            # (the rate just went up) is exactly when a new 429 must cut again
+            if p.cut and now - p.cut < RPM_CUT_COOLDOWN_S and p.rpm < _rpm_ceiling[0]:
+                continue
+            rate = max(min(RPM_FLOOR, _rpm_ceiling[0]), p.rpm / 2)
+            p.min_interval = 60.0 / rate
+            p.changed = p.cut = now
+            if p is mine:
+                result = rate
+        return result
 
 
-def _went_through(now: float | None = None) -> float | None:
-    """A call succeeded: after RPM_RAISE_EVERY_S with no 429, step the working rate back
+def _went_through(now: float | None = None, key: str | None = None) -> float | None:
+    """A call succeeded: after RPM_RAISE_EVERY_S with no 429, step the model's working rate back
     up by RPM_RAISE_STEP of the ceiling. Returns the new rate when it changed."""
     now = time.monotonic() if now is None else now
     with _pace_lock:
-        rate, ceiling = current_rpm(), _rpm_ceiling[0]
-        if rate >= ceiling or now - _rpm_changed[0] < RPM_RAISE_EVERY_S:
+        p = _pacer(key)
+        rate, ceiling = p.rpm, _rpm_ceiling[0]
+        if rate >= ceiling or now - p.changed < RPM_RAISE_EVERY_S:
             return None
         rate = min(ceiling, rate + ceiling * RPM_RAISE_STEP)
-        _min_interval[0] = 60.0 / rate
-        _rpm_changed[0] = now
+        p.min_interval = 60.0 / rate
+        p.changed = now
         return rate
+
+
+def _is_upstream_limit(text: str) -> bool:
+    """OpenRouter's 429 for one model's upstream provider ("Provider returned error" ... "rate-limited
+    upstream"): that model's limit, not the account's."""
+    low = text.lower()
+    return "provider returned error" in low or "rate-limited upstream" in low
 
 
 class RetriesExhausted(RuntimeError):
@@ -316,12 +359,13 @@ def _post_with_backoff(url: str, body: dict, timeout: float, headers: dict,
     """
     import httpx
     local = is_local_endpoint(url)
+    model = str(body.get("model") or "")        # the pacing key: one schedule per model
     timeouts = 0
     last = "no attempt made"
     started = time.monotonic()
     for attempt in range(LLM_MAX_RETRIES + 1):
         final = attempt == LLM_MAX_RETRIES
-        _acquire_slot(url)
+        _acquire_slot(url, model)
         try:
             r = httpx.post(url, json=body, timeout=timeout, headers=headers)
         except httpx.TimeoutException as e:
@@ -347,14 +391,18 @@ def _post_with_backoff(url: str, body: dict, timeout: float, headers: dict,
             raise BackendUnavailable(f"HTTP {r.status_code}: {r.text[:300]}")
         if r.status_code in (408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529):
             last = f"HTTP {r.status_code}"
-            if r.status_code == 429 and not local:
-                slower = _rate_limited()
+            limited = r.status_code == 429 and not local
+            account = limited and not (model and _is_upstream_limit(r.text))    # not one model's upstream
+            if limited:
+                slower = _rate_limited(key=model, everyone=account)
                 if slower is not None:
-                    _say(f"rate limited: slowing every worker to {slower:.0f} requests/min")
+                    who = "every model" if account or not model else model
+                    _say(f"rate limited: slowing {who} to {slower:.0f} requests/min")
             if final:
-                raise RetriesExhausted(f"{last} after {attempt + 1} tries: {r.text[:200]}")
-            _backoff(attempt, r.headers.get("retry-after"), last,
-                     pause_all=r.status_code == 429 and not local)
+                raise RetriesExhausted(f"{last} after {attempt + 1} tries: {r.text[:600]}")   # a provider's reason can be long: keep it
+            _backoff(attempt, r.headers.get("retry-after"),
+                     f"{last} from {model}" if model and not account else last,
+                     pause_all=limited, key=model, everyone=account)
             continue
         if r.status_code >= 400:                       # 400/422: the request itself is wrong
             raise RequestRejected(f"HTTP {r.status_code} from {url}: {r.text[:300]}")
@@ -367,7 +415,7 @@ def _post_with_backoff(url: str, body: dict, timeout: float, headers: dict,
         content, truncated = parse(j) if isinstance(j, dict) and not err else (None, False)
         if content:
             if not local:
-                _went_through()
+                _went_through(key=model)
             info = _call_info(j)
             info["seconds"] = round(time.monotonic() - started, 1)
             if attempt:
@@ -381,7 +429,8 @@ def _post_with_backoff(url: str, body: dict, timeout: float, headers: dict,
     raise RetriesExhausted(last)
 
 
-def _backoff(attempt: int, retry_after: str | None, why: str, pause_all: bool = False) -> None:
+def _backoff(attempt: int, retry_after: str | None, why: str, pause_all: bool = False,
+             key: str | None = None, everyone: bool = True) -> None:
     import random
     try:
         wait = float(retry_after) if retry_after else None
@@ -393,9 +442,12 @@ def _backoff(attempt: int, retry_after: str | None, why: str, pause_all: bool = 
     if wait is None:
         wait = min(LLM_BACKOFF_BASE_S * 2 ** attempt, LLM_BACKOFF_MAX_S)
         wait *= random.uniform(0.8, 1.2)             # jitter
-    if pause_all:
+    if pause_all:                                    # a limit: hold this model's calls (all models' if it is the account's)
         with _pace_lock:
-            _pause_until[0] = max(_pause_until[0], time.monotonic() + wait)
+            until = time.monotonic() + wait
+            mine = _pacer(key)
+            for p in (list(_pacers.values()) if everyone else [mine]):
+                p.pause_until = max(p.pause_until, until)
     _say(f"{why}, retry {attempt + 1}/{LLM_MAX_RETRIES} in {wait:.0f}s")
     time.sleep(wait)
 
@@ -543,8 +595,26 @@ def est_tokens(utterances: list[dict]) -> int:
 
 
 def _P():
-    """The prompts for the Document being extracted (its Source kind, ADR-0013)."""
+    """The prompts for the Document being extracted (its Source kind, ADR-0013, and prompt variant, ADR-0018)."""
     return getattr(_tls, "prompts", None) or prompts.for_kind("talk")
+
+
+def _V() -> str:
+    """The prompt variant of the Document being extracted."""
+    return getattr(_tls, "variant", None) or "startup"
+
+
+def _GEN():
+    return versions.models(_V())[0]
+
+
+def _OV():
+    return versions.models(_V())[1]
+
+
+def _assertions(gen) -> list:
+    """Everything in a generated result that carries a quote: highlights, advice, and a neutral one's facts."""
+    return list(gen.highlights) + list(gen.advice_atoms) + list(getattr(gen, "facts", None) or [])
 
 
 def _tls_calls() -> list[dict]:
@@ -557,7 +627,8 @@ def extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
     _tls.on_step = on_step            # retries/backoff report through the same callback
     _tls.calls = []                   # every LLM call for this video, kept in extraction_meta
     _tls.avoid_providers = None       # providers that looped on this video (OpenRouter)
-    _tls.prompts = prompts.for_kind(meta.get("source_kind") or transcript.get("source_kind"))
+    _tls.variant = meta.get("prompt_variant") if meta.get("prompt_variant") in versions.VARIANTS else "startup"
+    _tls.prompts = prompts.for_kind(meta.get("source_kind") or transcript.get("source_kind"), _tls.variant)
     try:
         return _extract_video(transcript, meta, uploader_chaps, backend, on_step)
     finally:
@@ -565,6 +636,7 @@ def extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
         _tls.calls = None
         _tls.avoid_providers = None
         _tls.prompts = None
+        _tls.variant = None
 
 
 def _extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
@@ -617,7 +689,7 @@ def _extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
 
     kind = _P().kind
     talk = kind == "talk"
-    fields = gen.model_dump()
+    fields = gen.model_dump() if _V() == "startup" else _neutral_fields(gen)
     if not talk and meta.get("speaker"):
         fields["speaker"] = meta["speaker"]      # given (the page's author, the Book's authors) beats generated
     return VideoMetadata(
@@ -637,8 +709,8 @@ def _extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
         page_labels=meta.get("page_labels") or {},
         chapters=chapters,
         extraction_meta=ExtractionMeta(
-            model=LLM_MODEL, backend=backend, schema_version=SCHEMA_VERSION,
-            prompt_hash=_P().hash(),
+            model=LLM_MODEL, backend=backend, schema_version=versions.VARIANTS[_V()].latest,
+            prompt_variant=_V(), prompt_hash=_P().hash(),
             passes=windows, chapter_source=chapter_source,
             processed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             calls=list(calls), grounding=grounding,
@@ -646,10 +718,22 @@ def _extract_video(transcript: dict, meta: dict, uploader_chaps: list[dict],
     )
 
 
+def _neutral_fields(gen) -> dict:
+    """A neutral result in the stored record's shape (ADR-0018): no Category or Stage (category "other"),
+    advice keeps the situation it applies under, typed entities fold into Entities, facts and topics kept."""
+    g = gen.model_dump()
+    e = g.pop("entities") or {}
+    return {**g, "category": "other", "stage_relevance": [],
+            "advice_atoms": [{**a, "applies_to_stage": []} for a in g["advice_atoms"]],
+            "entities": {"people": e.get("people") or [], "companies": e.get("organizations") or [],
+                         "frameworks": list(dict.fromkeys((e.get("concepts") or []) + (e.get("tools") or []))),
+                         "books": e.get("works") or [], "yc_jargon": []}}
+
+
 def _grounding(gen: Generated, utterances: list[dict]) -> tuple[int, int]:
     """(quotes found in the transcript, quotes checked) — the same test `verify` applies."""
     from ..verify import find_evidence
-    items = list(gen.highlights) + list(gen.advice_atoms)
+    items = _assertions(gen)
     found = sum(1 for it in items if find_evidence(it.evidence_span or "", utterances).ok)
     return found, len(items)
 
@@ -660,13 +744,19 @@ def _problems(gen: Generated, utterances: list[dict], found: int, checked: int,
     from ..verify import find_evidence
     out = []
     if checked and found / checked < GROUNDING_RETRY_BELOW:
-        missing = list(dict.fromkeys(it.evidence_span for it in list(gen.highlights) + list(gen.advice_atoms)
+        missing = list(dict.fromkeys(it.evidence_span for it in _assertions(gen)
                                      if not find_evidence(it.evidence_span or "", utterances).ok))[:8]
         out.append(f"- Only {found} of {checked} evidence quotes appear in the transcript. "
                    "These were NOT found (they read like paraphrases or quotes from memory):")
         out += [f'    "{q[:160]}"' for q in missing]
     if not checked:
         out.append("- You returned no highlights or advice.")
+    if _V() == "neutral":                       # a reference chapter may hold facts and no advice: that's fine
+        if not gen.advice_atoms and not getattr(gen, "facts", None) and words >= NO_ADVICE_RETRY_MIN_WORDS:
+            out.append(f"- You returned no advice and no facts. If the {_P().kind} recommends anything or states "
+                       "facts, extract them (one idea each, with its own quote); if it truly contains none, say "
+                       "so in unknowns_and_gaps.")
+        return "\n".join(out)
     if not gen.advice_atoms and words >= NO_ADVICE_RETRY_MIN_WORDS:
         out.append(f"- You returned no advice atoms. If the {_P().kind} recommends anything a founder "
                    "could act on, extract it as advice atoms (imperative, one idea each, with "
@@ -694,11 +784,11 @@ def _extract_once(utterances: list[dict], meta: dict, chapter_titles: str, backe
         title=meta.get("title", ""), series=_series(meta),
         chapter_titles=chapter_titles,
         max_highlights=budget[0], max_advice=budget[1],
-        schema=json.dumps(Generated.model_json_schema(), indent=2),
+        schema=json.dumps(_GEN().model_json_schema(), indent=2),
         feedback=feedback,
         transcript=_P().format(utterances),
     )
-    return generate_validated(prompt, Generated, backend, on_step=on_step, calls=calls, kind=kind,
+    return generate_validated(prompt, _GEN(), backend, on_step=on_step, calls=calls, kind=kind,
                               budget=budget)
 
 
@@ -769,10 +859,15 @@ def _extract_windowed(utterances: list[dict], chapters: list[Chapter], meta: dic
     highlights = _round_robin([dedup(p.highlights) for p in parts], int(MAX_HIGHLIGHTS * 1.5))
     advice = _round_robin([dedup(p.advice_atoms) for p in parts], int(MAX_ADVICE * 1.5))
     advice = [a.model_copy(update={"atom_id": f"a{n:02d}"}) for n, a in enumerate(dedup(advice), 1)]
-    merged = parts[0].model_copy(update={"highlights": dedup(highlights), "advice_atoms": advice})
+    update = {"highlights": dedup(highlights), "advice_atoms": advice}
+    if hasattr(parts[0], "facts"):
+        facts = _round_robin([dedup(p.facts) for p in parts], int(MAX_ADVICE * 1.5))
+        update["facts"] = [f.model_copy(update={"fact_id": f"f{n:02d}"}) for n, f in enumerate(dedup(facts), 1)]
+        update["topics"] = list(dict.fromkeys(t for p in parts for t in p.topics))[:5]
+    merged = parts[0].model_copy(update=update)
     for p in parts[1:]:
         merged.unknowns_and_gaps += [g for g in p.unknowns_and_gaps if g not in merged.unknowns_and_gaps]
-        for field in ("people", "companies", "frameworks", "books", "yc_jargon"):
+        for field in type(merged.entities).model_fields:
             seen = getattr(merged.entities, field)
             for v in getattr(p.entities, field):
                 if v not in seen:
@@ -784,8 +879,8 @@ def _extract_windowed(utterances: list[dict], chapters: list[Chapter], meta: dic
             title=meta.get("title", ""), series=_series(meta),
             summaries="\n".join(f"- {p.summary}" for p in parts),
             takeaways="\n".join(f"- {h.text}" for h in merged.highlights),
-            schema=json.dumps(Overview.model_json_schema(), indent=2))
-        ov, _ = generate_validated(prompt, Overview, backend, on_step=on_step, calls=calls,
+            schema=json.dumps(_OV().model_json_schema(), indent=2))
+        ov, _ = generate_validated(prompt, _OV(), backend, on_step=on_step, calls=calls,
                                    kind="overview")
         if ov is not None:
             merged = merged.model_copy(update=ov.model_dump())

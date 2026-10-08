@@ -30,8 +30,8 @@ Claude Code clones it with the tester's own git credentials.
 
    `.gitignore` keeps out `.env`, `data/` (1.1 GB, rebuildable), `dist/`, `.venv/`,
    `sources.yaml` and caches. `eval/` (the benchmark, 4 MB) is tracked on purpose.
-3. Run the CI checks on every `git commit` (recommended). `scripts/check.sh` scans for secrets, runs the seven
-   offline suites, checks the generated files are fresh and validates the plugin. It takes a couple of minutes,
+3. Run the CI checks on every `git commit` (recommended). `scripts/check.sh` scans for secrets, runs the nine
+   offline suites, checks the generated files are fresh and assembles and validates the three plugins (founder, coding, investor). It takes a couple of minutes,
    needs no key and makes no model calls; a failure stops the commit. Install it once per clone:
 
    ```bash
@@ -54,10 +54,10 @@ Claude Code clones it with the tester's own git credentials.
 ## CI
 
 `.github/workflows/ci.yml` runs on every push and pull request, on Linux with Python 3.11 and
-3.13: the secret scan, the seven test suites (core, eval, pack, coach, plugin, web, books; a suite that skips a test for a missing
-dependency fails the run), a plugin assembled from a test pack with `--check`, a check that
+3.13: the secret scan, the nine test suites (core, eval, pack, coach, projects, invest, plugin, web, books; a suite that skips a test for a missing
+dependency fails the run), the three plugins (founder, coding, investor) assembled from a test pack with `--check`, a check that
 the generated files (`founder_coach/product.json`, `founder_coach/playbooks/`) are committed,
-and `claude plugin validate --strict`. No paid calls, no model downloads, no `.env`.
+and `claude plugin validate --strict` on each plugin. No paid calls, no model downloads, no `.env`.
 See runs under the repo's **Actions** tab.
 
 ## Release a beta version

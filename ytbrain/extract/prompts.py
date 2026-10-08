@@ -127,6 +127,103 @@ Return JSON matching this schema:
 """
 
 
+# ---- the subject-neutral variant (ADR-0018) -------------------------------------------------
+# For any subject (software, investing, management, a craft): no startup Category or Stage. Advice says the
+# situation it is for (`applies_when`) and declarative statements become Facts. Written with the same
+# talk-specific phrases as the startup prompts, so the article and book-chapter conversions below apply.
+
+NEUTRAL_CHAPTER_PROMPT = """\
+Segment this talk into chapters using only its transcript.
+
+Rules:
+- Between 5 and 12 chapters. Fewer is better than forcing boundaries.
+- Each chapter starts at a real topic shift, not at a fixed interval.
+- `title` is 3-8 words and specific to this talk ("Why replication lag breaks
+  reads", not "Databases").
+- `start_ms` must be copied from one of the `[ms]` markers in the transcript
+  below. Do not compute or invent a value.
+- `source` must be "llm".
+- If the talk has no discernible structure, return one chapter covering it.
+
+Return JSON matching this schema:
+{schema}
+
+TRANSCRIPT:
+{transcript}
+"""
+
+NEUTRAL_EXTRACT_PROMPT = """\
+Build structured, cited knowledge from this talk for a personal knowledge base.
+The subject can be anything (software, investing, management, a craft):
+describe it in its own terms, not as startup advice.
+
+Talk: {title}
+Series: {series}
+Chapters: {chapter_titles}
+
+Hard rules:
+- EVERY highlight, advice atom and fact MUST carry `evidence_span`: a quote from the
+  transcript that supports it. If you cannot quote support for a claim, do not
+  make the claim. Copy ONE contiguous passage of 10-40 words exactly as it
+  appears in the transcript: keep repeated words, filler ("like", "you know")
+  and caption misspellings, and do not fix grammar or stitch passages together
+  with "...". A title, heading or slogan of your own is not a quote.
+- Do NOT output timestamps. They are derived from the transcript afterwards.
+- `advice_atoms` are single, actionable, imperative recommendations ("Add an
+  index before sharding the table"), one idea each, never compound. Give each a
+  short unique `atom_id` like "a01". Put the situation it is meant for in
+  `applies_when` ("a read-heavy table outgrowing one machine"), or null when it
+  always applies. Any highlight that tells the reader what to do must also
+  appear as an advice atom. Interviews and Q&A sessions often hold
+  the most concrete advice; extract it.
+- `facts` are declarative statements the talk presents as true ("Asynchronous
+  replication can lose acknowledged writes on failover"), one each, with a short
+  unique `fact_id` like "f01". Something the speaker only recommends or believes
+  is advice or a highlight, not a fact.
+- `highlights` are the talk's key takeaways, paraphrased, each with its quote.
+- `topics`: 1-5 short subject labels in the talk's own terms, most specific
+  first ("database replication", "consistency models").
+- `speaker`: only if the transcript or title makes it clear. Otherwise null.
+- `summary`: about 150 words, plain prose, no bullet points.
+- `entities`: the people, organizations, concepts (named ideas, methods,
+  patterns), works (books, papers, standards) and tools it names.
+- Set `confidence` honestly; "low" is a useful answer.
+- Size: at most {max_highlights} highlights, {max_advice} advice atoms and {max_advice}
+  facts (scaled to this talk's length) — the most important ones, not every point
+  made. Keep each quote under 40 words.
+- Record anything you could not determine in `unknowns_and_gaps` rather than
+  guessing. Only a clip that is purely logistics (announcements, introductions,
+  housekeeping) should return few or no atoms, and say so there.
+
+Return JSON matching this schema:
+{schema}
+{feedback}
+TRANSCRIPT:
+{transcript}
+"""
+
+NEUTRAL_OVERVIEW_PROMPT = """\
+These are section summaries and key takeaways of ONE talk, extracted section by
+section. Write the talk-level fields for the whole talk.
+
+Talk: {title}
+Series: {series}
+
+Section summaries:
+{summaries}
+
+Key takeaways:
+{takeaways}
+
+Rules: `summary` about 150 words of plain prose covering the whole talk;
+`topics` 1-5 short subject labels in the talk's own terms, most specific first;
+`speaker` only if clear, else null.
+
+Return JSON matching this schema:
+{schema}
+"""
+
+
 def prompt_hash(*parts: str) -> str:
     """Recorded on every record, so changing a prompt is detectable after the
     fact and `ytbrain invalidate extract` can be justified."""
@@ -232,16 +329,24 @@ def _pages(utterances: list[dict], max_words: int) -> str:
     return "\n".join(out)
 
 
+_VARIANT_PROMPTS = {
+    "startup": (CHAPTER_PROMPT, EXTRACT_PROMPT, OVERVIEW_PROMPT),
+    "neutral": (NEUTRAL_CHAPTER_PROMPT, NEUTRAL_EXTRACT_PROMPT, NEUTRAL_OVERVIEW_PROMPT),
+}
+
+
 class _Prompts:
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, variant: str = "startup"):
         conv = _CONVERT.get(kind, lambda s: s)
+        chapter, extract, overview = _VARIANT_PROMPTS[variant]
         self.kind = kind
-        self.CHAPTER_PROMPT = conv(CHAPTER_PROMPT)
-        self.EXTRACT_PROMPT = conv(EXTRACT_PROMPT)
+        self.variant = variant
+        self.CHAPTER_PROMPT = conv(chapter)
+        self.EXTRACT_PROMPT = conv(extract)
         self.REPAIR_PROMPT = REPAIR_PROMPT
         self.CONCISE_SUFFIX = CONCISE_SUFFIX
         self.GROUNDING_FEEDBACK = conv(GROUNDING_FEEDBACK)
-        self.OVERVIEW_PROMPT = conv(OVERVIEW_PROMPT)
+        self.OVERVIEW_PROMPT = conv(overview)
 
     def format(self, utterances: list[dict], with_ms: bool = False, max_words: int = 40000) -> str:
         """Talks: `[mm:ss]` (or raw ms for chaptering); articles: `[n]` paragraph numbers;
@@ -265,6 +370,7 @@ class _Prompts:
                            self.GROUNDING_FEEDBACK, self.OVERVIEW_PROMPT)
 
 
-def for_kind(kind: str | None) -> _Prompts:
-    """The prompts for a Source kind: 'talk' (default), 'article' or 'chapter' (a Book Chapter)."""
-    return _Prompts(kind if kind in _CONVERT else "talk")
+def for_kind(kind: str | None, variant: str = "startup") -> _Prompts:
+    """The prompts for a Source kind ('talk' (default), 'article' or 'chapter') and a prompt variant
+    ('startup', or the subject-neutral 'neutral', ADR-0018)."""
+    return _Prompts(kind if kind in _CONVERT else "talk", variant if variant in _VARIANT_PROMPTS else "startup")

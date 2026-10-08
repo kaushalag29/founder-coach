@@ -1,4 +1,4 @@
-# Every push and pull request: the seven offline suites (each alone, then all in one process), a secret scan, and an assembled
+# Every push and pull request: the nine offline suites (each alone, then all in one process), a secret scan, and an assembled
 # plugin checked by Claude Code's own validator. No paid calls, no model downloads, no .env.
 # Private repo on GitHub Free: 2,000 Linux minutes a month; a run takes a few minutes.
 name: ci
@@ -49,7 +49,7 @@ jobs:
       - name: Test suites (REQUIRE_ALL_TESTS turns a skip into a failure)
         run: |
           set -o pipefail
-          for suite in core eval pack coach plugin web books; do
+          for suite in core eval pack coach projects invest plugin web books; do
             echo "::group::test_$suite"
             uv run --no-sync python tests/test_$suite.py 2>&1 | tee "$RUNNER_TEMP/test_$suite.log"
             echo "::endgroup::"
@@ -70,6 +70,9 @@ jobs:
           _build(Path("dist/ci-pack"), emb=HashEmbed())
           PY
           uv run --no-sync python scripts/assemble_plugin.py --pack dist/ci-pack --out dist/plugin --check
+          for pack in coding investor; do   # one plugin per Pack (ADR-0016): each assembles and checks
+            uv run --no-sync python scripts/assemble_plugin.py --for "$pack" --pack dist/ci-pack --out "dist/plugin-$pack" --check
+          done
           git diff --exit-code -- founder_coach/product.json founder_coach/playbooks \
             || { echo "::error::generated files are stale: run scripts/assemble_plugin.py and commit"; exit 1; }
 
@@ -82,4 +85,6 @@ jobs:
         if: matrix.python == '3.13'
         run: |
           npm install -g @anthropic-ai/claude-code
-          claude plugin validate dist/plugin --strict
+          for plugin in dist/plugin dist/plugin-coding dist/plugin-investor; do
+            claude plugin validate "$plugin" --strict
+          done
