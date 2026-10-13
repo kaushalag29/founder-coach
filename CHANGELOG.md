@@ -3,6 +3,60 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-12 (second round: the coding and investor runs; plugins 0.1.4)
+
+- **A Project is named after what setup gave, in all three Packs.** The first save used to create a Project called "My project"
+  (G7 failed on the Project name). It now takes the first clause of the Pack's identity field: the company for the founder, the
+  system for the engineer, the goal for the investor.
+- **The eval host loads only the plugin under test.** The coaches you have installed in Cowork, and their session hooks, loaded
+  beside it: a coding run answered about "the founder coach's tools" and quoted your real Check-in nudges. When `claude --help`
+  lists `--setting-sources`, the host now uses project and local settings only, and the tools of every other coach are denied.
+  Every gate's version marker moved, so earlier results (all measured with that contamination) are not reused.
+- **G2 no longer flags real book pages.** The host can hand the coach the structured search result (`"page": 534`) instead of the
+  text `PDF p. 534`; the citation check only knew the text, so every correct page counted as "not retrieved" (coding about 73%,
+  investor 55%). Both forms count now; the G2 record also keeps `pages_seen`, `page_lines` and the first 300 characters of a
+  search result.
+- **G5/G7 checks:** a profile check can ask for words the saved value contains (`contains`), and a Project is found by the start
+  of its name; the pinned model is `claude-haiku-5-5`.
+- **Investor coach:** declining a security call now opens the answer with the one-sentence referral to a fee-only fiduciary adviser
+  (G8 g8-01 had left it out).
+- **`eval choice`:** 45 prompts, including 7 that need two or three coaches (all of them must be reached; those get 6 turns instead
+  of 3). `--quick` runs a 15-prompt sample of every kind. A prompt's result is kept whichever run asked it, for the same prompt and
+  expectation, so a full run after a quick one asks only the rest. A run that reached a coach before the turn cap is graded, not
+  an error.
+- 456 tests pass on Python 3.11 (CI runs 3.11 and 3.13).
+
+## 2026-10-11 (fixes from the first M6 coach runs)
+
+- The coach eval and `ytbrain claude` default to Haiku 5.5, pinned as `claude-haiku-5-5` (`coach.HAIKU`) instead of the `haiku` alias; the OpenRouter default is `anthropic/claude-haiku-5.5`. An empty `YTBRAIN_COACH_MODEL` also means Haiku 5.5. Cached gate results are keyed on the model name, so the first run after this change reruns every gate once.
+
+The first full `eval coach` on the M6 build (Haiku) failed G4 (5/10, every miss with zero searches) and G5 (0/3 personas).
+The stored runs show three separate causes; each is fixed at its source.
+
+- **A person's own facts are saved only in their own words.** The coach had saved `name='<the account holder>'` and
+  `role='Founder'` nobody had said: the host knows the account's name and the setup text called both fields optional.
+  `coach_update_profile` now takes `stated` (field -> the person's words) and refuses `name`, `role` and `answer_style`
+  without it, or when the words share nothing with the value; nothing is saved and the error says what to do. Fields about the
+  company need no quote. The tool text, server instructions, coach and setup skills (founder and coding) and the setup Playbook say
+  the same: ask, never infer from the account, email or what the host shows.
+- **A missing profile never replaces the search.** The setup Nudge, the session hook and the instructions said "answer the question
+  first", which a model can read as "skip `coach_search`". They now say: search first when there is a plan or claim to judge,
+  answer, then offer setup once (all three Packs; `coach_get_context` says it too).
+- **A Project is created or switched only on request,** or by setup for the company the person named (tool text, instructions,
+  coach skills of all three Packs). `coach_record` says what a Decision is: a choice presented as decided, not a dropped
+  Commitment or a change of priorities (the Check-in invented one in the fundraising persona).
+- **G5 checker:** `key_metrics` is judged by the numbers given, not the label the coach chose (`{'pilots': '3 clinics'}` for "3 clinics
+  piloting" is right); setup's `coach_project create` for the company they gave is allowed; a call the tool refused is ignored
+  (the stream parser now keeps `is_error` on each tool call).
+- **Guardrails:** `ruff check .` (syntax errors and pyflakes only, `pyproject.toml`) runs in CI and `scripts/check.sh`; 11 dead
+  imports and 2 small leftovers removed. `tests/golden/cli_surface.json` pins every command, option and handler of `ytbrain` and
+  `founder-coach`, so splitting `cli.py` cannot silently drop one.
+- **Setup asks once and never holds up a Focus.** The first G5 run after the fixes (G4 PASS 100%, G5 33%) failed the
+  Commitment checks in two personas: setup's "Ask for these" made the coach ask for a role and a Goal before any Focus, and
+  a "yes, record them" was answered with a new proposal. The setup and weekly-focus skills now say a missing name, role or
+  Goal never holds up a Focus or a save, and a yes is recorded in the same reply.
+- Tests: 449 (5 new: the guard, the pinned wording in every Pack, the checker cases, `is_error` parsing, the CLI surface).
+
 ## 2026-10-07 (parallel `enrich` and coach gates)
 
 - **`ytbrain enrich --workers N`** runs the model calls in parallel with `extract`'s default (`YTBRAIN_LLM_WORKERS`),

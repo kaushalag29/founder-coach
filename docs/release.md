@@ -54,7 +54,7 @@ Claude Code clones it with the tester's own git credentials.
 ## CI
 
 `.github/workflows/ci.yml` runs on every push and pull request, on Linux with Python 3.11 and
-3.13: the secret scan, the nine test suites (core, eval, pack, coach, projects, invest, plugin, web, books; a suite that skips a test for a missing
+3.13: the secret scan, `ruff check .`, the nine test suites (core, eval, pack, coach, projects, invest, plugin, web, books; a suite that skips a test for a missing
 dependency fails the run), the three plugins (founder, coding, investor) assembled from a test pack with `--check`, a check that
 the generated files (`founder_coach/product.json`, `founder_coach/playbooks/`) are committed,
 and `claude plugin validate --strict` on each plugin. No paid calls, no model downloads, no `.env`.

@@ -133,7 +133,8 @@ Posts (M7) follow M6; the investor Pack moved ahead of them because it needs no 
   Pack: cases in `ytbrain/eval/coach_cases/coding/` (G4 10 weak designs, G5 one persona, G6 6 multi-part questions, G7
   two systems), rubrics in the Pack's words, and G2 sampled only from Tuning questions seeded by Documents in that
   plugin's pack (75 of today's 329 are about coding or system design). `eval run|gap --only-pack-docs` scores a Pack
-  on its own questions (P3, P4). **P12** is `eval choice`: 30 prompts (12 founder, 12 coding, 6 for no coach) over
+  on its own questions (P3, P4). **P12** is `eval choice`: 45 prompts (12 founder, 12 coding, 8 investor, 6 for no coach, 7 that need two or
+  three coaches, which must all be reached; `--quick` runs a 15-prompt sample) over
   every coach installed together; ops runs it after each Pack's own gates. A draft of 35 near-miss coding Gap
   questions is in `data/eval/gap-questions-coding.draft.txt`.
 - **Re-extract scope (L1).** Before the neutral prompt's parity check, only Documents *declared* wholly outside the
@@ -182,6 +183,20 @@ full gates and in the first dogfood sessions before changing a prompt:
 - **coding G7**: the case ended in `error_max_turns` after `ToolSearch` loops (probably host behaviour, not our tools).
 
 Sign-off runs use `--model sonnet`; Haiku is the cheap default for iterating.
+
+### What the first full founder run showed (Haiku, 2026-10-09; fixes 2026-10-11)
+
+- **G2 passed (99%).** G4 was 5/10 and G5 0/3, but the history says both gates were already noisy: G4 ran 2/10, 10/10, 9/10, 8/10, 8/10
+  on earlier builds, G5 ran 0/3, 1/3, 1/3, 2/3, 3/3, and `persona-fundraising` recorded two Decisions (`decisions max 1`) on four of five
+  builds. M6 added one systematic failure on top.
+- **M6's own regression (G5, all three personas): values nobody dictated.** `name`/`role` were filled from the host's account (new Common fields,
+  setup called them optional), and the checker mislabelled two correct saves (`key_metrics` label, setup's `coach_project create`). Fixed:
+  the `stated` guard, clearer text, a fairer checker (CHANGELOG 2026-10-11).
+- **Not yet explained (G4):** every miss had zero searches. The session-start Nudge and instructions said "answer first" (unchanged since
+  before M6, so not the M6 cause, but reworded to "search first"). To tell our change from Haiku noise, run G4 on
+  `dist/plugin-baseline-pre-m6` and `dist/plugin-m6-before-fixes` as well as on the rebuilt plugin.
+- **Not changed:** the persona-fundraising week-2 reply asked questions instead of proposing Commitments (so no Commitments were
+  recorded); the weekly-focus skill already says the proposal comes in the first reply. Watch it in the rerun before adding text.
 
 ## 4. Acceptance criteria
 

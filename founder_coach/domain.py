@@ -59,11 +59,14 @@ PROFILE_FIELDS, FIELD_VALUES, NEVER_STALE = _pack_profile()
 # setup is offered until these are saved
 REQUIRED = tuple(product.PACK.get("required") or (("company", "stage") if "company" in PROFILE_FIELDS
                                                    else tuple(PROFILE_FIELDS)[:1]))
+# Facts about the person themselves: saved only in words they said in this conversation (coach_update_profile
+# `stated`), never from their account, email or the host's context
+STATED_FIELDS = tuple(f for f in ("name", "role", "answer_style") if f in PROFILE_FIELDS)
 _RUNTIME = product.PACK.get("runtime") or {}
 COACH_NAME = _RUNTIME.get("coach_name") or "Founder coach"
 SETUP_NUDGE = _RUNTIME.get("setup_nudge") or (
-    "No Founder profile yet: answer the Founder's question first, then offer the setup Playbook once (company, "
-    "customer, Stage, one Goal, Check-in day).")
+    "No Founder profile yet, which never delays or replaces the search: search first when there is a plan or claim "
+    "to judge, answer, then offer the setup Playbook once (company, customer, Stage, one Goal, Check-in day).")
 
 STATUSES = {
     "goal": ("active", "met", "dropped"),

@@ -2744,5 +2744,54 @@ def test_every_package_data_pattern_matches_a_shipped_file():
     assert "playbooks/*.md" in declared["founder_coach"]
 
 
+def _cli_surface(main):
+    """The command line as data: every command, its options, positionals and handler, found by stopping main() at
+    the point where it would parse. No help text, so rewording never trips it; renaming a command or option does."""
+    import argparse
+
+    class Seen(Exception):
+        pass
+
+    def grab(self, args=None, namespace=None):
+        raise Seen(self)
+    real = argparse.ArgumentParser.parse_args
+    argparse.ArgumentParser.parse_args = grab
+    try:
+        try:
+            main([])
+        except Seen as e:
+            parser = e.args[0]
+    finally:
+        argparse.ArgumentParser.parse_args = real
+
+    def walk(p):
+        out = {"options": sorted(o for a in p._actions if a.option_strings for o in a.option_strings
+                                 if o not in ("-h", "--help")),
+               "positionals": [a.dest for a in p._actions
+                               if not a.option_strings and not isinstance(a, argparse._SubParsersAction)]}
+        fn = p.get_default("func")
+        if fn is not None:
+            out["handler"] = getattr(fn, "__name__", str(fn))
+        subs = {name: walk(sp) for a in p._actions if isinstance(a, argparse._SubParsersAction)
+                for name, sp in a.choices.items()}
+        if subs:
+            out["commands"] = dict(sorted(subs.items()))
+        return out
+    return walk(parser)
+
+
+def test_the_command_lines_keep_their_commands_options_and_handlers():
+    """A guardrail for splitting ytbrain/cli.py: the surface users and scripts rely on is pinned in
+    tests/golden/cli_surface.json. After a deliberate change: UPDATE_GOLDEN=1 python tests/test_core.py"""
+    from founder_coach import cli as coach_cli
+    from ytbrain import cli
+    golden = Path(__file__).parent / "golden" / "cli_surface.json"
+    now = {"ytbrain": _cli_surface(cli.main), "founder-coach": _cli_surface(coach_cli.main)}
+    text = json.dumps(now, indent=1, sort_keys=True) + "\n"
+    if os.environ.get("UPDATE_GOLDEN") or not golden.exists():
+        golden.write_text(text)
+    assert golden.read_text() == text, "a command, option or handler changed: review it, then UPDATE_GOLDEN=1 python tests/test_core.py"
+
+
 if __name__ == "__main__":
     raise SystemExit(_run())

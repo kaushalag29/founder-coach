@@ -160,6 +160,28 @@ def test_each_project_keeps_its_own_memory_and_a_session_asks_which_one():
         assert not (user / ".founder-coach").exists(), "nothing is written to the old data folder"
 
 
+def test_the_first_save_names_the_project_after_the_company_setup_gives():
+    with _machine() as user:
+        async def go(call):
+            res, _, err = await call("coach_update_profile", {"changes": {"company": "Acme Dental", "stage": "mvp"},
+                                                                "request_id": _rid()})
+            assert not err and res["saved_to"] == "Project Acme Dental (acme-dental)"
+            out, _, _ = await call("coach_project", {"action": "list"})
+            assert [p["name"] for p in out["projects"]] == ["Acme Dental"]
+        _serve(user, go)
+
+
+def test_a_projects_first_name_is_the_first_clause_of_what_setup_gives():
+    from founder_coach.server import DEFAULT_PROJECT, _first_project_name
+    assert _first_project_name("Acme Dental") == "Acme Dental"
+    assert _first_project_name("Payments API, card payments for online shops") == "Payments API"
+    assert _first_project_name("Search Indexer; a batch pipeline") == "Search Indexer"
+    assert _first_project_name("Retirement 2055 - for me") == "Retirement 2055"
+    assert _first_project_name("E-commerce Co") == "E-commerce Co", "a hyphen inside a word is not a clause"
+    assert _first_project_name("  ") == DEFAULT_PROJECT and _first_project_name(None) == DEFAULT_PROJECT
+    assert len(_first_project_name("x" * 300)) <= 80
+
+
 def test_the_first_save_makes_a_project_and_a_pinned_folder_has_none():
     with _machine() as user:
         async def go(call):
@@ -181,7 +203,7 @@ def test_the_first_save_makes_a_project_and_a_pinned_folder_has_none():
             assert not err and out["mode"] == "single" and "Projects are off" in out["note"]
             res, _, _ = await call("coach_update_profile", {"changes": {"stage": "mvp"}, "request_id": _rid()})
             assert res["saved_to"] is None
-            _, text, err = await call("coach_update_profile", {"changes": {"name": "Kay"}, "scope": "common",
+            _, text, err = await call("coach_update_profile", {"changes": {"name": "Kay"}, "stated": {"name": "call me Kay"}, "scope": "common",
                                                                "request_id": _rid()})
             assert err and "no Common profile" in text
             ctx, _, _ = await call("coach_get_context")
@@ -195,11 +217,11 @@ def test_the_common_profile_is_shared_only_on_a_yes_and_only_for_its_fields():
     with _machine() as user:
         async def go(call):
             await call("coach_project", {"action": "create", "name": "Acme"})
-            await call("coach_update_profile", {"changes": {"name": "Kay", "company": "Acme"}, "request_id": _rid()})
+            await call("coach_update_profile", {"changes": {"name": "Kay", "company": "Acme"}, "stated": {"name": "call me Kay"}, "request_id": _rid()})
             await call("coach_project", {"action": "create", "name": "Beta"})
             ctx, _, _ = await call("coach_get_context")
             assert "name" not in ctx["profile"], "a project-scope save stays in its Project"
-            res, _, err = await call("coach_update_profile", {"changes": {"name": "Kay", "timezone": "Asia/Kolkata"},
+            res, _, err = await call("coach_update_profile", {"changes": {"name": "Kay", "timezone": "Asia/Kolkata"}, "stated": {"name": "call me Kay"},
                                                               "scope": "common", "request_id": _rid()})
             assert not err and res["saved_to"].startswith("Common profile") and res["profile"]["name"] == "Kay"
             ctx, _, _ = await call("coach_get_context")
@@ -209,7 +231,7 @@ def test_the_common_profile_is_shared_only_on_a_yes_and_only_for_its_fields():
             ctx, _, _ = await call("coach_get_context")
             assert ctx["profile"]["name"] == "Kay" and ctx["shared_fields"] == ["timezone"], \
                 "the Project's own value stands until it is shared from there"
-            await call("coach_update_profile", {"changes": {"name": "Kay R"}, "scope": "common", "request_id": _rid()})
+            await call("coach_update_profile", {"changes": {"name": "Kay R"}, "stated": {"name": "call me Kay R"}, "scope": "common", "request_id": _rid()})
             ctx, _, _ = await call("coach_get_context")
             assert ctx["profile"]["name"] == "Kay R" and "name" in ctx["shared_fields"], \
                 "sharing from a Project ends its own older value"
@@ -245,7 +267,7 @@ def test_a_pack_that_shares_nothing_never_reads_or_writes_the_common_profile():
                 await call("coach_project", {"action": "create", "name": "Fund I"})
                 ctx, _, _ = await call("coach_get_context")
                 assert "name" not in ctx["profile"] and ctx["shared_fields"] is None
-                _, text, err = await call("coach_update_profile", {"changes": {"name": "K"}, "scope": "common",
+                _, text, err = await call("coach_update_profile", {"changes": {"name": "K"}, "stated": {"name": "call me K"}, "scope": "common",
                                                                    "request_id": _rid()})
                 assert err and "shares no profile fields" in text
             _serve(user, go)
@@ -491,13 +513,41 @@ def test_g7_cases_are_well_formed_and_graded_on_every_projects_store():
     log = [{"coach": "Which one: Acme Dental or Kitebook?", "writes": [], "calls": []},
            {"coach": "Acme has 10 paying clinics as its goal.", "writes": [], "calls": []},
            {"coach": "Saved.", "writes": ["coach_update_profile"],
-            "calls": [{"tool": "coach_update_profile", "input": {"changes": {"name": "Kay"}, "scope": "common"}}]}]
+            "calls": [{"tool": "coach_update_profile", "input": {"changes": {"name": "Kay"}, "stated": {"name": "call me Kay"}, "scope": "common"}}]}]
     ask = {"turn": 1, "asks_project": True, "names": ["Acme", "Kitebook"], "not_mentions": ["clinics"],
            "no_memory_writes": True}
     assert C.turn_check(log, ask)["ok"]
     assert not C.turn_check(log, {**ask, "turn": 2})["ok"], "answering from one Project without asking fails"
     assert not C.turn_check(log, {"turn": 3, "no_common_write": True})["ok"]
     assert not C.turn_check(log, {"turn": 9, "mentions": ["x"]})["ok"], "a turn that never ran fails"
+
+
+def test_the_persons_own_facts_are_saved_only_in_their_own_words():
+    """G5 (2026-10-09): the coach saved name='<the account holder>' and role='Founder' nobody had said. The server can't
+    see the conversation, so name, role and answer_style need `stated`, the person's words, or nothing is saved."""
+    with _machine() as user:
+        async def go(call):
+            await call("coach_project", {"action": "create", "name": "Acme"})
+            for args, quote in (({"name": "Kaushal Ag"}, None),                      # from the account: no words
+                                ({"name": "Kaushal Ag", "stage": "idea"}, None),     # nothing is saved, not even stage
+                                ({"role": "CEO"}, "I work on payments"),             # words that don't say it
+                                ({"name": "Kaushal"}, "")):
+                body = {"changes": args, "request_id": _rid()}
+                if quote is not None:
+                    body["stated"] = {next(iter(args)): quote}
+                _, text, err = await call("coach_update_profile", body)
+                assert err and "own words" in text and "Nothing was saved" in text, (args, text)
+            ctx, _, _ = await call("coach_get_context")
+            assert not {"name", "role", "stage"} & set(ctx["profile"]), ctx["profile"]
+            res, _, err = await call("coach_update_profile", {
+                "changes": {"role": "solo founder", "answer_style": "short, bullets first", "stage": "idea"},
+                "stated": {"role": "I'm a solo founder", "answer_style": "keep it short, bullets first"},
+                "request_id": _rid()})
+            assert not err and set(res["updated"]) == {"role", "answer_style", "stage"}
+            res, _, err = await call("coach_update_profile", {"changes": {"stage": "mvp", "team_size": 2},
+                                                              "request_id": _rid()})
+            assert not err, "fields about the company need no quote"
+        _serve(user, go)
 
 
 if __name__ == "__main__":

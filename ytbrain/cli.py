@@ -296,8 +296,6 @@ def _discover_ytdlp(channel_id_or_url: str) -> int:
         print("yt-dlp not found. Install with: uv pip install yt-dlp", file=sys.stderr)
         return 1
 
-    import yaml
-
     FLAT = {"extract_flat": "in_playlist", "quiet": True,
             "no_warnings": True, "socket_timeout": 30}
 
@@ -1346,7 +1344,7 @@ def cmd_extract(args) -> int:
               flush=True)
         printed.release()
     print(f"\nextract: {n} records, {failed} failed in {_dur(time.time() - started)}"
-          + (f" (failed ones retry on the next run)" if failed else ""))
+          + (" (failed ones retry on the next run)" if failed else ""))
     return 0
 
 
@@ -1981,7 +1979,7 @@ def cmd_pack(args) -> int:
     """Build or inspect the Knowledge pack the coach plugin ships (ADR-0009)."""
     import json as _json
     from founder_coach import pack as P
-    from .config import EMBED_MODEL, PACK_DIR, PACK_EMBED_MODEL, PACK_RERANK_MODEL
+    from .config import EMBED_MODEL, PACK_EMBED_MODEL, PACK_RERANK_MODEL
     from .pack import build_pack, describe
     from . import packs as PK
     from .config import DATA
@@ -2246,7 +2244,7 @@ def cmd_eval(args) -> int:
         if not _sh.which("claude"):
             print("eval choice: the `claude` CLI isn't on PATH", file=sys.stderr)
             return 1
-        _, code = coach.run_choice(plugins, limit=args.limit, workers=args.workers,
+        _, code = coach.run_choice(plugins, limit=args.limit, workers=args.workers, quick=args.quick,
                                    model=None if args.model == "default" else (args.model or coach.DEFAULT_MODEL))
         return code
     if args.eval_cmd == "coach":
@@ -2282,7 +2280,7 @@ def cmd_eval(args) -> int:
             model = coach.DEFAULT_MODEL if args.model is None else None if args.model == "default" else args.model
             print(f"eval coach: host model {model or 'your Claude Code default'} on your Claude plan, at most "
                   f"{args.max_turns} turns per call"
-                  + ("" if model != "haiku" else " (sign a release off with --model sonnet)"))
+                  + ("" if model != coach.HAIKU else " (sign a release off with --model sonnet)"))
         _, code = coach.run_gates(env, args.gate or ["g2", "g4", "g5", "g6", "g7", "g8"], plugin,
                                   limit=args.limit or None, max_cost=args.max_cost, model=model,
                                   max_turns=args.max_turns, host=host, workers=args.workers)
@@ -2662,7 +2660,7 @@ def cmd_sample(args) -> int:
     failure mode that matters. Samples across caption_kind and series, with a
     fixed seed so the check is reproducible across prompt versions.
     """
-    m = Manifest(MANIFEST_DB)
+    Manifest(MANIFEST_DB)         # opens (and creates) the manifest, as before
     strata: dict[tuple, list[str]] = defaultdict(list)
     for p in METADATA.glob("*.json"):
         if getattr(args, "doc", None) and not p.stem.startswith(tuple(args.doc)):
@@ -3220,8 +3218,8 @@ def main(argv=None) -> int:
     cc = sub.add_parser("claude", help="run the local Claude Code CLI for plugin work, on your Claude plan with "
                                        "Haiku: ytbrain claude -- <claude args>")
     cc.add_argument("--model", default=None, metavar="MODEL",
-                    help="haiku (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus; with --openrouter an "
-                         "OpenRouter id (default anthropic/claude-haiku-4.5)")
+                    help="claude-haiku-5-5 (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus; with --openrouter an "
+                         "OpenRouter id (default anthropic/claude-haiku-5.5)")
     cc.add_argument("--openrouter", action="store_true",
                     help="through OpenRouter instead of your Claude plan (paid per token; key YTBRAIN_COACH_HOST_KEY)")
     cc.add_argument("claude_args", nargs=argparse.REMAINDER, help="arguments for claude, after --")
@@ -3298,8 +3296,11 @@ def main(argv=None) -> int:
                                          "(the real host, your Claude plan; no judges)")
     ech.add_argument("--plugin", action="append", metavar="DIR", required=True,
                      help="an assembled plugin; pass two or more (dist/plugin-private, dist/coding-coach-private, ...)")
-    ech.add_argument("--limit", type=int, default=0, help="first N prompts (a quick check)")
-    ech.add_argument("--model", default=None, metavar="MODEL", help="host model (default haiku; 'default' for yours)")
+    ech.add_argument("--quick", action="store_true",
+                     help="a 15-prompt sample that covers every kind (each coach, no coach, prompts that need several); "
+                          "finished prompts are shared with a full run")
+    ech.add_argument("--limit", type=int, default=0, help="first N prompts (of the quick sample with --quick)")
+    ech.add_argument("--model", default=None, metavar="MODEL", help="host model (default claude-haiku-5-5; 'default' for yours)")
     ech.add_argument("--workers", type=int, default=0,
                      help="host runs at a time (default: YTBRAIN_COACH_WORKERS or 1; each is a `claude -p` on your plan)")
     ec = esub.add_parser("coach", help="gates G2/G4/G5/G6/G7: the coach's answers and memory through the real host "
@@ -3309,7 +3310,7 @@ def main(argv=None) -> int:
     ec.add_argument("--plugin", default=None, metavar="DIR", help="assembled plugin (default dist/plugin)")
     ec.add_argument("--limit", type=int, default=0, help="first N cases per gate (a quick check)")
     ec.add_argument("--model", default=None, metavar="MODEL",
-                    help="haiku (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus or 'default' (your Claude Code "
+                    help="claude-haiku-5-5 (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus or 'default' (your Claude Code "
                          "default); with --host openrouter an OpenRouter id. Results are kept per model.")
     ec.add_argument("--max-turns", type=int, default=12, help="agentic turns per host call (default 12)")
     ec.add_argument("--workers", type=int, default=0,
@@ -3317,7 +3318,7 @@ def main(argv=None) -> int:
     ec.add_argument("--host", choices=["claude", "openrouter"], default="claude",
                     help="claude (default): the local Claude Code on your Claude plan, with the token-saving setup "
                          "(Haiku, turn cap, no repo context). openrouter: through OpenRouter, paid per token (key "
-                         "YTBRAIN_COACH_HOST_KEY); --model is then an OpenRouter id (default anthropic/claude-haiku-4.5)")
+                         "YTBRAIN_COACH_HOST_KEY); --model is then an OpenRouter id (default anthropic/claude-haiku-5.5)")
     ec.add_argument("--max-cost", type=float, default=None, help="USD cap for judge calls (default 5)")
     ej = esub.add_parser("judge", help="grade the Moments a saved run retrieved that no judge has seen "
                                        "(pool extension); re-releases the labels as a new minor version")

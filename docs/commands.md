@@ -96,7 +96,8 @@ ytbrain eval latency --pack data/pack-private      # search p95 as the plugin ru
 ytbrain eval run --config pack --pack data/packs/coding/pack-private --only-pack-docs   # a Pack on its own questions
 ytbrain eval gap --pack data/packs/coding/pack-private --questions data/eval/gap-questions-coding.txt --only-pack-docs
 ytbrain eval coach --plugin dist/coding-coach-private   # a Pack's own coach gates (cases in ytbrain/eval/coach_cases/<pack>/)
-ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private   # P12, your Claude plan, no judges
+ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # P12, your Claude plan, no judges
+ytbrain eval choice --quick --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # 15 of the 45 prompts, one of every kind
 ytbrain pack info                     # counts, models, checksum OK
 ytbrain pack build --device coreml    # experimental: Apple GPU/Neural Engine for embedding (default cpu)
 ytbrain search "..." --pack           # search the pack with the ONNX runtime path

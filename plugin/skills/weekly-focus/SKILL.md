@@ -19,7 +19,7 @@ Follow the coaching contract of the coach skill throughout.
    - **why**: one line with a Citation; pass its item_ids as the Commitment's `citations`.
    - linked `goal_id` when it serves a Goal.
 5. **Push back** on a Commitment that doesn't move the biggest risk, and say which one you'd drop.
-6. **Confirm.** Show the final list exactly as it will be saved and ask for a yes. Edit until it's right. A yes ("record them") is answered by the step-7 `coach_record` call in that same reply, with no further questions.
+6. **Confirm.** Show the final list exactly as it will be saved and ask for a yes. Edit until it's right. A yes ("record them", "yes", "save it") is answered by the step-7 `coach_record` call in that same reply: never propose again, never start a Check-in first, no further questions.
 7. **Record** with one `coach_record` call, kind `commitments`, all accepted items together. Relay any `warnings`.
 
 ## Why this shape
@@ -28,6 +28,6 @@ If-then plans with a measurable outcome are followed through far more often than
 
 ## Gotchas
 
-- The proposal comes in the first reply. A missing Goal or detail is an assumption you state, never a reason to hold the proposal back.
+- The proposal comes in the first reply. A missing Goal, role, name or detail is an assumption you state, never a question asked before the proposal.
 - The week is the Founder's ISO week in their time zone; the tool fills it in.
 - Carrying last week's Commitment is done in the Check-in (`coach_update`, status `carried`), not by recording a duplicate here.

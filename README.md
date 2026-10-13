@@ -24,7 +24,7 @@ This repository holds both halves:
                                              located
 ```
 
-**Status (2026-10-07):** M0–M6g are built: the founder, coding and investor plugins, Projects and inferred Domains. Left before anyone else uses them: each Pack's coach gates on the real host (`ytbrain ops plugin --coach`), then dogfooding in Cowork ([docs/m6-plan.md](docs/m6-plan.md); earlier detail in [docs/m3-status.md](docs/m3-status.md)).
+**Status (2026-10-12):** M0–M6g are built: the founder, coding and investor plugins, Projects and inferred Domains. The coach gates have been fixed on the real host Pack by Pack (coding and investor pass on samples). Left before anyone else uses them: one full run of every gate on the final build, `eval choice` over all three coaches (`ytbrain ops plugin --coach`), then dogfooding in Cowork ([docs/m6-plan.md](docs/m6-plan.md); earlier detail in [docs/m3-status.md](docs/m3-status.md)).
 
 | | State |
 |---|---|
@@ -483,7 +483,7 @@ ytbrain eval coach --model sonnet                             # sign a release o
 
 **Optional, OpenRouter instead of the plan** (paid per token, e.g. when the plan's limit is
 reached): `ytbrain claude --openrouter -- …` or `ytbrain eval coach --host openrouter` with
-`YTBRAIN_COACH_HOST_KEY` in `.env` (default model `anthropic/claude-haiku-4.5`; host cost counts in
+`YTBRAIN_COACH_HOST_KEY` in `.env` (default model `anthropic/claude-haiku-5.5`; host cost counts in
 `--max-cost`). Claude Code is built for Anthropic models; a non-Anthropic model is for smoke tests only.
 
 ---
@@ -889,7 +889,8 @@ never recommends a security (gate G8).
 ```bash
 ytbrain pack build --for coding --include-private --out data/packs/coding/pack-private
 python scripts/assemble_plugin.py --for coding --pack data/packs/coding/pack-private --check   # -> dist/coding-coach-private
-ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private   # P12: each prompt reaches the right coach
+ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # P12: each of 45 prompts reaches the right coach (all of them, for a prompt that needs several)
+ytbrain eval choice --quick --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # a 15-prompt sample of every kind
 ```
 
 Load `dist/plugin`, never `plugin/` itself. `--check` imports the assembled runtime and verifies
@@ -1219,7 +1220,7 @@ All settings are environment variables (`.env` or shell). Defaults in parenthese
 | `YTBRAIN_RERANK_MODEL` (`BAAI/bge-reranker-v2-m3`) | Cross-encoder reranker for `search`; `none` disables |
 | `YTBRAIN_PACK_EMBED_MODEL` (`BAAI/bge-base-en-v1.5`) · `YTBRAIN_PACK_RERANK_MODEL` (`none`) | ONNX models for `pack build` (fastembed names); the pack records them, so its searches always use the same ones |
 | `FOUNDER_COACH_HOME` (`~/.founder-coach`) · `FOUNDER_COACH_MODELS` (`$FOUNDER_COACH_HOME/models`) | Where the coach runtime keeps its data and downloaded ONNX models; the other `FOUNDER_COACH_*` settings are under [The coach runtime](#the-coach-runtime-founder-coach-m3a) |
-| `YTBRAIN_COACH_MODEL` (`haiku`) | Default host model for `eval coach` and `ytbrain claude` |
+| `YTBRAIN_COACH_MODEL` (`claude-haiku-5-5`) | Default host model for `eval coach` and `ytbrain claude` |
 | `YTBRAIN_COACH_HOST_KEY` (none) | OpenRouter key for `--host openrouter` / `--openrouter`; falls back to `YTBRAIN_LLM_API_KEY` when `YTBRAIN_LLM_BASE_URL` is OpenRouter |
 | `YTBRAIN_BOOK_TIMEOUT_S` (`1800`) · `YTBRAIN_BOOK_THREADS` (`0` = all cores but one, max 8) | Parked Docling parser only: one book's parse timeout (a timeout fails the book, never half of it); its threads |
 | `YTBRAIN_WEB_CONTACT` (the repo URL) · `YTBRAIN_WEB_USER_AGENT` (`ytbrain/0.1 (+<contact>; polite research crawler)`) | The crawler's honest User-Agent; set your own contact before crawling |
@@ -1266,7 +1267,7 @@ product.toml              the product's id, display name, SEO description and re
 .env.example              template for .env (copy, fill in; .env is git-ignored)
 sources.example.yaml      template for sources.yaml (your playlist list; git-ignored)
 domains.yaml              the Library's Domains: description, example questions, risk tier, freshness, web policy
-.github/workflows/ci.yml  tests, secret scan, assembled plugin, claude plugin validate
+.github/workflows/ci.yml  tests, secret scan, ruff, assembled plugin, claude plugin validate
 eval/                     the released retrieval benchmark (queries, qrels, moments; CHECKSUMS)
 ops/                      all.sh, ingest.sh, eval.sh, plugin.sh (`ytbrain ops`), the launchd plist, log rotation, probe_models.py
 ytbrain/                  the pipeline
@@ -1292,7 +1293,7 @@ ytbrain/                  the pipeline
   knowledge/              items.py (Knowledge items), embed.py, store.py (LanceDB), search.py
   pack.py                 `pack build`: the Knowledge pack writer (embed cache, checks, manifest)
   index.py                transcript passages (used by knowledge/items.py)
-  eval/                   the benchmark build, judges, runs, splits.py (a question set per source kind), and `eval coach` (gates G2, G4, G5, G6)
+  eval/                   the benchmark build, judges, runs, splits.py (a question set per source kind), and `eval coach` (gates G2, G4, G5, G6, G7, and G8 for the investor coach)
   graph.py, mcp_server.py parked for later milestones (docs/archive/phase2-parked.md)
 founder_coach/            the light runtime founders install (ADR-0010): server.py (MCP), store.py
                           (Founder store), search.py (shared ranking), pack.py, models.py (ONNX),
@@ -1351,7 +1352,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 443 tests, no network
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 452 tests (456 under `pytest tests`), no network
 pytest tests/                                                                        # the same under pytest
 ```
 
@@ -1370,14 +1371,15 @@ pytest tests/                                                                   
 The tests use fakes (a hashing embedder, stubbed yt-dlp and LLM calls), so they need no keys,
 models or YouTube access, and they are hermetic: every suite sets `YTBRAIN_DOTENV=0` (your `.env`
 is never read) and never reads your `sources.yaml`, so a clean checkout passes exactly like your
-machine. CI (`.github/workflows/ci.yml`) runs on every push and pull request: a secret scan,
+machine. CI (`.github/workflows/ci.yml`) runs on every push and pull request: a secret scan, `ruff check .` (syntax errors and
+undefined or unused names, configured in `pyproject.toml`),
 then the suites on Python 3.11 and 3.13 (`serve,pack,dev,web` plus LanceDB), failing on any skipped
 test, and all of them again in one process (`pytest tests`, which catches state leaking between suites); then it assembles a plugin from a test pack, fails if the generated files are stale, and
 runs `claude plugin validate --strict`.
 Everything that needs your books, models or keys (the corpus, search, the benchmark, the coach on the real host, a live
 session) is a command, not a CI job: [docs/testing.md](docs/testing.md) lists them in order, cheapest first.
 Answer quality is measured separately, on the real host (the local Claude Code on your plan,
-Haiku by default): `ytbrain eval coach` (gates G2, G4, G5, G6) and `ytbrain claude -- plugin eval …` (mocked skill
+Haiku by default): `ytbrain eval coach` (gates G2, G4, G5, G6, G7, and G8 for the investor coach) and `ytbrain claude -- plugin eval …` (mocked skill
 behaviour); see [docs/commands.md](docs/commands.md).
 
 ## Roadmap

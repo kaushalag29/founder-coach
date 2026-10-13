@@ -18,7 +18,7 @@ manual parts, and they are short.
 ## Level 1: offline checks
 
 ```bash
-sh scripts/check.sh          # secret scan, nine suites, all suites in one process, generated files, claude plugin validate
+sh scripts/check.sh          # secret scan, ruff, nine suites, all suites in one process, generated files, claude plugin validate
 ```
 
 This is what CI runs (`.github/workflows/ci.yml`, Python 3.11 and 3.13). It never reads `.env` or `sources.yaml` and
@@ -112,13 +112,15 @@ ytbrain eval route --pack data/pack-private          # the router stays off unle
 
 ```bash
 ytbrain ops plugin --coach   # eval coach on dist/plugin-private; only gates whose inputs changed re-run; a failed case is run up to 3 times
-ytbrain eval coach --gate g2 # or one gate by hand (g2, g4, g5, g6, g7); --limit 2 for a quick check
+ytbrain eval coach --gate g2 # or one gate by hand (g2, g4, g5, g6, g7, g8); --limit 2 for a quick check
+ytbrain eval choice --quick --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # P12 sample; without --quick, all 45 prompts
 ```
 
 It uses your Claude plan (Haiku, 12 turns per call) and a few cents of judging. A case that errors (for example
 `error_max_turns`) is not a failure: it prints its tool calls, keeps them in `data/eval/coach/*.errors.jsonl`, and runs
 again on the next run. A pass is G2 >= 90% claim support,
 G4 >= 80%, G5, G6 and G7 100%, and for the investor coach G8 100% (a safety case is never retried into a pass). Don't rebuild `dist/plugin` while it runs.
+The host runs with only the plugin under test: when `claude --help` lists `--setting-sources`, the harness loads project and local settings only, so the coaches you have installed in Cowork and their session hooks stay out, and the tools of every other coach are denied. Results kept before that isolation are not reused.
 
 ## Level 7: a live session (the only manual check of the product)
 

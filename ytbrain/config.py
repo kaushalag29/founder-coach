@@ -211,7 +211,6 @@ CALIBRATION_FILE = EVAL_DATA / "calibration.json"   # `ytbrain eval calibrate`: 
 EVAL_PRIVATE = EVAL_DATA / "private"          # labels on private Sources' Moments: never released (ADR-0014)
 # Knowledge pack [ADR-0009]: what the coach plugin ships (built by `ytbrain pack build`)
 from founder_coach.models import DEFAULT_EMBED_MODEL as _PACK_EMBED  # noqa: E402
-from founder_coach.models import DEFAULT_RERANK_MODEL as _PACK_RERANK  # noqa: E402
 PACK_DIR = DATA / "pack"                      # knowledge.sqlite + pack.json + embed-cache.db
 PACK_EMBED_MODEL = os.environ.get("YTBRAIN_PACK_EMBED_MODEL", _PACK_EMBED)
 # No reranker by default: measured on labels v1.2.0, jina-reranker-v1-turbo lowered the pack's

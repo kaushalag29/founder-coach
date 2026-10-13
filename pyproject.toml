@@ -44,3 +44,14 @@ include = ["ytbrain*", "founder_coach*"]
 [tool.setuptools.package-data]
 founder_coach = ["playbooks/*.md", "product.json"]
 ytbrain = ["eval/coach_cases/*.jsonl", "eval/golden.example.jsonl", "eval/gap_questions.txt", "books/ligature_words.txt"]
+
+# Lint guardrail (CI and scripts/check.sh run `ruff check .`): only rules that find real bugs, not style.
+# E9 = syntax errors; F = pyflakes (undefined names, unused imports and variables, redefinitions).
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F401", "F541", "F841"]      # tests import inside functions and keep throwaway locals on purpose

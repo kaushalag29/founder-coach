@@ -1,0 +1,562 @@
+{
+ "founder-coach": {
+  "commands": {
+   "export": {
+    "options": [
+     "--home",
+     "--out",
+     "--project"
+    ],
+    "positionals": []
+   },
+   "feedback": {
+    "options": [
+     "--home",
+     "--out",
+     "--project"
+    ],
+    "positionals": [
+     "action"
+    ]
+   },
+   "forget": {
+    "options": [
+     "--all",
+     "--confirm",
+     "--home",
+     "--no-backup",
+     "--project"
+    ],
+    "positionals": []
+   },
+   "holdings": {
+    "options": [
+     "--account",
+     "--as-of",
+     "--home",
+     "--project"
+    ],
+    "positionals": [
+     "action",
+     "args"
+    ]
+   },
+   "hook": {
+    "options": [
+     "--home",
+     "--project"
+    ],
+    "positionals": [
+     "event"
+    ]
+   },
+   "projects": {
+    "options": [
+     "--home"
+    ],
+    "positionals": [
+     "action",
+     "args"
+    ]
+   },
+   "restore": {
+    "options": [
+     "--home",
+     "--list",
+     "--project"
+    ],
+    "positionals": [
+     "backup"
+    ]
+   },
+   "serve": {
+    "options": [
+     "--home",
+     "--pack"
+    ],
+    "positionals": []
+   },
+   "status": {
+    "options": [
+     "--home",
+     "--json",
+     "--pack",
+     "--project"
+    ],
+    "positionals": []
+   },
+   "usage": {
+    "options": [
+     "--days",
+     "--home",
+     "--json",
+     "--out",
+     "--project",
+     "--yes"
+    ],
+    "positionals": [
+     "action"
+    ]
+   },
+   "warmup": {
+    "options": [
+     "--home",
+     "--pack"
+    ],
+    "positionals": []
+   }
+  },
+  "options": [
+   "--version"
+  ],
+  "positionals": []
+ },
+ "ytbrain": {
+  "commands": {
+   "books": {
+    "commands": {
+     "inspect": {
+      "options": [
+       "--expect",
+       "--json",
+       "--parser",
+       "--reparse"
+      ],
+      "positionals": [
+       "paths"
+      ]
+     }
+    },
+    "handler": "cmd_books",
+    "options": [],
+    "positionals": []
+   },
+   "claude": {
+    "handler": "cmd_claude",
+    "options": [
+     "--model",
+     "--openrouter"
+    ],
+    "positionals": [
+     "claude_args"
+    ]
+   },
+   "clean": {
+    "handler": "cmd_clean",
+    "options": [
+     "--limit",
+     "--retry-failed"
+    ],
+    "positionals": []
+   },
+   "discover": {
+    "handler": "cmd_discover",
+    "options": [
+     "--channel",
+     "--method"
+    ],
+    "positionals": []
+   },
+   "domains": {
+    "commands": {
+     "add": {
+      "options": [
+       "--description",
+       "--example",
+       "--freshness",
+       "--risk",
+       "--web-policy"
+      ],
+      "positionals": [
+       "name"
+      ]
+     },
+     "alias": {
+      "options": [],
+      "positionals": [
+       "name",
+       "alias"
+      ]
+     },
+     "ignore": {
+      "options": [],
+      "positionals": [
+       "folder"
+      ]
+     },
+     "list": {
+      "options": [],
+      "positionals": []
+     },
+     "propose": {
+      "options": [
+       "--min-size"
+      ],
+      "positionals": []
+     },
+     "review": {
+      "options": [
+       "--accept",
+       "--reject"
+      ],
+      "positionals": []
+     },
+     "sample": {
+      "options": [
+       "--docs",
+       "--n",
+       "--seed"
+      ],
+      "positionals": []
+     },
+     "why": {
+      "options": [
+       "--items"
+      ],
+      "positionals": [
+       "doc"
+      ]
+     }
+    },
+    "handler": "cmd_domains",
+    "options": [],
+    "positionals": []
+   },
+   "drop": {
+    "handler": "cmd_drop",
+    "options": [
+     "--source"
+    ],
+    "positionals": []
+   },
+   "enrich": {
+    "handler": "cmd_enrich",
+    "options": [
+     "--doc",
+     "--dry-run",
+     "--limit",
+     "--max-cost",
+     "--workers"
+    ],
+    "positionals": []
+   },
+   "eval": {
+    "commands": {
+     "build": {
+      "options": [
+       "--device",
+       "--limit",
+       "--max-cost",
+       "--set",
+       "--top-up",
+       "--workers"
+      ],
+      "positionals": []
+     },
+     "calibrate": {
+      "options": [
+       "--force",
+       "--k",
+       "--no-save",
+       "--pack",
+       "--set"
+      ],
+      "positionals": []
+     },
+     "choice": {
+      "options": [
+       "--limit",
+       "--model",
+       "--plugin",
+       "--quick",
+       "--workers"
+      ],
+      "positionals": []
+     },
+     "coach": {
+      "options": [
+       "--gate",
+       "--host",
+       "--limit",
+       "--max-cost",
+       "--max-turns",
+       "--model",
+       "--plugin",
+       "--workers"
+      ],
+      "positionals": []
+     },
+     "gap": {
+      "options": [
+       "--only-pack-docs",
+       "--pack",
+       "--questions",
+       "--set",
+       "--tune"
+      ],
+      "positionals": []
+     },
+     "judge": {
+      "options": [
+       "--config",
+       "--depth",
+       "--max-cost",
+       "--set",
+       "--workers"
+      ],
+      "positionals": []
+     },
+     "latency": {
+      "options": [
+       "--n",
+       "--no-rerank",
+       "--pack"
+      ],
+      "positionals": []
+     },
+     "parity": {
+      "options": [
+       "--max-cost",
+       "--n"
+      ],
+      "positionals": []
+     },
+     "rescore": {
+      "options": [
+       "--as",
+       "--compare",
+       "--config",
+       "--refresh-baseline",
+       "--run",
+       "--save-baseline",
+       "--set"
+      ],
+      "positionals": []
+     },
+     "route": {
+      "options": [
+       "--composed",
+       "--device",
+       "--pack",
+       "--set"
+      ],
+      "positionals": []
+     },
+     "run": {
+      "options": [
+       "--compare",
+       "--config",
+       "--device",
+       "--label",
+       "--only-pack-docs",
+       "--pack",
+       "--save-baseline",
+       "--set",
+       "--smoke"
+      ],
+      "positionals": []
+     },
+     "status": {
+      "options": [],
+      "positionals": []
+     },
+     "tags": {
+      "options": [
+       "--documents",
+       "--items",
+       "--save",
+       "--tune"
+      ],
+      "positionals": []
+     }
+    },
+    "handler": "cmd_eval",
+    "options": [],
+    "positionals": []
+   },
+   "extract": {
+    "handler": "cmd_extract",
+    "options": [
+     "--doc",
+     "--limit",
+     "--retry-failed",
+     "--workers"
+    ],
+    "positionals": []
+   },
+   "index": {
+    "handler": "cmd_index",
+    "options": [
+     "--device",
+     "--limit",
+     "--retry-failed"
+    ],
+    "positionals": []
+   },
+   "invalidate": {
+    "handler": "cmd_invalidate",
+    "options": [
+     "--only-flagged",
+     "--reason",
+     "--source"
+    ],
+    "positionals": [
+     "stage"
+    ]
+   },
+   "ops": {
+    "handler": "cmd_ops",
+    "options": [
+     "--coach",
+     "--dry-run",
+     "--force",
+     "--max-cost",
+     "--max-extract",
+     "--no-notify",
+     "--no-sync",
+     "--restart",
+     "--skip-coach",
+     "--version"
+    ],
+    "positionals": [
+     "plan"
+    ]
+   },
+   "pack": {
+    "commands": {
+     "build": {
+      "options": [
+       "--batch",
+       "--device",
+       "--embed-model",
+       "--for",
+       "--include-private",
+       "--out",
+       "--rerank-model",
+       "--route",
+       "--with-passages"
+      ],
+      "positionals": []
+     },
+     "info": {
+      "options": [
+       "--for",
+       "--out"
+      ],
+      "positionals": []
+     }
+    },
+    "handler": "cmd_pack",
+    "options": [],
+    "positionals": []
+   },
+   "pages": {
+    "handler": "cmd_pages",
+    "options": [],
+    "positionals": []
+   },
+   "refresh": {
+    "handler": "cmd_refresh",
+    "options": [],
+    "positionals": []
+   },
+   "report": {
+    "handler": "cmd_report",
+    "options": [],
+    "positionals": []
+   },
+   "run": {
+    "handler": "cmd_run",
+    "options": [
+     "--device",
+     "--force",
+     "--limit",
+     "--reconcile",
+     "--source",
+     "--type",
+     "--workers"
+    ],
+    "positionals": []
+   },
+   "sample": {
+    "handler": "cmd_sample",
+    "options": [
+     "--doc",
+     "--n",
+     "--seed"
+    ],
+    "positionals": []
+   },
+   "search": {
+    "handler": "cmd_search",
+    "options": [
+     "--device",
+     "--json",
+     "--kind",
+     "--no-rerank",
+     "--pack",
+     "--require-stage",
+     "--stage",
+     "--top-k",
+     "--topic"
+    ],
+    "positionals": [
+     "query"
+    ]
+   },
+   "status": {
+    "handler": "cmd_status",
+    "options": [],
+    "positionals": []
+   },
+   "sync": {
+    "handler": "cmd_sync",
+    "options": [
+     "--backfill",
+     "--force",
+     "--limit",
+     "--per-hour",
+     "--reconcile",
+     "--sleep-subtitles",
+     "--source",
+     "--strict-domains",
+     "--type"
+    ],
+    "positionals": []
+   },
+   "tag": {
+    "handler": "cmd_tag",
+    "options": [
+     "--dry-run",
+     "--gated",
+     "--max-cost",
+     "--no-apply",
+     "--no-llm",
+     "--retry-undecided"
+    ],
+    "positionals": []
+   },
+   "upgrade": {
+    "handler": "cmd_upgrade",
+    "options": [
+     "--doc",
+     "--dry-run",
+     "--max-cost",
+     "--variant"
+    ],
+    "positionals": []
+   },
+   "verify": {
+    "handler": "cmd_verify",
+    "options": [
+     "--doc",
+     "--limit",
+     "--retry-failed"
+    ],
+    "positionals": []
+   }
+  },
+  "options": [],
+  "positionals": []
+ }
+}

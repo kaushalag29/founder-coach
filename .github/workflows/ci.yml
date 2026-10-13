@@ -46,6 +46,9 @@ jobs:
           uv venv
           uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"   # web: trafilatura + playwright (no browser needed: tests fake it)
 
+      - name: Lint (ruff E9 + F: syntax errors, undefined or unused names; config in pyproject.toml)
+        run: uv run --no-sync ruff check .
+
       - name: Test suites (REQUIRE_ALL_TESTS turns a skip into a failure)
         run: |
           set -o pipefail

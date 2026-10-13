@@ -20,6 +20,8 @@ from ytbrain.extract import runner as _runner                   # noqa: E402
 # it, not in os.environ: config is read once, so another suite imported first would win.
 _runner.LLM_BACKEND = "openai"
 from ytbrain.eval import generate as G                             # noqa: E402
+from ytbrain.eval import coach as _coach                           # noqa: E402
+_coach._FLAGS[("claude", "--setting-sources")] = False   # hermetic: never run the developer's real `claude --help`
 from ytbrain.eval.moments import (moment_for, moment_id, moment_text, parse_moment_id,  # noqa: E402
                                   results_to_moments, spans_to_qrels)
 
@@ -1380,18 +1382,18 @@ def test_coach_eval_can_run_the_host_through_openrouter_off_the_claude_plan():
     real = C.subprocess.run
     C.subprocess.run = fake_run
     try:
-        host = C.openrouter_host("anthropic/claude-haiku-4.5", key="sk-or-test-123")
+        host = C.openrouter_host("anthropic/claude-haiku-5.5", key="sk-or-test-123")
         run = C.claude_runner(Path("/p"), model=host["model"], workdir=Path(tempfile.mkdtemp()), host_env=host["env"])
         run("hello")
     finally:
         C.subprocess.run = real
     (cmd, env), = seen
     assert env["ANTHROPIC_BASE_URL"] == "https://openrouter.ai/api" and env["ANTHROPIC_AUTH_TOKEN"] == "sk-or-test-123"
-    assert env["ANTHROPIC_API_KEY"] == "" and env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "anthropic/claude-haiku-4.5"
+    assert env["ANTHROPIC_API_KEY"] == "" and env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "anthropic/claude-haiku-5.5"
     assert cmd[cmd.index("--model") + 1] == "haiku" and "sk-or-test-123" not in " ".join(cmd)
     assert C.cache_name("g4", "b1", host["label"]) != C.cache_name("g4", "b1", "haiku")
     try:
-        C.openrouter_host("anthropic/claude-haiku-4.5", key="")
+        C.openrouter_host("anthropic/claude-haiku-5.5", key="")
         raise AssertionError("a missing key must be refused with a fix-it message")
     except ValueError as e:
         assert "YTBRAIN_COACH_HOST_KEY" in str(e)
@@ -1422,7 +1424,7 @@ def test_claude_code_runs_on_the_claude_plan_by_default_and_through_openrouter_o
         os.environ.update(saved)
     (cmd1, env1), (cmd2, env2), (cmd3, env3) = seen
     assert cmd1 == ["claude", "plugin", "eval", "dist/plugin-eval", "--runs", "1"]
-    assert "ANTHROPIC_BASE_URL" not in env1 and env1["ANTHROPIC_MODEL"] == "haiku", "the plan, on Haiku"
+    assert "ANTHROPIC_BASE_URL" not in env1 and env1["ANTHROPIC_MODEL"] == C.HAIKU, "the plan, on Haiku 5.5"
     assert env2["ANTHROPIC_MODEL"] == "sonnet"
     assert env3["ANTHROPIC_BASE_URL"] == C.OPENROUTER_ANTHROPIC_URL and env3["ANTHROPIC_API_KEY"] == ""
     assert "sk-or-test-9" not in " ".join(cmd3)
@@ -1569,6 +1571,47 @@ def test_coach_eval_before_a_yes_only_the_founders_dictated_values_may_be_saved(
                 [prof(company="ShiftSwap"), {"tool": "coach_record", "input": {"entry": {"kind": "goal"}}}]):
         r = C.before_yes_check(bad, said, 1)
         assert not r["ok"] and r["not_dictated"], bad
+
+
+def test_coach_eval_before_a_yes_judges_values_not_labels_and_lets_setup_name_the_project():
+    """G5 (2026-10-09): `key_metrics={'pilots': '3 clinics'}` for "3 clinics piloting" is what was said; setup's
+    coach_project create for the company they gave is by design; a call the tool refused saved nothing."""
+    from ytbrain.eval import coach as C
+    said = {"company": "Acme Dental", "key_metrics": "3 clinics piloting", "team_size": "2"}
+    prof = lambda **ch: {"tool": "coach_update_profile", "input": {"changes": ch, "request_id": "r"}}
+    proj = lambda **kw: {"tool": "coach_project", "input": kw}
+    assert C.before_yes_check([prof(key_metrics={"pilots": "3 clinics"}, company="Acme Dental")], said, 1)["ok"]
+    assert not C.before_yes_check([prof(key_metrics={"pilots": "30 clinics"})], said, 1)["ok"], "a different number"
+    assert C.before_yes_check([proj(action="create", name="Acme Dental")], said, 1)["ok"]
+    assert C.before_yes_check([proj(action="list")], said, 1)["ok"]
+    for bad in (proj(action="create", name="Something Else"), proj(action="rename", name="Acme Dental"),
+                proj(action="switch", project="acme-dental")):
+        assert not C.before_yes_check([bad], said, 1)["ok"], bad
+    name = prof(name="Kaushal Ag", role="Founder")
+    assert not C.before_yes_check([name], said, 1)["ok"], "never dictated"
+    assert C.before_yes_check([{**name, "refused": True}], said, 1)["ok"], "the tool refused it: nothing saved"
+
+
+def test_a_persona_turn_logs_which_tools_and_skills_ran():
+    from ytbrain.eval import coach as C
+    lines = [json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "a", "name": "Skill", "input": {"skill": "founder-coach:weekly-focus"}},
+                {"type": "tool_use", "id": "b", "name": "mcp__plugin_founder-coach_coach__coach_search", "input": {}}]}}),
+             json.dumps({"type": "result", "subtype": "success", "result": "done"})]
+    assert C.tool_names(C.parse_stream(lines)) == ["Skill:founder-coach:weekly-focus", "coach_search"]
+
+
+def test_a_tool_result_marked_as_an_error_is_kept_on_the_call():
+    from ytbrain.eval import coach as C
+    lines = [json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "a", "name": "mcp__coach__coach_update_profile", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "mcp__coach__coach_record", "input": {}}]}}),
+             json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "a", "is_error": True, "content": "refused"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "ok"}]}}),
+             json.dumps({"type": "result", "subtype": "success", "result": "done"})]
+    t = C.parse_stream(lines)
+    assert [c["error"] for c in t.tools] == [True, False]
 
 
 def test_coach_eval_stops_at_the_hosts_usage_limit_and_keeps_finished_cases():
@@ -1915,7 +1958,7 @@ def test_warm_plugin_builds_the_runtime_once_with_the_plugins_own_command_and_re
     C.warm_plugin(plugin, say=lines.append)                      # nothing to build: the host reports what is wrong
 
 
-def test_the_host_run_leaves_out_a_synced_founder_coach_unless_it_is_the_plugin_under_test():
+def test_the_host_run_leaves_out_every_synced_coach_but_the_plugin_under_test_and_their_settings():
     from unittest import mock
     from ytbrain.eval import coach as C
     tmp = Path(tempfile.mkdtemp())
@@ -1924,14 +1967,19 @@ def test_the_host_run_leaves_out_a_synced_founder_coach_unless_it_is_the_plugin_
     def fake_run(cmd, **kw):
         seen.append(cmd)
         return type("P", (), {"stdout": "", "stderr": "", "returncode": 0})()
-    for name, expect in (("coding-coach", True), ("founder-coach", False)):
+    for name in ("coding-coach", "founder-coach", "investor-coach"):
         d = tmp / name
         (d / "founder_coach").mkdir(parents=True)
         (d / "founder_coach" / "product.json").write_text(json.dumps({"id": name}))
         with mock.patch.object(C.subprocess, "run", fake_run):
             C.claude_runner(d, workdir=tmp)("hi")
         denied = seen[-1][seen[-1].index("--disallowedTools"):]
-        assert ("mcp__plugin_founder-coach_coach" in denied) is expect, (name, denied)
+        for other in C.ALL_COACHES:
+            assert (f"mcp__plugin_{other}_coach" in denied) is (other != name), (name, other, denied)
+        assert "--setting-sources" not in seen[-1], "a CLI that lacks the option is not given it"
+        with mock.patch.object(C, "host_supports", lambda claude, flag: True), mock.patch.object(C.subprocess, "run", fake_run):
+            C.claude_runner(d, workdir=tmp)("hi")
+        assert seen[-1][seen[-1].index("--setting-sources") + 1] == "project,local", "the user's own coaches are not loaded"
     # the host runs from its own scratch folder: a relative --plugin path would point nowhere there
     here = os.getcwd()
     os.chdir(tmp)
@@ -2090,6 +2138,16 @@ def test_coach_citations_are_checked_for_every_source_kind_without_a_judge():
                                       "book page not retrieved: PDF p. 300"]
     assert t.evidence().startswith("[coach_search") and "PDF p. 47" in t.evidence().split("\n\n")[0], \
         "a cited book hit goes first, like a cited talk"
+
+
+def test_a_book_page_counts_as_retrieved_when_the_host_hands_the_coach_the_structured_result():
+    from ytbrain.eval import coach as C
+    t = C.Turn(text="Margin of safety (Graham, The Intelligent Investor, PDF p. 534).")
+    t.tools = [{"name": C.SEARCH, "input": {"query": "margin"}, "result":
+                '{"hits": [{"item_id": "rul:x:r01", "series": "The Intelligent Investor", "page": 534}]}'}]
+    assert C.citation_problems(t) == []
+    t.text += " And PDF p. 12."
+    assert C.citation_problems(t) == ["book page not retrieved: PDF p. 12"]
 
 
 def test_the_g2_sample_asks_questions_from_every_kind_of_source():
@@ -2545,6 +2603,81 @@ def test_the_plugin_choice_gate_checks_which_coach_the_host_reached_for():
 
 
 
+def test_a_prompt_that_needs_several_coaches_passes_only_when_the_host_reached_all_of_them():
+    from ytbrain.eval import coach as C
+    ids = ["founder-coach", "coding-coach", "investor-coach"]
+    t = C.Turn(text="ok", tools=[{"name": "Skill", "input": {"skill": "founder-coach:ask"}, "result": ""},
+                                 {"name": "mcp__plugin_founder-coach_coach__coach_search", "input": {}, "result": ""},
+                                 {"name": "mcp__plugin_investor-coach_coach__coach_search", "input": {}, "result": ""}])
+    assert C.fired_all(t, ids) == ["founder-coach", "investor-coach"], "in the order first reached, once each"
+    assert C.fired(t, ids) == "founder-coach" and C.fired(C.Turn(text="x"), ids) == "none"
+    with tempfile.TemporaryDirectory() as d:
+        plugins = []
+        for pid in ids:
+            p = Path(d) / pid
+            (p / "founder_coach").mkdir(parents=True)
+            (p / "founder_coach" / "product.json").write_text(json.dumps({"id": pid, "pack": {"id": pid[:-6]}}))
+            (p / "skills" / "ask").mkdir(parents=True)
+            (p / "skills" / "ask" / "SKILL.md").write_text(f"---\nname: ask\ndescription: {pid}\n---\nb\n")
+            plugins.append(p)
+        reached = {"a": ["founder-coach", "investor-coach"], "b": ["founder-coach"], "c": ["coding-coach"]}
+
+        def runner(prompt, env=None, resume=None):
+            tl = [{"name": "Skill", "input": {"skill": f"{pid}:ask"}, "result": ""} for pid in reached[prompt]]
+            return C.Turn(text="ok", tools=tl, error="error_max_turns" if prompt == "c" else None)
+        cases = [{"id": "1", "expect": ["founder-coach", "investor-coach"], "prompt": "a"},
+                 {"id": "2", "expect": ["founder-coach", "investor-coach"], "prompt": "b"},
+                 {"id": "3", "expect": "coding-coach", "prompt": "c"}]
+        old = C.OUT
+        C.OUT = Path(d) / "out"
+        try:
+            s, _ = C.run_choice(plugins, runner=runner, cases=cases, say=lambda m: None)
+        finally:
+            C.OUT = old
+        assert s["by_coach"] == {"coding-coach": "1/1", "several": "1/2"}, \
+            "a coach reached before the turn cap still counts; one of two coaches is a fail"
+        assert not s["passed"]
+
+
+def test_the_quick_choice_sample_runs_the_marked_prompts_and_a_full_run_keeps_what_it_finished():
+    import json as _j
+    from ytbrain.eval import coach as C
+    rows = [_j.loads(x) for x in C.CHOICE_CASES.read_text().splitlines() if x.strip()]
+    quick = [r for r in rows if r.get("quick")]
+    kinds = {"several" if isinstance(r["expect"], list) else r["expect"] for r in quick}
+    assert 12 <= len(quick) <= 18 and kinds == {"founder-coach", "coding-coach", "investor-coach", "none", "several"}, \
+        "the quick sample covers every kind of prompt"
+    with tempfile.TemporaryDirectory() as d:
+        plugins = []
+        for pid in ("founder-coach", "coding-coach"):
+            p = Path(d) / pid
+            (p / "founder_coach").mkdir(parents=True)
+            (p / "founder_coach" / "product.json").write_text(_j.dumps({"id": pid, "pack": {"id": pid[:-6]}}))
+            (p / "skills" / "ask").mkdir(parents=True)
+            (p / "skills" / "ask" / "SKILL.md").write_text(f"---\nname: ask\ndescription: {pid}\n---\nb\n")
+            plugins.append(p)
+        asked = []
+
+        def runner(prompt, env=None, resume=None):
+            asked.append(prompt)
+            return C.Turn(text="ok", tools=[{"name": "Skill", "input": {"skill": "founder-coach:ask"}, "result": ""}])
+        cases = [{"id": "1", "expect": "founder-coach", "prompt": "a", "quick": True},
+                 {"id": "2", "expect": "founder-coach", "prompt": "b"},
+                 {"id": "3", "expect": "founder-coach", "prompt": "c", "quick": True}]
+        old = C.OUT
+        C.OUT = Path(d) / "out"
+        try:
+            C.run_choice(plugins, runner=runner, cases=cases, say=lambda m: None, quick=True)
+            assert asked == ["a", "c"]
+            C.run_choice(plugins, runner=runner, cases=cases, say=lambda m: None)
+            assert asked == ["a", "c", "b"], "a full run only asks what the quick run did not"
+            cases[0]["prompt"] = "a2"
+            C.run_choice(plugins, runner=runner, cases=cases, say=lambda m: None)
+            assert asked[-1] == "a2" and len(asked) == 4, "a changed prompt is asked again"
+        finally:
+            C.OUT = old
+
+
 def test_ops_builds_and_evaluates_every_pack_and_checks_the_plugin_choice():
     """M6f: `ops plugin --coach` with your private Sources builds the coding plugin, runs its own coach gates and
     then P12 over every coach together."""
@@ -2624,6 +2757,26 @@ def test_a_persona_can_carry_a_file_and_the_investor_checks_read_the_store():
                                {"check": "labels", "equals": {"bnd": "bonds"}},
                                {"check": "labels", "equals": {"VTI": "us_equity"}}], "2026-10-06T09:00:00+00:00")
     assert [g["ok"] for g in got] == [True, True, True, False], got
+
+
+def test_a_profile_check_can_ask_for_words_the_value_contains_and_a_project_is_found_by_the_start_of_its_name():
+    from ytbrain.eval import coach as C
+    from founder_coach.store import FounderStore
+    home = Path(tempfile.mkdtemp())
+    s = FounderStore(home)
+    s.update_profile({"company": "Payments API for card payments", "stage": "mvp"})
+    s.close()
+    got = C.check_state(home, [{"check": "profile", "field": "company", "contains": "payments api"},
+                               {"check": "profile", "field": "company", "contains": "kite"},
+                               {"check": "profile", "field": "stage", "equals": "mvp"},
+                               {"check": "profile", "field": "company", "equals": "Payments API"}],
+                       "2026-10-06T09:00:00+00:00")
+    assert [g["ok"] for g in got] == [True, False, True, False], got
+    stores = {"payments api for card payments": 1, "search indexer": 2, "payments api gateway": 3}
+    assert C._find_store(stores, "search indexer") == "search indexer"
+    assert C._find_store(stores, "search") == "search indexer", "the start of a name, whole words"
+    assert C._find_store(stores, "payments api") is None, "two names start with it: no guess"
+    assert C._find_store(stores, "sear") is None and C._find_store(stores, "") is None
 
 
 if __name__ == "__main__":

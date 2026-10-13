@@ -90,10 +90,11 @@ def host_env(name: str) -> str:
 GATES = {"g2": 0.90, "g4": 0.80, "g5": 1.0, "g6": 1.0, "g7": 1.0, "g8": 1.0}
 CLAUDE_TIMEOUT_S = 600
 MAX_TURNS = 12                     # agentic turns per `claude -p` call: a looping case stops, not the plan
-DEFAULT_MODEL = os.environ.get("YTBRAIN_COACH_MODEL", "haiku")   # cheapest on Pro limits; sign off with sonnet
+HAIKU = "claude-haiku-5-5"        # pinned, so the default never drifts when the "haiku" alias moves
+DEFAULT_MODEL = os.environ.get("YTBRAIN_COACH_MODEL") or HAIKU   # cheapest on Pro limits; --model sonnet for a sign-off
 EVIDENCE_CHARS = 30_000
 # part of each gate's results cache key: bump a gate when a change invalidates its earlier results
-HARNESS = {"g2": "h4", "g4": "h3", "g5": "h5", "g6": "h4", "g7": "h1", "g8": "h1"}   # g6 h4: a high-risk decline counts as handled
+HARNESS = {"g2": "h6", "g4": "h4", "g5": "h6", "g6": "h5", "g7": "h2", "g8": "h2"}   # h+1: the host no longer loads the user's own coaches
 # the skills whose full text a gate's cases use; every other skill counts only by its description (frontmatter),
 # which the host always sees
 GATE_SKILLS = {"g2": ("ask", "coach"), "g4": ("coach",), "g5": ("coach", "setup", "weekly-focus", "check-in", "ask"),
@@ -302,6 +303,7 @@ def parse_stream(lines) -> Turn:
                     text = c if isinstance(c, str) else "\n".join(
                         x.get("text", "") for x in (c or []) if isinstance(x, dict))
                     pending[b["tool_use_id"]]["result"] = text
+                    pending[b["tool_use_id"]]["error"] = bool(b.get("is_error"))
         elif kind == "result":
             turn.text = ev.get("result") or ""
             turn.session_id = ev.get("session_id") or turn.session_id
@@ -318,7 +320,7 @@ def parse_stream(lines) -> Turn:
 
 
 OPENROUTER_ANTHROPIC_URL = "https://openrouter.ai/api"      # OpenRouter's Anthropic-compatible API
-DEFAULT_OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
+DEFAULT_OPENROUTER_MODEL = "anthropic/claude-haiku-5.5"
 
 
 def openrouter_host(model_id: str | None = None, key: str | None = None) -> dict:
@@ -339,6 +341,22 @@ def openrouter_host(model_id: str | None = None, key: str | None = None) -> dict
     return {"env": env, "model": "haiku", "label": "or-" + re.sub(r"[^A-Za-z0-9.]+", "-", model_id)}
 
 
+ALL_COACHES = ("founder-coach", "coding-coach", "investor-coach")
+_FLAGS: dict[tuple[str, str], bool] = {}
+
+
+def host_supports(claude: str, flag: str) -> bool:
+    """Does this `claude` list `flag` in its --help? (An option an older CLI lacks would fail every case.)"""
+    if (claude, flag) not in _FLAGS:
+        try:
+            p = subprocess.Popen([claude, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out, _ = p.communicate(timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        _FLAGS[(claude, flag)] = flag in (out or "")
+    return _FLAGS[(claude, flag)]
+
+
 def claude_runner(plugin: Path | list[Path], claude: str = "claude", model: str | None = None,
                   max_turns: int = MAX_TURNS, workdir: Path | None = None,
                   host_env: dict | None = None) -> Callable[..., Turn]:
@@ -350,18 +368,22 @@ def claude_runner(plugin: Path | list[Path], claude: str = "claude", model: str 
     workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="coach-host-"))
 
     plugins = [Path(x).resolve() for x in (plugin if isinstance(plugin, (list, tuple)) else [plugin])]   # runs from `workdir`
+    # The user's own settings enable the coaches they installed (Cowork syncs them): their tools, skills and session
+    # hooks (with the real memory's nudges) would sit beside the plugin under test. Only project and local settings load.
+    isolate = host_supports(claude, "--setting-sources")
 
     def run(prompt: str, env: dict | None = None, resume: str | None = None) -> Turn:
         dirs = [a for x in plugins for a in ("--plugin-dir", str(x))]
         servers = [f"mcp__plugin_{plugin_id(x)}_coach" for x in plugins] if len(plugins) > 1 else \
             [f"mcp__plugin_{TARGET['id']}_coach"]
-        cmd = [claude, "-p", prompt, *dirs, "--output-format", "stream-json", "--verbose",
+        cmd = [claude, "-p", prompt, *dirs, *(["--setting-sources", "project,local"] if isolate else []),
+               "--output-format", "stream-json", "--verbose",
                "--max-turns", str(max_turns), *(["--model", model] if model else []),
                # the coach's own tools and skills only: no shell, no file edits, no web
                "--allowedTools", *servers, "Skill",
                "--disallowedTools", "Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch",
-               # a founder-coach plugin synced from Cowork is loaded beside the one under test: not its tools
-               *(["mcp__plugin_founder-coach_coach"] if "founder-coach" not in [plugin_id(x) for x in plugins] else [])]
+               # a coach synced from Cowork is loaded beside the one under test (when the host cannot leave it out): not its tools
+               *[f"mcp__plugin_{c}_coach" for c in ALL_COACHES if c not in [plugin_id(x) for x in plugins]]]
         if resume:
             cmd += ["--resume", resume]
         fake = next((v for k, v in (env or {}).items() if k.endswith("_FAKE_NOW") and v), None)
@@ -377,6 +399,19 @@ def claude_runner(plugin: Path | list[Path], claude: str = "claude", model: str 
             t.error = f"claude exited {p.returncode}: {p.stderr.strip()[-300:]}"
         return t
     return run
+
+
+def tool_names(turn: Turn) -> list[str]:
+    """Each call's short name, in order; a Skill call names its skill ("Skill:founder-coach:weekly-focus"), so a
+    persona's log shows whether the Playbook a turn needed ran at all."""
+    out = []
+    for c in turn.tools:
+        name = c.get("name", "").rsplit("__", 1)[-1]
+        if name == "Skill":
+            inp = c.get("input") or {}
+            name = "Skill:" + str(inp.get("skill") or inp.get("command") or "?")
+        out.append(name)
+    return out
 
 
 def tool_trace(turn: Turn) -> list[dict]:
@@ -590,12 +625,18 @@ LINK = re.compile(r"\]\((https?://[^)\s]+)\)")
 BOOK_PAGE = re.compile(r"PDF p\. (\d+)")
 
 
+def pages_returned(seen: str) -> set[str]:
+    """The book pages a search or read returned. The tool's text form says `, PDF p. N`; when the host
+    hands the coach the structured form instead (claude -p may), the same page is a `"page": N` field."""
+    return set(re.findall(r", PDF p\. (\d+)", seen)) | set(re.findall(r'"page"\s*:\s*(\d+)', seen))
+
+
 def citation_problems(turn: Turn) -> list[str]:
     """Citations no tool returned, checked without a judge, for every source kind: a link must be
     one a search or read result contained exactly (the coach never builds a link), and a book
     page ("PDF p. N", unlinked) must be a page of a book hit it retrieved."""
     seen = "\n".join(t["result"] for t in turn.tools if t["name"] in (SEARCH, READ))
-    pages = set(re.findall(r", PDF p\. (\d+)", seen))
+    pages = pages_returned(seen)
     out = [f"link not returned by a search: {u}" for u in dict.fromkeys(LINK.findall(turn.text))
            if u not in seen and u.split("#:~:text=")[0] not in seen]
     out += [f"book page not retrieved: PDF p. {n}" for n in dict.fromkeys(BOOK_PAGE.findall(turn.text))
@@ -618,7 +659,10 @@ def check_state(home: Path, checks: list[dict], now: str) -> list[dict]:
             what = c["check"]
             if what == "profile":
                 got = prof.get(c["field"])
-                ok = (str(got).lower() == str(c["equals"]).lower()) if "equals" in c else got not in (None, "", {})
+                if "contains" in c:                  # a value the person dictated, saved as a longer phrase
+                    ok = got not in (None, "", {}) and str(c["contains"]).lower() in str(got).lower()
+                else:
+                    ok = (str(got).lower() == str(c["equals"]).lower()) if "equals" in c else got not in (None, "", {})
             elif what == "goals":
                 got = sum(1 for g in goals if g["status"] == c.get("status", "active"))
                 ok = c.get("min", 1) <= got <= c.get("max", 99)
@@ -740,6 +784,10 @@ def _run_case(gate: str, case: dict, run: Callable[..., Turn], env, spend, fresh
         res["evidence_truncated"] = full > EVIDENCE_CHARS    # an "unsupported" claim may be one the judge didn't see
         # a citation no tool returned is an unsupported claim, whatever the judges thought of its text
         res["bad_citations"] = citation_problems(turn)
+        seen_all = "\n".join(t["result"] for t in turn.tools if t["name"] in (SEARCH, READ))
+        res["pages_seen"] = sorted(int(n) for n in pages_returned(seen_all))    # why a page "was not retrieved"
+        res["page_lines"] = [ln.strip()[:240] for ln in seen_all.splitlines() if "PDF p." in ln][:6]
+        res["result_head"] = next((t["result"][:300] for t in turn.tools if t["name"] == SEARCH), "")  # the form the coach saw
         res["claims"] += len(res["bad_citations"])
         res["passed"] = res["claims"] > 0 and res["supported"] == res["claims"]
     elif gate == "g4":
@@ -790,9 +838,10 @@ def _run_persona(case: dict, run, fresh_home, say=print) -> dict:
             t = run(msg, env=env, resume=session)
             _check_host(t)
             done += 1
-            calls = [(c["name"].rsplit("__", 1)[-1], c["input"]) for c in t.tools if c["name"].startswith(SERVER)
-                     and c["name"].rsplit("__", 1)[-1] in WRITES]
-            wrote = [name for name, _ in calls]
+            made = [c for c in t.tools if c["name"].startswith(SERVER) and c["name"].rsplit("__", 1)[-1] in WRITES]
+            calls = [(c["name"].rsplit("__", 1)[-1], c["input"]) for c in made]
+            refused = [bool(c.get("error")) for c in made]        # the tool refused it: nothing was saved
+            wrote = [name for (name, _), no in zip(calls, refused) if not no]
             per = (time.time() - t0) / done
             say(f"      {case['id']} week {wi}/{len(case['weeks'])}, turn {done}/{total}"
                 + (f" · saved: {', '.join(wrote)}" if wrote else "") + f" · ETA {per * (total - done) / 60:.1f} min")
@@ -803,8 +852,9 @@ def _run_persona(case: dict, run, fresh_home, say=print) -> dict:
             for k, v in t.tokens.items():
                 tokens[k] = tokens.get(k, 0) + v
             cost += t.cost_usd
-            log.append({"now": w["now"], "user": msg, "coach": t.text[:1500], "writes": wrote,
-                        "write_inputs": [{"tool": n, "input": i} for n, i in calls]})
+            log.append({"now": w["now"], "user": msg, "coach": t.text[:1500], "writes": wrote, "tools": tool_names(t),
+                        "write_inputs": [{"tool": n, "input": i, **({"refused": True} if no else {})}
+                                         for (n, i), no in zip(calls, refused)]})
     checks = check_state(home, case["checks"], case["weeks"][-1]["now"])
     for i in case.get("no_write_turns", []):          # turns where the Founder hasn't said yes yet
         entry = log[i] if i < len(log) else {}
@@ -869,6 +919,15 @@ def _project_stores(engine: Path) -> dict[str, Path]:
     return out
 
 
+def _find_store(stores: dict, want: str):
+    """The key for `want`: that name exactly, else the one name that starts with it as whole words ("payments api"
+    finds "payments api for card payments"); None when there is none or more than one."""
+    if want in stores:
+        return want
+    hits = [k for k in stores if want and re.match(re.escape(want) + r"\b", k)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def check_projects(engine: Path, checks: list[dict], now: str) -> list[dict]:
     """G7's declarative expectations. A Project is named by its company (or its name): {"company": "Acme"}.
     projects: how many there are · profile: a field of one Project (or of the Common profile, "company":
@@ -893,10 +952,10 @@ def check_projects(engine: Path, checks: list[dict], now: str) -> list[dict]:
                     finally:
                         s.close()
                 ok = (got is not None and _same(got, c["equals"])) if "equals" in c else got is None
-            elif want not in stores:
+            elif _find_store(stores, want) is None:
                 got = f"no Project for {want!r} (have: {', '.join(stores) or 'none'})"
             else:
-                s = FounderStore(stores[want])
+                s = FounderStore(stores[_find_store(stores, want)])
                 try:
                     if what == "profile":
                         got = (s._own_profile().get(c["field"]) or {}).get("value")
@@ -965,12 +1024,25 @@ def before_yes_check(write_inputs: list[dict], dictated: dict, turn: int) -> dic
     coach drafted, reworded or inferred (a Goal, an extra field, a changed value) fails."""
     bad = []
     for w in write_inputs:
+        if w.get("refused"):                      # the tool turned it down and saved nothing
+            continue
+        inp = w.get("input") or {}
+        if w["tool"] == "coach_project":
+            # setup's own step: a Project named for the company the Founder gave (or a read-only look)
+            name = inp.get("name") or inp.get("project")
+            if inp.get("action") in ("list", "summary") or (
+                    inp.get("action") == "create" and name and any(_same(name, x) for x in dictated.values())):
+                continue
+            bad.append(f"coach_project {inp.get('action')}")
+            continue
         if w["tool"] != "coach_update_profile":
             bad.append(w["tool"])
             continue
-        for f, v in ((w.get("input") or {}).get("changes") or {}).items():
+        for f, v in (inp.get("changes") or {}).items():
             want = dictated.get(f)
             exp = _norm(want) if want is not None else None
+            if isinstance(v, dict) and want is not None and not isinstance(want, dict):
+                v = list(v.values())               # key_metrics: judge the numbers they gave, not the label chosen
             # tolerant of the coach's normal forms ("fri" for "Friday", 2 for "2", a list of metrics)
             if not exp or not _same(v, want):
                 bad.append(f"{f}={v!r}" + ("" if want is None else f" (said {want!r})"))
@@ -1361,24 +1433,32 @@ CHOICE_GATE = 0.90
 CHOICE_CASES = CASES / "choice.jsonl"
 
 
-def fired(turn: Turn, ids: list[str]) -> str:
-    """Which installed coach the host reached for first: a skill of it (`<id>:<skill>`) or one of its tools;
-    "none" when it answered without any coach."""
+def fired_all(turn: Turn, ids: list[str]) -> list[str]:
+    """Every installed coach the host reached for, in the order it first did: a skill of it (`<id>:<skill>`)
+    or one of its tools."""
+    out: list[str] = []
     for c in turn.tools:
         name, inp = c.get("name", ""), c.get("input") or {}
+        hit = None
         if name == "Skill":
             skill = str(inp.get("skill") or inp.get("command") or inp.get("name") or "")
-            for pid in ids:
-                if skill.startswith(pid + ":"):
-                    return pid
-        for pid in ids:
-            if name.startswith(f"mcp__plugin_{pid}_"):
-                return pid
-    return "none"
+            hit = next((pid for pid in ids if skill.startswith(pid + ":")), None)
+        hit = hit or next((pid for pid in ids if name.startswith(f"mcp__plugin_{pid}_")), None)
+        if hit and hit not in out:
+            out.append(hit)
+    return out
+
+
+def fired(turn: Turn, ids: list[str]) -> str:
+    """Which installed coach the host reached for first; "none" when it answered without any coach."""
+    return (fired_all(turn, ids) or ["none"])[0]
+
+
+MULTI_TURNS = 6          # a prompt that needs two or three coaches takes more turns than one that needs one
 
 
 def run_choice(plugins: list[Path], runner=None, cases: list[dict] | None = None, limit: int | None = None,
-               say=print, model: str | None = None, workers: int | None = None) -> tuple[dict, int]:
+               say=print, model: str | None = None, workers: int | None = None, quick: bool = False) -> tuple[dict, int]:
     """P12 (docs/m6-plan.md 4.2): with every coach installed together, each prompt reaches the right one (or
     none, for a request that isn't coaching). The host runs on your Claude plan; no judges, so no spend.
     Results are kept per prompt under data/eval/coach/choice-<inputs>.jsonl, so a re-run continues."""
@@ -1386,14 +1466,16 @@ def run_choice(plugins: list[Path], runner=None, cases: list[dict] | None = None
     workers = max(1, int(workers or COACH_WORKERS))
     ids = [plugin_id(x) for x in plugins]
     cases = cases if cases is not None else [json.loads(x) for x in CHOICE_CASES.read_text().splitlines() if x.strip()]
-    cases = [c for c in cases if c["expect"] in (*ids, "none")]          # a case for a coach that isn't built: later
+    wants = lambda c: c["expect"] if isinstance(c["expect"], list) else [c["expect"]]    # noqa: E731 (a list: all needed)
+    cases = [c for c in cases if all(x in (*ids, "none") for x in wants(c))]   # a case for a coach that isn't built: later
+    cases = [c for c in cases if c.get("quick")] if quick else cases      # the sample marked "quick" in choice.jsonl
     cases = cases[:limit] if limit else cases
     h = hashlib.sha256()
     for x in plugins:                                     # what decides the choice: every skill's frontmatter
         for f in sorted(Path(x).glob("skills/*/SKILL.md")):
             h.update(f.relative_to(x).as_posix().encode() + _frontmatter(f.read_text()).encode())
         h.update(plugin_id(x).encode())
-    h.update(json.dumps(cases, sort_keys=True).encode() + str(model).encode())
+    h.update(str(model).encode())                       # not the cases: a prompt's result is kept whichever run asked it
     cache = OUT / f"choice-{h.hexdigest()[:12]}.jsonl"
     OUT.mkdir(parents=True, exist_ok=True)
     have = {}
@@ -1401,31 +1483,44 @@ def run_choice(plugins: list[Path], runner=None, cases: list[dict] | None = None
         for line in cache.read_text().splitlines():
             r = json.loads(line)
             have[r["id"]] = r
+    asked = {c["id"]: c for c in cases}
+    have = {i: r for i, r in have.items()                # a result stands only for the same prompt and expectation
+            if i in asked and r.get("prompt") == asked[i]["prompt"] and r.get("expect") == asked[i]["expect"]}
     homes = Path(tempfile.mkdtemp(prefix="coach-choice-"))
     real_runner = runner is None
-    runner = runner or ready_runner(claude_runner(plugins, model=model, max_turns=3, workdir=homes), ids)
+    multi = runner
+    if runner is None:
+        runner = ready_runner(claude_runner(plugins, model=model, max_turns=3, workdir=homes), ids)
+        multi = ready_runner(claude_runner(plugins, model=model, max_turns=MULTI_TURNS, workdir=homes), ids)
     env = {}
     for pid in ids:
         prefix = pid.upper().replace("-", "_") + "_"
         env[prefix + "HOME"] = str(Path(tempfile.mkdtemp(dir=homes)))
         env[prefix + "MODELS"] = str(models_dir())
     todo = [c for c in cases if c["id"] not in have]
-    say(f"eval choice: {len(cases)} prompt(s) over {', '.join(ids)}; {len(have)} already done, {len(todo)} to run")
+    say(f"eval choice{' (quick sample)' if quick else ''}: {len(cases)} prompt(s) over {', '.join(ids)}; {len(have)} already done, {len(todo)} to run")
     def ask_host(c):
-        t = runner(c["prompt"], env=env)
+        t = (multi if isinstance(c["expect"], list) else runner)(c["prompt"], env=env)
         _check_host(t, ids)
         return t
 
     def handle(i, c, t):
-        if t.error:
+        reached = fired_all(t, ids)
+        if t.error and not (t.error.startswith("error_max_turns") and reached):     # what it reached before the cap counts
             say(f"    {c['id']}: ERROR {t.error[:100]} (runs again next time)")
             return
-        got = fired(t, ids)
-        r = {"id": c["id"], "expect": c["expect"], "got": got, "passed": got == c["expect"]}
+        if isinstance(c["expect"], list):                 # a prompt that needs several coaches: all of them
+            got = reached
+            passed = all(x in reached for x in c["expect"])
+        else:
+            got = reached[0] if reached else "none"
+            passed = got == c["expect"]
+        r = {"id": c["id"], "expect": c["expect"], "prompt": c["prompt"], "got": got, "passed": passed}
         with open(cache, "a") as f:
             f.write(json.dumps(r) + "\n")
         have[c["id"]] = r
-        say(f"    {i}/{len(todo)} {c['id']}: {'pass' if r['passed'] else 'FAIL'} (expected {c['expect']}, got {got})")
+        say(f"    {i}/{len(todo)} {c['id']}: {'pass' if passed else 'FAIL'} "
+            f"(expected {' + '.join(wants(c))}, got {' + '.join(got) if isinstance(got, list) else got or 'none'})")
 
     try:
         if real_runner:
@@ -1446,6 +1541,7 @@ def run_choice(plugins: list[Path], runner=None, cases: list[dict] | None = None
     done = [have[c["id"]] for c in cases if c["id"] in have]
     rate = sum(r["passed"] for r in done) / len(done) if done else 0.0
     per = {pid: [r for r in done if r["expect"] == pid] for pid in (*ids, "none")}
+    per["several"] = [r for r in done if isinstance(r["expect"], list)]          # prompts that need more than one coach
     summary = {"gate": "p12", "cases": len(cases), "done": len(done), "rate": round(rate, 3), "threshold": CHOICE_GATE,
                "by_coach": {k: f"{sum(r['passed'] for r in v)}/{len(v)}" for k, v in per.items() if v},
                "passed": len(done) == len(cases) and bool(done) and rate >= CHOICE_GATE

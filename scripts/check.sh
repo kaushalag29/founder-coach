@@ -19,6 +19,9 @@ export REQUIRE_ALL_TESTS=1 YTBRAIN_DOTENV=0 PYTHONDONTWRITEBYTECODE=1 YTBRAIN_RO
 echo "== secret scan"
 "$PY" scripts/check_secrets.py
 
+echo "== ruff (syntax errors, undefined or unused names; config in pyproject.toml)"
+"$PY" -m ruff check . || { echo "FAILED: ruff (install the dev extras: uv pip install -e \".[dev]\")"; exit 1; }
+
 for s in core eval pack coach projects invest plugin web books; do
   echo "== test_$s"
   "$PY" "tests/test_$s.py" > "$TMP/$s.log" 2>&1 || { grep -v "^  PASS" "$TMP/$s.log" | tail -40; echo "FAILED: test_$s (a 'skipped in CI' line means an extra is missing: uv pip install -e \".[serve,pack,dev,web]\" \"lancedb>=0.39.0\")"; exit 1; }

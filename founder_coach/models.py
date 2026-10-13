@@ -8,7 +8,6 @@ reads them from the pack, so queries and items are always embedded the same way.
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from . import product
 

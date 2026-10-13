@@ -18,7 +18,7 @@ knowledge, and is growing into a founder-coach served over MCP.
 ## Commands
 
 - Setup: `uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"` (what CI installs; with less, suites skip tests). Everything: `".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"`
-- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, the nine suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
+- Before a commit: `sh scripts/check.sh` runs what CI runs (secret scan, `ruff check .`, the nine suites with skips failing, generated files fresh, `claude plugin validate`), offline and free; the maintainer's pre-commit hook runs it (`docs/release.md`).
 - Tests: `for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done` — offline and fast; run before and after every change. `tests/golden/coach_tools.json` pins the MCP tool schemas: after an intended change, review the diff and regenerate with `UPDATE_GOLDEN=1 python tests/test_coach.py`.
 - CLI reference: `ytbrain --help` and `README.md`. Testing the whole system end to end (what CI covers and what only you can run): `docs/testing.md`.
 - Plugin: edit `plugin/skills/*/SKILL.md`, never `founder_coach/playbooks/*.md` or `founder_coach/product.json` (generated); `python scripts/assemble_plugin.py --pack data/pack --check` builds `dist/plugin`. `plugin/` is a template: load `dist/plugin`, not `plugin/`.
@@ -32,6 +32,7 @@ knowledge, and is growing into a founder-coach served over MCP.
 - **Git:** the maintainer runs every git command (including `scripts/release.py`); agents leave the repository state alone.
 - **Product id:** the product's name lives only in `product.toml` (ADR-0012). Shipped files say `{{id}}` (plugin/) or use `founder_coach.product` (runtime: `product.ID`, `product.env("HOME")`); a test fails on a spelled-out id.
 - **Founder store schema:** a change to its tables is a new numbered migration in `founder_coach/store.py` (bump `SCHEMA_VERSION`); migrations are forward-only and take a backup first (ADR-0010, ADR-0011).
+- **Only what the person said:** `coach_update_profile` refuses `name`, `role` and `answer_style` without `stated` (their own words); the coach never fills them from the account, email or host context. A new field about the person itself goes in `domain.STATED_FIELDS`. A missing profile never replaces `coach_search` (the setup Nudge, hook and instructions say so; `tests/test_plugin.py` pins the wording in every Pack).
 - **Secrets:** `.env` holds API keys — leave it unread; configuration you need is documented
   in `.env.example` and `README.md`. Pass dummy values when a test needs a key.
 - **Checkpoints:** a Step marks a Document done only after its output file is complete, so an

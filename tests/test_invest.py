@@ -387,7 +387,7 @@ def test_c3_an_investor_goal_promotes_nothing_to_the_shared_profile_or_another_c
                 await call("coach_project", {"action": "create", "name": "Retirement 2055"})
                 await call("coach_update_profile", {"changes": {"goal": "retirement", "targets": {"bonds": 100},
                                                                 "name": "Kay"}, "request_id": "p"})
-                _, text, err = await call("coach_update_profile", {"changes": {"name": "Kay"}, "scope": "common",
+                _, text, err = await call("coach_update_profile", {"changes": {"name": "Kay"}, "stated": {"name": "call me Kay"}, "scope": "common",
                                                                    "request_id": "c"})
                 assert err and "shares no profile fields" in text
                 out, text, err = await call("coach_holdings", {"action": "import", "path": str(csv_file),

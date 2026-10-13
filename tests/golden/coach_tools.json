@@ -623,7 +623,7 @@
    "open_world_hint": false,
    "read_only_hint": true
   },
-  "description": "Start here (and add coach_search in the same message when the Founder shares a plan or claim to judge): today's date and ISO week, the Founder profile (stale facts flagged), active Goals,\nthis week's and overdue Commitments, the last Check-in, recent Decisions, and what's due (Nudges),\nand, when the knowledge covers several subjects (Domains), what each is about.\nRecord ids here are what coach_update takes.",
+  "description": "Start here, and add coach_search in the same message when the Founder shares a plan or claim to judge (a missing\nprofile never replaces that search): today's date and ISO week, the Founder profile (stale facts flagged), active Goals,\nthis week's and overdue Commitments, the last Check-in, recent Decisions, and what's due (Nudges),\nand, when the knowledge covers several subjects (Domains), what each is about.\nRecord ids here are what coach_update takes.",
   "input": {
    "properties": {
     "response_format": {
@@ -818,7 +818,7 @@
    "open_world_hint": false,
    "read_only_hint": false
   },
-  "description": "Set or confirm Founder profile facts. A changed value keeps the old one in history; re-stating\nan unchanged value confirms it (profile facts go stale after 30 days). Call only after the\nFounder has approved the exact values, and say which Project they are saved to.",
+  "description": "Set or confirm Founder profile facts. A changed value keeps the old one in history; re-stating\nan unchanged value confirms it (profile facts go stale after 30 days). Call only after the\nFounder has approved the exact values (or dictated them and asked to save), and say which Project they are\nsaved to. name, role and answer_style are the person's own words: pass them in `stated`; a value from their\naccount, email or a guess is refused and nothing is saved.",
   "input": {
    "properties": {
     "changes": {
@@ -857,6 +857,22 @@
      ],
      "title": "Scope",
      "type": "string"
+    },
+    "stated": {
+     "anyOf": [
+      {
+       "additionalProperties": {
+        "type": "string"
+       },
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "description": "field -> the person's own words from this conversation. Required for name, role, answer_style, which are never filled from their account, email, the host's context or a guess",
+     "title": "Stated"
     }
    },
    "required": [
@@ -923,7 +939,7 @@
    "open_world_hint": false,
    "read_only_hint": false
   },
-  "description": "Projects keep separate memory: one per company or product the Founder works on with this coach. A\nsession works on one active Project; with several and none chosen, ask which one, then switch. create\nmakes a Project and switches to it (setup does this first); rename changes its name, never its memory;\nsummary shows another Project's profile and Goals, read-only, only when the Founder asks to look at or\ncompare it. Nothing is ever copied between Projects.",
+  "description": "Projects keep separate memory: one per company or product the Founder works on with this coach. A\nsession works on one active Project; with several and none chosen, ask which one, then switch. create\nmakes a Project and switches to it (setup does this first); rename changes its name, never its memory;\nsummary shows another Project's profile and Goals, read-only, only when the Founder asks to look at or\ncompare it. Nothing is ever copied between Projects. Call create, switch or rename only when the Founder asks,\nor in setup for the one they named; never to organise memory on your own.",
   "input": {
    "properties": {
     "action": {
@@ -1049,7 +1065,7 @@
    "open_world_hint": false,
    "read_only_hint": false
   },
-  "description": "Save one new record. kind \"commitments\" takes 1-3 if-then plans with measurable outcomes (the\nweek's Focus). Citations must be item_ids returned by coach_search or coach_read. Warnings flag\nmore than 3 open Commitments or Goals. Call only after the Founder has approved the exact text.",
+  "description": "Save one new record. kind \"commitments\" takes 1-3 if-then plans with measurable outcomes (the\nweek's Focus). Citations must be item_ids returned by coach_search or coach_read. Warnings flag\nmore than 3 open Commitments or Goals. A Decision is a choice the Founder presents as decided (\"I've decided\", \"we chose A over B\"); a dropped Commitment, a shift of priorities or finished work is not one: it goes in the Commitment's note or the Check-in summary. Call only after the Founder has approved the exact text.",
   "input": {
    "$defs": {
     "CheckinIn": {

@@ -843,6 +843,30 @@ def test_the_investor_pack_builds_a_plugin_with_holdings_tools_and_no_founder_wo
             assert phrase in text or json.dumps(phrase)[1:-1] in text, f"[runtime.replace] {phrase!r} isn't in the runtime"
 
 
+def test_every_pack_says_search_comes_first_and_a_person_is_never_filled_in_from_the_account():
+    """G4/G5 regressions (2026-10-09): a missing profile answered without a search, and name/role were saved from the
+    host's account. The wording is what the coach follows, so it is pinned in every place it is read."""
+    for pack in ("founder", "coding", "investor"):
+        raw = tomllib.loads((ROOT / "packs" / pack / "pack.toml").read_text())
+        rt = raw.get("runtime") or {}
+        if rt:
+            assert "never delays or replaces the search" in rt["setup_nudge"], pack
+            assert "is created or switched only when they ask" in rt["instructions"], pack
+        skill = ROOT / ("plugin" if pack == "founder" else f"packs/{pack}") / "skills" / "coach" / "SKILL.md"
+        assert "Create or switch a Project only when" in skill.read_text(), pack
+    for pack, files in {"founder": ["plugin/skills/setup/SKILL.md", "founder_coach/playbooks/setup.md"],
+                        "coding": ["packs/coding/skills/setup/SKILL.md"]}.items():
+        for f in files:
+            text = (ROOT / f).read_text()
+            assert "never infer" in text and "`stated`" in text, f
+    from founder_coach import domain as D
+    from founder_coach.server import INSTRUCTIONS
+    assert "never delays or replaces the search" in D.SETUP_NUDGE
+    assert "never delays or replaces the search" in INSTRUCTIONS
+    assert "coach_update_profile `stated`" in INSTRUCTIONS and "or by setup for the company they named" in INSTRUCTIONS
+    assert "search and answer it first" in (ROOT / "founder_coach/nudges.py").read_text()
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

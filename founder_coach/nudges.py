@@ -122,8 +122,8 @@ def hook_text(store: FounderStore, limit: int = 1500) -> str:
     if open_now and not any(n["kind"] == "setup" for n in items):
         parts.append(f"{open_now} open Commitment(s) this week")
     text = (f"{D.COACH_NAME}: " + " · ".join(parts) + product.reword(
-        ". If the Founder raises startup work, answer it first, then offer the matching Playbook (check-in or "
-        "setup) once; otherwise don't interrupt."))
+        ". If the Founder raises startup work, search and answer it first, then offer the matching Playbook (check-in "
+        "or setup) once; otherwise don't interrupt."))
     return text[:limit]
 
 

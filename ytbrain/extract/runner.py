@@ -16,7 +16,6 @@ half a corpus came from one model and half from another.
 from __future__ import annotations
 
 import json
-import random
 import re
 import threading
 import time
@@ -32,13 +31,12 @@ from ..config import (EXTRACT_MAX_REPAIRS, GROUNDING_RETRY_BELOW, LLM_BACKEND, L
                       LLM_MAX_TOKENS, LLM_MIN_INTERVAL_S, LLM_NUM_CTX,
                       LLM_TIMEOUT_RETRIES, LLM_TIMEOUT_S,
                       RPM_CUT_COOLDOWN_S, RPM_FLOOR, RPM_RAISE_EVERY_S, RPM_RAISE_STEP,
-                      LLM_SEED, LLM_TEMPERATURE, SCHEMA_VERSION,
+                      LLM_SEED, LLM_TEMPERATURE,
                       SINGLE_CALL_MAX_TOKENS, TOKENS_PER_WORD,
                       WORDS_PER_ADVICE, WORDS_PER_HIGHLIGHT)
 from .. import source_kinds
 from . import prompts, versions
-from .schema import (AdviceAtom, Chapter, ChapterList, ExtractionMeta, Generated, Highlight,
-                     Overview, VideoMetadata)
+from .schema import Chapter, ChapterList, ExtractionMeta, Generated, VideoMetadata
 
 
 # Progress callback: each LLM call can take minutes on a laptop, so callers get
