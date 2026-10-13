@@ -2780,6 +2780,19 @@ def _cli_surface(main):
     return walk(parser)
 
 
+def test_the_github_workflows_are_valid_yaml_with_a_name_and_steps_for_every_job():
+    """A step name with ": " in it broke ci.yml on GitHub while every local check passed."""
+    import yaml
+    files = sorted((Path(__file__).resolve().parents[1] / ".github" / "workflows").glob("*.y*ml"))
+    assert files
+    for f in files:
+        wf = yaml.safe_load(f.read_text())
+        assert wf.get("name") and wf.get("jobs"), f.name
+        for job, spec in wf["jobs"].items():
+            assert spec.get("steps"), (f.name, job)
+            assert all(isinstance(s.get("name", ""), str) for s in spec["steps"]), (f.name, job)
+
+
 def test_the_command_lines_keep_their_commands_options_and_handlers():
     """A guardrail for splitting ytbrain/cli.py: the surface users and scripts rely on is pinned in
     tests/golden/cli_surface.json. After a deliberate change: UPDATE_GOLDEN=1 python tests/test_core.py"""

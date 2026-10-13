@@ -24,7 +24,7 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
   of 3). `--quick` runs a 15-prompt sample of every kind. A prompt's result is kept whichever run asked it, for the same prompt and
   expectation, so a full run after a quick one asks only the rest. A run that reached a coach before the turn cap is graded, not
   an error.
-- 456 tests pass on Python 3.11 (CI runs 3.11 and 3.13).
+- 457 tests pass on Python 3.11 (CI runs 3.11 and 3.13).
 
 ## 2026-10-11 (fixes from the first M6 coach runs)
 

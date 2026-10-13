@@ -1352,7 +1352,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 452 tests (456 under `pytest tests`), no network
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 453 tests (457 under `pytest tests`), no network
 pytest tests/                                                                        # the same under pytest
 ```
 
