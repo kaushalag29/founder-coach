@@ -5,6 +5,12 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
 
 ## 2026-10-12 (second round: the coding and investor runs; plugins 0.1.4)
 
+- **Public builds for every Pack, switched by `builds`.** A Pack with `release` in its `builds` gets a public plugin in
+  `ops plugin`, with its own coach gates and P12 over the public set. Until its Domains have public Documents, that
+  build is skipped with the reason in `last-run.md` (a step can now carry a run-time skip, checked when it comes up).
+  The coding and investor Packs still list only `private`. `sources.example.yaml` has commented examples for public
+  investment and coding playlists and sites. `ytbrain run` stays: the scheduled ingest-only job; `ops` is the manual loop.
+
 - **A Project is named after what setup gave, in all three Packs.** The first save used to create a Project called "My project"
   (G7 failed on the Project name). It now takes the first clause of the Pack's identity field: the company for the founder, the
   system for the engineer, the goal for the investor.
@@ -24,7 +30,7 @@ tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](do
   of 3). `--quick` runs a 15-prompt sample of every kind. A prompt's result is kept whichever run asked it, for the same prompt and
   expectation, so a full run after a quick one asks only the rest. A run that reached a coach before the turn cap is graded, not
   an error.
-- 457 tests pass on Python 3.11 (CI runs 3.11 and 3.13).
+- 460 tests pass under `pytest tests` on Python 3.11 (CI runs 3.11 and 3.13).
 
 ## 2026-10-11 (fixes from the first M6 coach runs)
 

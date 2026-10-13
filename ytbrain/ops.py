@@ -94,6 +94,8 @@ class Step:
     # Asked only when the child dies on a crash signal: native libraries (ONNX, PyTorch) can abort while Python
     # shuts down, after every file is written, and the output decides whether that was harmless.
     check: Callable[[float], str | None] | None = None
+    # run time, before the step: a reason to skip it (a public build with no public Documents yet), else None
+    skip: Callable[[], str | None] | None = None
 
 
 @dataclass
@@ -388,6 +390,16 @@ class Ops:
                 plugins = [target, *(d for _, d in others)]
                 steps.append(Step("plugin:choice", run=lambda ps=plugins: self.choice(ps),
                                   note="eval choice: the right coach for each prompt (P12)"))
+            release = self.other_release_builds()    # each public build: its own gates (skipped while it has no public Documents)
+            for pid, dist in release:
+                steps.append(Step(f"plugin:{pid}:release:coach",
+                                  run=lambda d=dist, k=f"coach:{pid}:release": self.coach(d, key=k),
+                                  skip=Ops.release_skip(pid), note=f"eval coach --plugin {dist} (public build)"))
+            if release:                              # P12 over the public set, the one that ships
+                plugins = ["dist/plugin", *(d for _, d in release)]
+                steps.append(Step("plugin:choice-release", run=lambda ps=plugins: self.choice(ps),
+                                  skip=Ops.release_set_skip(release),
+                                  note="eval choice over the public builds (P12)"))
         return steps
 
     @staticmethod
@@ -418,6 +430,7 @@ class Ops:
                     continue
                 out, dist = pk.pack_dir(priv, DATA), pk.dist_dir(priv, Path("dist"))
                 tag = f"plugin:{pid}" + (":private" if priv else "")
+                n0 = len(steps)
                 steps += [Step(f"{tag}:pack", ["pack", "build", "--for", pid, *(["--include-private"] if priv else []),
                                                "--out", str(out)],
                                check=lambda since, o=out: pack_written(o, since)),
@@ -425,7 +438,59 @@ class Ops:
                                                    "--out", str(dist), "--check", "--zip"], script=True),
                           Step(f"{tag}:validate", run=lambda d=str(dist): Ops.validate_static(d),
                                note=f"claude plugin validate {dist}")]
+                if not priv:                       # a public build waits for public Documents (checked when it comes up)
+                    for st in steps[n0:]:
+                        st.skip = Ops.release_skip(pid)
         return steps
+
+    @staticmethod
+    def other_release_builds() -> list[tuple[str, str]]:
+        """(pack id, dist folder) of every Pack besides founder with a public (release) build."""
+        from . import packs as PK
+        out = []
+        for pid in PK.all_ids():
+            if pid == PK.DEFAULT_PACK:
+                continue
+            pk = PK.load(pid, check_skills=False)
+            if "release" in pk.builds:
+                out.append((pid, str(pk.dist_dir(False, Path("dist")))))
+        return out
+
+    @staticmethod
+    def public_docs(pid: str) -> int:
+        """Indexed items a Pack would ship publicly: in its Domains and not private. Read when asked, so a Source
+        added since the plan was made counts. 0 when there is no index yet."""
+        from founder_coach import pack as P
+        from founder_coach.search import DEFAULT_DOMAIN
+        from . import packs as PK
+        from .knowledge.store import KnowledgeStore
+        store = KnowledgeStore()
+        if not store.ready:
+            return 0
+        mine = set(PK.load(pid, check_skills=False).domains)
+        return sum(1 for r in store.rows(kinds=list(P.KINDS))
+                   if (r.get("visibility") or "public") != "private"
+                   and mine & set(r.get("domains") or (DEFAULT_DOMAIN,)))
+
+    @staticmethod
+    def release_skip(pid: str) -> Callable[[], str | None]:
+        """The skip for one Pack's public build: skipped, with the reason, while it has no public Documents."""
+        def why() -> str | None:
+            if Ops.public_docs(pid):
+                return None
+            from . import packs as PK
+            doms = ", ".join(PK.load(pid, check_skills=False).domains)
+            return (f"{pid} has no public Documents yet: its public build waits for a public Source tagged {doms} "
+                    "in sources.yaml (its private build is unaffected)")
+        return why
+
+    @staticmethod
+    def release_set_skip(release: list[tuple[str, str]]) -> Callable[[], str | None]:
+        """The skip for P12 over the public builds: waits while any of them has no public Documents."""
+        def why() -> str | None:
+            waiting = [pid for pid, _ in release if not Ops.public_docs(pid)]
+            return None if not waiting else f"{', '.join(waiting)} has no public Documents yet"
+        return why
 
     @staticmethod
     def validate_static(target: str) -> int:
@@ -606,6 +671,11 @@ class Ops:
                 ran = self.state.get(f"coach:{pid}") or {}
                 if not ran.get("build") or ran.get("code"):
                     return True, COACH_ONLY
+        if self.opts.coach:                            # a public build's coach, once it has public Documents
+            for pid, _ in self.other_release_builds():
+                ran = self.state.get(f"coach:{pid}:release") or {}
+                if self.public_docs(pid) and (not ran.get("build") or ran.get("code")):
+                    return True, COACH_ONLY
         return False, "nothing changed since the last build"
 
     # ------------------------------------------------------------------ run
@@ -634,9 +704,15 @@ class Ops:
                     continue
                 self.say(f"ops: plugin: {why}")
                 if why == COACH_ONLY:            # the build is current: no new pack, version or zip
-                    steps = [st for st in steps if st.name.endswith(":coach") or st.name == "plugin:choice"]
+                    steps = [st for st in steps if st.name.endswith(":coach")
+                                              or st.name in ("plugin:choice", "plugin:choice-release")]
             for i, step in enumerate(steps, 1):
                 if step.name in cur["done"]:
+                    continue
+                if step.skip and not self.opts.dry_run and (why := step.skip()):
+                    self.say(f"\n=== ops {plan} [{i}/{len(steps)}] {step.name.split(':', 1)[1]}: skipped: {why} ===")
+                    cur["done"].append(step.name)
+                    self.save()
                     continue
                 what = " ".join(step.argv) + (f"  ({step.note})" if step.note else "") if step.argv else step.note
                 self.say(f"\n=== ops {plan} [{i}/{len(steps)}] {step.name.split(':', 1)[1]}: {what} ===")

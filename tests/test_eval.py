@@ -2678,6 +2678,55 @@ def test_the_quick_choice_sample_runs_the_marked_prompts_and_a_full_run_keeps_wh
             C.OUT = old
 
 
+def test_a_public_build_waits_for_public_documents_and_then_runs_its_gates_and_the_public_choice():
+    """A Pack lists `release` in its builds: its public plugin is planned beside the private one, and each of its
+    steps is skipped, with the reason, while its Domains hold no public Document. Once they do, its gates and P12
+    over the public set run."""
+    from unittest import mock
+    from ytbrain import ops
+    o = ops.Ops(ops.Options(version="skip", coach=True), call=lambda argv: 0, say=lambda m: None)
+    o.has_private = lambda: True
+    rel = [("investor", "dist/investor-coach")]
+    with mock.patch.object(ops.Ops, "other_release_builds", staticmethod(lambda: rel)), \
+            mock.patch.object(ops.Ops, "public_docs", staticmethod(lambda pid: 0)):
+        steps = {s.name: s for s in o.plugin_steps()}
+        assert "plugin:investor:release:coach" in steps and "plugin:choice-release" in steps
+        why = steps["plugin:investor:release:coach"].skip()
+        assert why and "waits for a public Source tagged investment" in why, why
+        assert steps["plugin:choice-release"].skip() == "investor has no public Documents yet"
+    with mock.patch.object(ops.Ops, "other_release_builds", staticmethod(lambda: rel)), \
+            mock.patch.object(ops.Ops, "public_docs", staticmethod(lambda pid: 7)):
+        steps = {s.name: s for s in o.plugin_steps()}
+        assert steps["plugin:investor:release:coach"].skip() is None
+        assert steps["plugin:choice-release"].skip() is None
+
+
+def test_a_public_build_counts_zero_public_documents_when_there_is_no_index_yet():
+    from ytbrain import ops
+    assert ops.Ops.public_docs("investor") == 0
+    assert ops.Ops.release_skip("investor")() and "no public Documents yet" in ops.Ops.release_skip("investor")()
+
+
+def test_a_skipped_step_is_recorded_as_done_and_the_run_goes_on():
+    """ops run: a step whose skip gives a reason is noted and never run; the next step still runs."""
+    from unittest import mock
+    from ytbrain import ops
+    ran, said = [], []
+    o = ops.Ops(ops.Options(version="skip", coach=False), call=lambda argv: ran.append(argv) or 0,
+                say=said.append)
+    skipped = ops.Step("plugin:investor:release:pack", ["pack", "build"], skip=lambda: "no public Documents yet")
+    kept = ops.Step("plugin:founder:validate", run=lambda: ran.append("kept") or 0)
+    o.load = lambda: None
+    o.save = lambda: None
+    o.notify = lambda *a, **k: None
+    o.spent_total = lambda: 0.0
+    o.plugin_is_due = lambda: (True, "test")
+    o.due = lambda: [("plugin", [skipped, kept], "test")]
+    assert o.run() == 0
+    assert ran == ["kept"], "the skipped step never ran its command"
+    assert any("skipped: no public Documents yet" in line for line in said), said
+
+
 def test_ops_builds_and_evaluates_every_pack_and_checks_the_plugin_choice():
     """M6f: `ops plugin --coach` with your private Sources builds the coding plugin, runs its own coach gates and
     then P12 over every coach together."""

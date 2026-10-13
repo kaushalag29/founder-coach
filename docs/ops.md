@@ -63,6 +63,14 @@ interrupted, auth, books, config); the runner acts on it:
 Every stop and every finished run sends a macOS notification and writes `data/ops/last-run.md`: what
 happened and the one command to run next.
 
+## Public builds of the other Packs
+
+A Pack builds a public plugin only when its `builds` in `pack.toml` lists `release` (today: none of the coding and
+investor Packs). Each of that plugin's steps checks at its turn whether its Domains have public Documents, and is
+skipped with that reason when they don't; the private plugin is never affected. Once they do, its own coach gates run
+(`ytbrain ops plugin --coach`), and `eval choice` runs once more over the public set (`dist/plugin` plus each public
+build). `ops` never publishes: `scripts/release.py` does, on your command.
+
 ## Plugin version
 
 A new build gets a new version so Cowork installs it as an update. The run asks in the terminal: patch

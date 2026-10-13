@@ -757,7 +757,7 @@ only the talks whose records changed.
 | `eval status` | Progress and LLM spend per split | |
 | `pages` | Re-render all markdown pages from the JSON records | |
 | `refresh` | Re-apply Series and provenance from `sources.yaml` and yt-dlp metadata to documents, records and pages (no network, no LLM) | |
-| `run` | sync → clean → extract → verify → index | `--limit` (per playlist for sync, per Step after), `--workers`, `--device`, `--force`, `--reconcile`, `--source ID`, `--type website\|youtube\|book` |
+| `run` | sync → clean → extract → verify → index: the scheduled job (launchd), ingest only; `ops ingest` runs the same steps with checkpoints, and `ops` adds eval and plugin | `--limit` (per playlist for sync, per Step after), `--workers`, `--device`, `--force`, `--reconcile`, `--source ID`, `--type website\|youtube\|book` |
 | `report` | Acceptance numbers + last three runs | |
 | `sample` | Stratified review sheet in `data/reports/` | `--n`, `--seed`, `--doc PREFIX` |
 | `status` | Count of finished items per stage, and records per extraction version (ADR-0018) | |
@@ -892,6 +892,12 @@ python scripts/assemble_plugin.py --for coding --pack data/packs/coding/pack-pri
 ytbrain eval choice --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # P12: each of 45 prompts reaches the right coach (all of them, for a prompt that needs several)
 ytbrain eval choice --quick --plugin dist/plugin-private --plugin dist/coding-coach-private --plugin dist/investor-coach-private   # a 15-prompt sample of every kind
 ```
+
+A Pack's `builds` in its `pack.toml` says which plugins it gets: `private` (with your books) and/or `release` (public
+Sources only). The coding and investor Packs list only `private` for now. Adding `release` gives them a public plugin
+too: it is built from the public Documents in their Domains, its gates run and P12 covers the public set; while those
+Domains have no public Document (the case until you add public playlists or sites to `sources.yaml`), the public build
+is skipped with a note in `data/ops/last-run.md`, and the private build is unaffected. Nothing is published by `ops`.
 
 Load `dist/plugin`, never `plugin/` itself. `--check` imports the assembled runtime and verifies
 the pack's checksum before swapping the build in, so a broken build never replaces a working
@@ -1352,7 +1358,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 453 tests (457 under `pytest tests`), no network
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 456 tests (460 under `pytest tests`), no network
 pytest tests/                                                                        # the same under pytest
 ```
 
