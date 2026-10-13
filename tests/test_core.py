@@ -1664,6 +1664,121 @@ def test_tags_reach_the_index_only_after_the_labelled_set_passes_for_this_tagger
         assert "changed" in T.gate(bigger, s, p), "a new Domain needs a new pass"
 
 
+def test_the_tag_policy_is_auto_by_default_and_a_bad_value_is_refused_never_guessed():
+    from unittest import mock
+    from ytbrain import config
+    from ytbrain import tagging as T
+    with mock.patch.object(config, "TAG_POLICY", "auto"), mock.patch.object(config, "TAG_AUTO_SHARE", "0.5"):
+        assert T.policy() == ("auto", 0.5)
+    assert T.policy("", "0.5") == ("auto", 0.5), "an empty setting is the default"
+    assert T.policy(" Reviewed ", "1") == ("reviewed", 1.0)
+    for bad in (("automatic", "0.5"), ("auto", "abc"), ("auto", "0"), ("auto", "1.5"), ("auto", "-0.2"), ("auto", "nan")):
+        try:
+            T.policy(*bad)
+            raise AssertionError(f"{bad} should be refused")
+        except T.PolicyError as e:
+            assert "YTBRAIN_TAG_" in str(e), str(e)
+
+
+def test_auto_applies_without_labels_and_reviewed_keeps_the_tags_already_applied():
+    from ytbrain import tagging as T
+    reg, s = _tag_registry(), T.Settings(floor=0.5)
+    ok = {"passed": True, "tagger_version": T.TAGGER_VERSION, "domain_list": reg.fingerprint(), "settings": s.key()}
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "tags.json"
+        apply, note = T.decide(reg, s, "auto", p)
+        assert apply and "without a passing labelled set" in note and "no `ytbrain eval tags`" in note
+        p.write_text(json.dumps({**ok, "passed": False}))
+        apply, note = T.decide(reg, s, "auto", p)
+        assert apply and "failed" in note, "auto reports a failing labelled set, never blocks on it"
+        p.write_text(json.dumps(ok))
+        assert T.decide(reg, s, "auto", p) == (True, None) and T.decide(reg, s, "reviewed", p) == (True, None)
+        p.unlink()
+        assert T.decide(reg, s, "reviewed", p)[0] is False
+        db = T.TagDB(Path(d) / "tags.db")
+        kw = {"reg": reg, "s": s, "path": p}
+        assert T.apply_plan(db, gated=True, no_apply=True, pol="auto", **kw) == ("store", "--no-apply")
+        assert T.apply_plan(db, gated=False, no_apply=False, pol="reviewed", **kw) == ("apply", None), \
+            "a hand-run `ytbrain tag` applies under either policy"
+        assert T.apply_plan(db, gated=True, no_apply=False, pol="reviewed", **kw)[0] == "store", "nothing applied yet"
+        db.replace({}, {}, {"applied": "1", "tagged_at": "2026-10-07T04:04:31Z"})
+        action, why = T.apply_plan(db, gated=True, no_apply=False, pol="reviewed", **kw)
+        assert action == "keep" and "no `ytbrain eval tags`" in why, "a held-back run never takes applied tags away"
+        assert T.apply_plan(db, gated=True, no_apply=False, pol="auto", **kw)[0] == "apply"
+        db.close()
+
+
+def test_auto_applies_a_high_tier_domain_only_where_the_decided_content_carries_it():
+    """auto: finance (high tier) is applied on half of a Document's Passages, counting only decided tags and the
+    whole Document; a rejection, a hint and a person's confirmation keep their meaning; reviewed is unchanged."""
+    from ytbrain import tagging as T
+    reg = _tag_registry()
+    spec = [("f1", "a", ["FIN", "FIN", "LEAD"]),                 # 2 of 3 decided: applied automatically
+            ("f2", "b", ["FIN", "LEAD", "LEAD"]),                # 1 of 3: only suggested
+            ("f3", "c", ["FIN", "FIN"]),                         # rejected for its Source: never
+            ("f4", "d", ["FIN LEAD", "FIN LEAD"]),               # unresolved close calls prove nothing
+            ("f5", "e", ["FIN", "NOISE", "NOISE", "NOISE"]),     # 1 of 4 Passages: the whole Document counts
+            ("f6", "f", ["FIN", "FIN"])]                         # a hint confirms it: not automatic
+    rows, texts = [], []
+    for doc, src, psgs in spec:
+        for i, x in enumerate(psgs, 1):
+            rows.append({"item_id": f"psg:{doc}:{i}", "doc_id": doc, "kind": "passage", "text": f"text {x}",
+                         "source_id": src})
+            texts.append(x)
+    rows.append({"item_id": "adv:f1:a1", "doc_id": "f1", "kind": "advice", "text": "text FIN", "source_id": "a"})
+    texts.append("FIN")
+    vecs = _axis_embed(texts)
+    s = T.Settings(floor=0.5, close=0.05, share=0.2, min_passages=1)
+    with tempfile.TemporaryDirectory() as d:
+        db = T.TagDB(Path(d) / "tags.db")
+        db.reject(["source:c"], "finance")
+        res = T.run(rows, vecs, reg, _axis_embed, {"f6": ["finance"]}, s, None, db, "m", say=lambda m: None,
+                    auto_share=0.5)
+        doc = res.docs
+        assert "finance" in doc["f1"].domains and doc["f1"].auto == ("finance",)
+        assert "finance" in res.items["adv:f1:a1"].domains and not res.items["adv:f1:a1"].suggested
+        assert "finance" in doc["f2"].suggested and not doc["f2"].auto
+        assert "finance" not in doc["f3"].domains + doc["f3"].suggested, "a rejection always wins"
+        assert "finance" in doc["f4"].suggested and not doc["f4"].auto, "unresolved close calls never confirm"
+        assert "finance" in doc["f5"].suggested and not doc["f5"].auto, "one Passage in four is not half the Document"
+        assert "finance" in doc["f6"].domains and not doc["f6"].auto, "a hint confirms; nothing is automatic there"
+        assert res.auto_confirmed == 1
+        db.replace(res.items, res.docs, {"applied": "1"})
+        assert db.auto_of("f1") == ["finance"] and db.auto_of("f2") == []
+        assert db.auto_groups() == {("a", "finance"): ["f1"]}, "review lists them by Source, ready to reject"
+        reviewed = T.run(rows, vecs, reg, _axis_embed, {"f6": ["finance"]}, s, None, db, "m", say=lambda m: None)
+        assert "finance" in reviewed.docs["f1"].suggested and reviewed.auto_confirmed == 0, "reviewed is unchanged"
+        db.replace(reviewed.items, reviewed.docs, {"applied": "1"})
+        assert db.auto_of("f1") == [], "each run's record replaces the last"
+        db.confirm(["source:a"], "finance")
+        again = T.run(rows, vecs, reg, _axis_embed, {"f6": ["finance"]}, s, None, db, "m", say=lambda m: None,
+                      auto_share=0.5)
+        assert "finance" in again.docs["f1"].domains and not again.docs["f1"].auto, "a person's yes is not automatic"
+        strict = T.run(rows, vecs, reg, _axis_embed, {}, s, None, db, "m", say=lambda m: None, auto_share=1.0)
+        assert strict.docs["f6"].auto == ("finance",), "without its hint, a Document wholly about finance is automatic"
+        assert not strict.docs["f2"].auto and strict.auto_confirmed == 1, "a stricter share applies less"
+        db.close()
+
+
+def test_ops_reports_what_the_tag_step_did():
+    from unittest import mock
+    from ytbrain import ops
+    from ytbrain import tagging as T
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "tags.db"
+        with mock.patch.object(T, "TAGS_DB", p):
+            assert ops.Ops.tag_note() == "", "no tag run yet: nothing to say"
+            db = T.TagDB()
+            db.set_meta({"status": "applied", "auto_confirmed": 2})
+            db.close()
+            note = ops.Ops.tag_note()
+            assert note.startswith("; tags applied") and "2 high-tier applied from the content" in note, note
+            db = T.TagDB()
+            db.set_meta({"status": "held back, earlier tags kept: no `ytbrain eval tags` result yet", "auto_confirmed": 0})
+            db.close()
+            assert "held back, earlier tags kept" in ops.Ops.tag_note() and "high-tier" not in ops.Ops.tag_note()
+
+
 def test_status_counts_leave_out_dropped_documents():
     with tempfile.TemporaryDirectory() as d:
         m = Manifest(Path(d) / "m.db")

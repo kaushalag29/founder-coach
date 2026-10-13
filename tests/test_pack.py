@@ -624,6 +624,67 @@ def test_the_tag_step_sets_item_domains_in_place_and_index_keeps_them():
     assert T.stored_item_domains(tmp / "missing.db") == {} and T.tagged_docs(tmp / "missing.db") == set()
 
 
+def test_ytbrain_tag_follows_the_policy_end_to_end_and_never_takes_applied_tags_away():
+    """`ytbrain tag --gated` (what ops runs) on a real index: a bad policy stops it with exit 2 and changes
+    nothing; auto applies with no labelled set; reviewed then holds the new run back and keeps what is applied;
+    on a fresh store reviewed only stores them for review."""
+    try:
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+        from ytbrain.knowledge.store import KnowledgeStore
+    except ImportError:
+        return
+    from ytbrain import cli, config
+    from ytbrain import domains as D
+    from ytbrain import tagging as T
+    tmp = Path(tempfile.mkdtemp())
+    emb = HashEmbed()
+    store = KnowledgeStore(path=tmp / "lance")
+    for doc in dict.fromkeys(r["doc_id"] for r in ROWS):
+        store.replace_document(doc, [{**r, "domains": ["startup"], "source_id": "s", "vector": emb([r["indexable"]])[0],
+                                      "embed_model": emb.name} for r in ROWS if r["doc_id"] == doc], emb.dim)
+    reg = D.parse({"default": "startup", "domains": {"startup": {"description": "startups", "risk_tier": "medium"},
+                                                     "gtm": {"description": "selling", "risk_tier": "medium"},
+                                                     "finance": {"description": "money", "risk_tier": "high"}}})
+    args = argparse.Namespace(dry_run=False, max_cost=None, no_llm=True, retry_undecided=False, no_apply=False,
+                              gated=True)
+
+    def tag(policy, db_path):
+        rows, vectors = store.tag_inputs()
+        out = io.StringIO()
+        with mock.patch.object(cli, "_tag_inputs", lambda cmd: (store, rows, vectors, emb)), \
+                mock.patch.object(cli, "_domains", lambda: reg), mock.patch.object(cli, "_doc_tags", lambda *a, **k: {}), \
+                mock.patch.object(T, "TAGS_DB", db_path), mock.patch.object(config, "EVAL_DATA", tmp / "eval"), \
+                mock.patch.object(config, "TAG_POLICY", policy), mock.patch.object(config, "TAG_AUTO_SHARE", "0.5"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = cli.cmd_tag(args)
+        return code, out.getvalue()
+
+    def meta(db_path, key):
+        db = T.TagDB(db_path)
+        try:
+            return db.meta(key)
+        finally:
+            db.close()
+    main = tmp / "tags.db"
+    code, out = tag("bogus", main)
+    assert code == 2 and "is not a policy" in out and not main.exists(), "a typo stops before anything is written"
+    code, out = tag("auto", main)
+    assert code == 0 and meta(main, "applied") == "1", out
+    assert meta(main, "policy") == "auto" and meta(main, "status").startswith("applied (applied by policy auto"), \
+        meta(main, "status")
+    first = meta(main, "tagged_at")
+    code, out = tag("reviewed", main)
+    assert code == 0 and "the tags already on the index stay" in out, out
+    assert meta(main, "applied") == "1" and meta(main, "tagged_at") == first, "the applied run is kept as it was"
+    assert meta(main, "status").startswith("held back, earlier tags kept")
+    fresh = tmp / "fresh.db"
+    code, out = tag("reviewed", fresh)
+    assert code == 0 and meta(fresh, "applied") == "0" and meta(fresh, "status").startswith("stored for review"), out
+
+
 def test_a_packs_build_holds_only_its_domains_items_and_describes_only_its_domains():
     """ADR-0016: `pack build --for <id>` ships the items in any of the Pack's Domains."""
     try:

@@ -256,7 +256,7 @@ class Ops:
                        note="extract + verify once more, for Documents verify newly flagged"),
                   Step("ingest:index", ["index"]),
                   Step("ingest:tag", ["tag", "--gated", "--max-cost", f"{TAG_MAX_COST:g}"],
-                       note="Domains by content (ADR-0017), applied once `ytbrain eval tags` passes; "
+                       note="Domains by content (ADR-0017), per YTBRAIN_TAG_POLICY (auto by default); "
                             "a cheap model only for uncached close calls"),
                   Step("ingest:enrich", ["enrich", "--max-cost", f"{ENRICH_MAX_COST:g}"],
                        note="Rules (and Facts) for investment, coding and system-design Documents (ADR-0018)"),
@@ -442,6 +442,25 @@ class Ops:
                     for st in steps[n0:]:
                         st.skip = Ops.release_skip(pid)
         return steps
+
+    @staticmethod
+    def tag_note() -> str:
+        """What this run's tag Step did, for the summary and data/ops/last-run.md ("" when nothing is recorded)."""
+        try:
+            from . import tagging as T
+            if not T.TAGS_DB.exists():
+                return ""
+            db = T.TagDB()
+            try:
+                status, n = db.meta("status"), int(db.meta("auto_confirmed") or 0)
+            finally:
+                db.close()
+        except Exception:                      # noqa: BLE001 -- a summary line never stops the run
+            return ""
+        if not status:
+            return ""
+        return (f"; tags {status}" + (f", {n} high-tier applied from the content (`ytbrain domains why`, "
+                                      f"`ytbrain domains review --reject`)" if n else ""))
 
     @staticmethod
     def other_release_builds() -> list[tuple[str, str]]:
@@ -759,6 +778,7 @@ class Ops:
         if verdict in ("pass", "baseline") and ev.get("index") != self.index_fp():
             verdict += " (on an older index)"          # the plugin step skips: a pass on this index is still missing
         summary = (f"eval {verdict}; plugin {pl.get('version', '-')} ({pl.get('path', 'not built')})"
+                   + (self.tag_note() if "ingest:tag" in cur["done"] else "")
                    + coach_note
                    + f"; eval spend ${self.state['last_run']['spent']:.3f}")
         self.say(f"\nops: {self.opts.plan} done: {summary}")

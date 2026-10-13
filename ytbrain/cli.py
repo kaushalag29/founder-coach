@@ -1697,6 +1697,11 @@ def cmd_tag(args) -> int:
     if isinstance(got, int):
         return got
     store, rows, vectors, embed = got
+    try:
+        pol, auto_share = T.policy()
+    except T.PolicyError as e:
+        print(f"tag: {e}", file=sys.stderr)
+        return 2
     reg = _domains()
     m = Manifest(MANIFEST_DB)
     docs = sorted({r["doc_id"] for r in rows})
@@ -1704,9 +1709,11 @@ def cmd_tag(args) -> int:
     model, s, db = _tag_model(), T.load_settings(), T.TagDB()
     ask = None if args.no_llm else T.llm_tiebreak(reg, model)
     print(f"tag: {len(rows)} item(s) in {len(docs)} Document(s) against {len(reg.names)} Domain(s) "
-          f"(floor {s.floor}, close {s.close}, share {s.share})", flush=True)
+          f"(floor {s.floor}, close {s.close}, share {s.share}; policy {pol}"
+          + (f", high-tier on {auto_share:g} of a Document" if pol == "auto" else "") + ")", flush=True)
     res = T.run(rows, vectors, reg, embed, hints, s, ask, db, model, args.max_cost, args.dry_run,
-                retry_undecided=getattr(args, "retry_undecided", False))
+                retry_undecided=getattr(args, "retry_undecided", False),
+                auto_share=auto_share if pol == "auto" else None)
     print(f"tag: {res.close_calls} close call(s): {res.cached} from the cache, {res.asked} asked, "
           f"{res.unresolved} kept every candidate" + (f" · ${res.cost:.3f} on {model}" if res.cost else ""))
     if res.undecided:
@@ -1721,6 +1728,9 @@ def cmd_tag(args) -> int:
                   f"estimated; cap it with --max-cost, or --no-llm to keep every candidate)")
     per = Counter(d for t in res.docs.values() for d in t.domains)
     print("tag: Documents per Domain: " + ", ".join(f"{d} {n}" for d, n in sorted(per.items(), key=lambda x: -x[1])))
+    if res.auto_confirmed:
+        print(f"tag: {res.auto_confirmed} high-tier tag(s) applied from the content (policy auto); "
+              f"`ytbrain domains why DOC` shows them, `ytbrain domains review --reject SOURCE:DOMAIN` undoes a Source's")
     if res.awaiting_review:
         print(f"tag: {res.awaiting_review} high-tier tag(s) await your review (they stay out of packs until "
               f"confirmed): " + ("`ytbrain domains review` after a real run (`ytbrain tag --no-apply` stores them)"
@@ -1731,12 +1741,22 @@ def cmd_tag(args) -> int:
     if args.dry_run:
         print("tag: dry run, nothing changed")
         return 0
-    why = "--no-apply" if args.no_apply else (T.gate(reg, s) if args.gated else None)
-    meta = {**T.meta_for(reg, s, store.embed_model() or EMBED_MODEL, model), "applied": "0" if why else "1"}
+    action, why = T.apply_plan(db, gated=args.gated, no_apply=args.no_apply, pol=pol, reg=reg, s=s)
+    if action == "keep":
+        db.set_meta({"status": f"held back, earlier tags kept: {why}", "policy": pol, "auto_confirmed": 0})
+        print(f"tag: not applied, and the tags already on the index stay (applied {db.meta('tagged_at') or 'earlier'}): "
+              f"{why}. This run's tags are not stored; `ytbrain tag --no-apply` stores them for review")
+        return 0
+    meta = {**T.meta_for(reg, s, store.embed_model() or EMBED_MODEL, model),
+            "applied": "1" if action == "apply" else "0", "policy": pol,
+            "auto_confirmed": str(res.auto_confirmed if action == "apply" else 0),
+            "status": "applied" + (f" ({why})" if why else "") if action == "apply" else f"stored for review: {why}"}
     db.replace(res.items, res.docs, meta)
-    if why:
+    if action == "store":
         print(f"tag: stored for review (`ytbrain domains why|review|sample`), not applied to the index: {why}")
         return 0
+    if why:
+        print(f"tag: note: {why}")
     n = store.set_item_domains({i: t.domains for i, t in res.items.items()})
     print(f"tag: {n} item(s) changed Domains in the index (in place; nothing re-extracted or re-embedded)")
     if n:
@@ -1775,6 +1795,10 @@ def _domains_tagging(args, reg) -> int:
         print(f"{r['doc_id']}  {titles.get(r['doc_id'], '')}")
         print(f"  Domains: {', '.join(json.loads(r['domains']))} (from {r['origin']})"
               + (f" · suggested, awaiting review: {', '.join(json.loads(r['suggested']))}" if json.loads(r['suggested']) else ""))
+        auto = db.auto_of(r["doc_id"])
+        if auto:
+            print(f"  applied from the content by policy auto: {', '.join(auto)} "
+                  f"(undo for its Source: ytbrain domains review --reject {r['source_id'] or 'SOURCE'}:{auto[0]})")
         shares = json.loads(r["shares"])
         if shares:
             print("  share of its Passages: " + ", ".join(f"{d} {v:.0%}" for d, v in sorted(shares.items(), key=lambda x: -x[1])))
@@ -1802,6 +1826,14 @@ def _domains_tagging(args, reg) -> int:
         for r in db.docs():
             for d in json.loads(r["suggested"]):
                 groups.setdefault((r["source_id"], d), []).append(r["doc_id"])
+        auto = db.auto_groups()
+        if auto:
+            print("domains review: applied from the content (policy auto), for you to check:")
+            for (sid, d), docs in sorted(auto.items(), key=lambda x: -len(x[1])):
+                eg = "; ".join(titles.get(x, x)[:50] for x in docs[:3])
+                print(f"  {d} · source {sid or '?'} · {len(docs)} Document(s), e.g. {eg}")
+                print(f"      wrong for this Source: ytbrain domains review --reject {sid or 'SOURCE'}:{d}   "
+                      f"(one Document: doc:<doc_id>:{d})")
         if not groups:
             print("domains review: no high-tier tags await review")
             return 0
@@ -3197,8 +3229,9 @@ def main(argv=None) -> int:
     sp.add_argument("--retry-undecided", action="store_true",
                     help="ask again about close calls the model already left undecided (cached otherwise)")
     sp.add_argument("--no-apply", action="store_true", help="store the tags for review and labelling; leave the index's Domains")
-    sp.add_argument("--gated", action="store_true", help="apply only when `ytbrain eval tags` passed for this tagger, "
-                                                          "Domain list and thresholds (what `ytbrain ops` runs)")
+    sp.add_argument("--gated", action="store_true", help="what `ytbrain ops` runs: YTBRAIN_TAG_POLICY=auto (default) "
+                                                          "applies every run; reviewed applies only after `ytbrain eval "
+                                                          "tags` passed and otherwise keeps the tags already applied")
     sp = add("upgrade", cmd_upgrade)
     sp.add_argument("--dry-run", action="store_true", help="show what would be re-extracted and its cost; change nothing")
     sp.add_argument("--max-cost", type=float, default=None, metavar="USD",

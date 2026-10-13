@@ -50,3 +50,27 @@ Retagging rewrites metadata only (no re-extraction, no re-embedding); a new Doma
 everything by embedding in seconds and asks the LLM only about results that changed or became close,
 then swaps the tags in atomically. `domains.yaml` gains `aliases:`; `sync --strict-domains` no longer
 stops on an unknown folder (the folder name is a hint and goes through the same four checks).
+
+## Amendment (2026-10-13): a policy for fully automatic tagging
+
+The labelled set and a person's yes on every high-tier tag kept untuned thresholds away from the packs, but they
+also made ingestion stop at a manual step: new Sources fell back to their `domains:` line or the default Domain.
+The goal is now an ingestion loop with no manual step, where content reaches the coaches by what it says.
+
+- **`YTBRAIN_TAG_POLICY`, `auto` by default.** `auto` applies each run's tags with no labelled set; a missing,
+  failed or outdated labelled set is reported in the run's output and `last-run.md`, not blocking. `reviewed` is
+  the previous behaviour: applied only after `ytbrain eval tags` passed.
+- **High-tier tags from the content.** Under `auto`, a high-tier Domain is applied to a Document when it covers at
+  least `YTBRAIN_TAG_AUTO_SHARE` (0.5) of all its Passages, counting only Passages whose tag was decided; an
+  unresolved close call keeps every candidate and proves nothing. Weaker evidence stays a suggestion that no pack
+  ships. Each such tag is recorded (`auto_tags`, shown by `ytbrain domains why`), counted in the summary, and undone
+  for a whole Source by `ytbrain domains review --reject`. A rejection always wins; a hint or a confirmation is not
+  counted as automatic.
+- **A held-back run never removes applied tags.** Under `reviewed`, a run that may not apply keeps the stored and
+  applied tags as they are (before, it marked them unapplied, so re-indexed Documents lost them).
+- **Settings are checked, never guessed.** An unknown policy or a share outside (0, 1] stops the tag Step with the
+  reason, before anything is written.
+
+What stays human: creating a Domain, its Risk tier, and the Domains a Pack serves. Trade-off accepted: a Source about
+startup or angel investing may occasionally be tagged `investment`; the Domain's `not_about` guides the tie-break, the
+half-the-Document bar filters weak evidence, and a rejection fixes a Source once and for all.

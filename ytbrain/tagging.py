@@ -16,8 +16,15 @@ A Document's Domains are those covering at least `share` of its tagged Passages 
 text), so a talk on hiring and pricing gets leadership and gtm with no summary or table of contents.
 
 High-tier Domains (finance, investment) are only *suggested* until confirmed: by a hint (the person
-put the Book in that folder or named the Domain on the Source) or by `ytbrain domains review`.
-Unconfirmed, they stay out of the index's `domains`, so `pack build` never ships them.
+put the Book in that folder or named the Domain on the Source), by `ytbrain domains review`, or, under
+the `auto` policy (YTBRAIN_TAG_POLICY, the default), by the content itself: a high-tier Domain that
+covers at least YTBRAIN_TAG_AUTO_SHARE (0.5) of a Document's Passages, counting only Passages whose tag
+was decided (never an unresolved close call), is applied and recorded as automatic. A rejection always
+wins. Unconfirmed, they stay out of the index's `domains`, so `pack build` never ships them.
+
+Policies (ADR-0017 amendment, 2026-10-13): `auto` applies every run's tags with no labelled set needed;
+a failing or outdated labelled set is reported, not blocking. `reviewed` applies them only after
+`ytbrain eval tags` passed, and a run it holds back keeps the tags already applied.
 
 Nothing here re-extracts or re-embeds: results go to data/tags/tags.db (with their origin and
 scores, for `ytbrain domains why`) and onto the index's `domains` column in place.
@@ -169,6 +176,8 @@ class TagDB:
                 PRIMARY KEY (scope, domain));
             CREATE TABLE IF NOT EXISTS rejections (scope TEXT NOT NULL, domain TEXT NOT NULL, at TEXT NOT NULL,
                 PRIMARY KEY (scope, domain));
+            CREATE TABLE IF NOT EXISTS auto_tags (doc_id TEXT NOT NULL, domain TEXT NOT NULL,
+                PRIMARY KEY (doc_id, domain));
         """)
 
     def meta(self, key: str) -> str | None:
@@ -223,7 +232,27 @@ class TagDB:
             self.db.executemany("INSERT INTO doc_tags VALUES (?,?,?,?,?,?,?)", [
                 (d, t.source_id, json.dumps(list(t.domains)), json.dumps(list(t.suggested)), t.origin,
                  json.dumps(t.shares), json.dumps(list(t.hints))) for d, t in docs.items()])
+            self.db.execute("DELETE FROM auto_tags")
+            self.db.executemany("INSERT INTO auto_tags VALUES (?,?)",
+                                [(d, dom) for d, t in docs.items() for dom in getattr(t, "auto", ())])
             self.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", list(meta.items()))
+
+    def set_meta(self, meta: dict) -> None:
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [(k, str(v)) for k, v in meta.items()])
+
+    def auto_groups(self) -> dict[tuple[str, str], list[str]]:
+        """(source id, Domain) -> Documents whose high-tier Domain the `auto` policy applied, for `domains review`."""
+        out: dict[tuple[str, str], list[str]] = {}
+        for r in self.db.execute("SELECT a.doc_id, a.domain, COALESCE(d.source_id, '') AS source_id FROM auto_tags a "
+                                 "LEFT JOIN doc_tags d ON d.doc_id = a.doc_id ORDER BY a.domain, a.doc_id"):
+            out.setdefault((r["source_id"], r["domain"]), []).append(r["doc_id"])
+        return out
+
+    def auto_of(self, doc_id: str) -> list[str]:
+        """The high-tier Domains the `auto` policy applied to this Document in the stored run."""
+        return [r["domain"] for r in self.db.execute("SELECT domain FROM auto_tags WHERE doc_id=? ORDER BY domain",
+                                                     (doc_id,))]
 
     @property
     def applied(self) -> bool:
@@ -293,6 +322,7 @@ class DocTag:
     origin: str = "passages"       # passages | items | hint | default
     shares: dict = field(default_factory=dict)
     hints: tuple[str, ...] = ()
+    auto: tuple[str, ...] = ()     # high-tier Domains applied by the `auto` policy (not by a hint or a person)
 
 
 @dataclass
@@ -311,6 +341,11 @@ class Result:
     @property
     def awaiting_review(self) -> int:
         return sum(len(d.suggested) for d in self.docs.values())
+
+    @property
+    def auto_confirmed(self) -> int:
+        """High-tier Document tags the `auto` policy applied this run."""
+        return sum(len(d.auto) for d in self.docs.values())
 
     @property
     def unplaced(self) -> list[str]:
@@ -361,10 +396,12 @@ def llm_tiebreak(reg, model: str) -> AskBatch:
 def run(rows: list[dict], vectors, reg, embed: Callable[[list[str]], list], hints: dict[str, list[str]],
         settings: Settings | None = None, ask: AskBatch | None = None, db: TagDB | None = None,
         model: str = "", max_cost: float | None = None, dry_run: bool = False, say=print,
-        retry_undecided: bool = False) -> Result:
+        retry_undecided: bool = False, auto_share: float | None = None) -> Result:
     """Tag every item in `rows` with `vectors` (KnowledgeStore.tag_inputs). `hints`: doc_id -> configured
     Domains (never the registry default). `ask`: the tie-break model, or None to leave close calls
-    unresolved. Pure apart from `db` (cache reads always; writes only when not a dry run)."""
+    unresolved. `auto_share`: the `auto` policy's bar for applying a high-tier Domain from the content alone
+    (None: only a hint or a person confirms one). Pure apart from `db` (cache reads always; writes only
+    when not a dry run)."""
     s = settings or Settings()
     names = reg.names
     prof = profile_texts(reg)
@@ -454,9 +491,19 @@ def run(rows: list[dict], vectors, reg, embed: Callable[[list[str]], list], hint
             res.items[r["item_id"]] = ItemTag(r["doc_id"], tuple(c), origin="unresolved", scores=top)
             res.unresolved += 1
 
-    def is_confirmed(domain: str, doc_id: str, source_id: str, hinted: set[str]) -> bool:
-        return (reg.get(domain).risk_tier != "high" or domain in hinted
+    def is_confirmed(domain: str, doc_id: str, source_id: str, hinted: set[str],
+                     strong: frozenset[str] = frozenset()) -> bool:
+        return (reg.get(domain).risk_tier != "high" or domain in hinted or domain in strong
                 or (f"doc:{doc_id}", domain) in confirmed or (f"source:{source_id}", domain) in confirmed)
+
+    def strong_high_tier(psg: list[ItemTag]) -> frozenset[str]:
+        """`auto`: high-tier Domains covering at least `auto_share` of ALL the Document's Passages, counting only
+        Passages whose tag was decided (an unresolved close call keeps every candidate and proves nothing)."""
+        if auto_share is None or not psg:
+            return frozenset()
+        decided = Counter(d for t in psg if t.origin != "unresolved" for d in t.domains)
+        return frozenset(d for d, n in decided.items()
+                         if reg.get(d).risk_tier == "high" and n / len(psg) >= auto_share)
 
     def is_rejected(domain: str, doc_id: str, source_id: str, hinted: set[str]) -> bool:
         """You said no for this Document or Source (a hint, which you configured yourself, still wins)."""
@@ -481,19 +528,21 @@ def run(rows: list[dict], vectors, reg, embed: Callable[[list[str]], list], hint
                 doms, origin = sorted(d for d, n in other.items() if n == top), "items"
         if not doms:
             doms, origin = (sorted(hinted), "hint") if hinted else ([reg.default], "default")
+        strong = strong_high_tier(psg)
         doms = [d for d in doms if not is_rejected(d, doc_id, source_id, hinted)]
-        ok = tuple(d for d in doms if is_confirmed(d, doc_id, source_id, hinted))
+        ok = tuple(d for d in doms if is_confirmed(d, doc_id, source_id, hinted, strong))
         sugg = tuple(d for d in doms if d not in ok)
+        auto = tuple(d for d in ok if d in strong and not is_confirmed(d, doc_id, source_id, hinted))
         if not ok:
             ok = tuple(sorted(hinted)) or (reg.default,)
-        res.docs[doc_id] = DocTag(source_id, ok, sugg, origin, shares, tuple(sorted(hinted)))
+        res.docs[doc_id] = DocTag(source_id, ok, sugg, origin, shares, tuple(sorted(hinted)), auto)
         for r in items:
             t = res.items[r["item_id"]]
             if not t.domains:
                 t.domains = ok
             elif r.get("kind") == "summary":
                 t.domains, t.origin = ok, "document"
-            keep = tuple(d for d in t.domains if is_confirmed(d, doc_id, source_id, hinted))
+            keep = tuple(d for d in t.domains if is_confirmed(d, doc_id, source_id, hinted, strong))
             t.suggested = tuple(d for d in t.domains if d not in keep and not is_rejected(d, doc_id, source_id, hinted))
             t.domains = keep or ok
     return res
@@ -514,6 +563,54 @@ def gate(reg, s: Settings, path: Path | None = None) -> str | None:
             or r.get("settings") != s.key():
         return "the tagger, the Domain list or the thresholds changed since the last passing `ytbrain eval tags`"
     return None
+
+
+POLICIES = ("auto", "reviewed")
+
+
+class PolicyError(ValueError):
+    """YTBRAIN_TAG_POLICY or YTBRAIN_TAG_AUTO_SHARE holds a value the tagger can't use."""
+
+
+def policy(raw: str | None = None, share: str | None = None) -> tuple[str, float]:
+    """(policy, auto share) from the arguments or the configuration; a typo is refused, never guessed, because
+    the policy decides what reaches a coach."""
+    from . import config as C
+    name = str(raw if raw is not None else C.TAG_POLICY).strip().lower() or "auto"
+    if name not in POLICIES:
+        raise PolicyError(f"YTBRAIN_TAG_POLICY={name!r} is not a policy: use auto or reviewed")
+    text = str(share if share is not None else C.TAG_AUTO_SHARE).strip()
+    try:
+        value = float(text)
+    except ValueError:
+        raise PolicyError(f"YTBRAIN_TAG_AUTO_SHARE={text!r} is not a number: use a share such as 0.5") from None
+    if not (0.0 < value <= 1.0) or math.isnan(value):
+        raise PolicyError(f"YTBRAIN_TAG_AUTO_SHARE={text!r} must be above 0 and at most 1 (a share of a Document)")
+    return name, value
+
+
+def decide(reg, s: Settings, pol: str, path: Path | None = None) -> tuple[bool, str | None]:
+    """(apply?, a note) for `tag --gated`. `auto` always applies and says when the labelled set is missing,
+    failed or out of date; `reviewed` applies only after it passed (the note is then why not)."""
+    why = gate(reg, s, path)
+    if pol == "auto":
+        return True, (None if why is None else f"applied by policy auto without a passing labelled set ({why})")
+    return why is None, why
+
+
+def apply_plan(db: TagDB, *, gated: bool, no_apply: bool, pol: str, reg, s: Settings,
+               path: Path | None = None) -> tuple[str, str | None]:
+    """What a real `tag` run does with its results: ("apply", note) puts them on the index; ("store", why)
+    keeps them for review only; ("keep", why) leaves the stored and applied tags as they are, because a run the
+    `reviewed` policy holds back must not take away tags that are already on the index."""
+    if no_apply:
+        return "store", "--no-apply"
+    if not gated:
+        return "apply", None
+    ok, note = decide(reg, s, pol, path)
+    if ok:
+        return "apply", note
+    return ("keep" if db.applied else "store"), note
 
 
 def meta_for(reg, s: Settings, embed_model: str, model: str) -> dict:

@@ -63,6 +63,15 @@ interrupted, auth, books, config); the runner acts on it:
 Every stop and every finished run sends a macOS notification and writes `data/ops/last-run.md`: what
 happened and the one command to run next.
 
+## Tagging (Domains by content)
+
+`ingest` runs `tag --gated`. Under `YTBRAIN_TAG_POLICY=auto` (the default) the tags are applied every run with no
+labelled set, so new Sources reach the right coaches with no `domains:` line; `finance` and `investment` are applied only
+where they cover half of a Document (`YTBRAIN_TAG_AUTO_SHARE`), the rest wait as suggestions. Under `reviewed` they are
+applied only after `ytbrain eval tags` passed, and a run held back keeps the tags already applied. The summary and
+`last-run.md` say what the step did ("tags applied", "held back, earlier tags kept", how many high-tier tags were
+applied from the content). A bad policy value stops the run at that step, with the reason, before anything is written.
+
 ## Public builds of the other Packs
 
 A Pack builds a public plugin only when its `builds` in `pack.toml` lists `release` (today: none of the coding and

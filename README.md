@@ -509,17 +509,28 @@ Nothing is re-extracted or re-embedded. A Source's `domains: [...]`, a Book's fo
 case or spacing, or an alias) and `books: {"X.pdf": {domains: [...]}}` are **hints**: they break ties and confirm a
 high-tier tag. A folder that is no Domain name is only noted by `sync`; its Books are tagged by what they say.
 
-The person decides what changes safety: an inferred `finance` or `investment` tag is *suggested* until confirmed
-(`ytbrain domains review`, a whole Source at once) and never reaches a pack before; a new Domain is proposed, never
+A Source needs no `domains:` line: the content decides, and every new Source, talk, page or Book reaches the coaches
+whose Packs list its Domains with no configuration. A new coach is a Pack (`packs/<id>/pack.toml`) plus its Domain in
+`domains.yaml`; the next `ytbrain ops` run retags the Library against the new list (cached, so only close calls cost).
+
+High-tier Domains (`finance`, `investment`) are held to a higher bar. Under the default policy (`YTBRAIN_TAG_POLICY=auto`)
+one is applied from the content when it covers at least half of a Document's Passages (`YTBRAIN_TAG_AUTO_SHARE`), counting
+only decided tags, never an unresolved close call; anything weaker stays *suggested* and out of every pack.
+`ytbrain domains review` lists the tags applied this way by Source (`ytbrain domains why <doc>` marks them per Document),
+and `ytbrain domains review --reject SOURCE:DOMAIN` removes one
+for good (a rejection always wins, and so does your yes). Under `reviewed`, every high-tier tag waits for your yes
+(`ytbrain domains review`, a whole Source at once) and never reaches a pack before. A new Domain is proposed, never
 created (`ytbrain domains propose` groups content no Domain fits and checks each proposal against the list: spelling,
 aliases, meaning, and the model's same/narrower/new), and its risk tier is asked
 (`ytbrain domains add legal --risk high --description "Law for founders"`, `ytbrain domains alias gtm "growth"`).
 `ytbrain domains why <doc>` shows where a Document's Domains came from.
 
-Tags reach the index only once the tagger passes its gate on your labels: `ytbrain tag --no-apply` (store for review),
-`ytbrain domains sample` (sheets of 100 items and 30 Documents), fill the `label` column, `ytbrain eval tags --items …
---documents …` (precision >= 90 %, recall >= 85 %, no high-tier label missed; `--tune --save` picks the thresholds).
-`ytbrain ops` runs `tag --gated`, which applies them only then. A Document may belong to several Domains, and
+`ytbrain ops` runs `tag --gated`. With `auto` (the default) it applies the tags every run, so ingestion is fully
+automatic; a labelled set is optional and, when you have one, only reported on. With `reviewed` the tags reach the index
+only once the tagger passes its gate on your labels: `ytbrain domains sample` (sheets of 100 items and 30 Documents),
+fill the `label` column, `ytbrain eval tags --items … --documents …` (precision >= 90 %, recall >= 85 %, no high-tier
+label missed; `--tune --save` picks the thresholds); until then a run keeps the tags already applied. A bad value in
+either setting stops the tag Step with the reason and changes nothing. A Document may belong to several Domains, and
 `coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them. The coach learns the Domains from `coach_get_context` and passes the ones a
 question touches; an automatic router exists too but is off until you have measured it on your corpus:
 `ytbrain eval route` (accuracy on single and composed questions), `ytbrain eval run --config pack-route
@@ -1222,6 +1233,7 @@ All settings are environment variables (`.env` or shell). Defaults in parenthese
 | `YTBRAIN_EVAL_GENERATOR` (`YTBRAIN_LLM_MODEL`, else `deepseek/deepseek-v4-flash`) | Writes the eval questions |
 | `YTBRAIN_EVAL_JUDGES` (`google/gemma-4-31b-it,qwen/qwen3.8-flash,mistralai/mistral-medium-3.1`) | Two judges and a tie-breaker from other model families; an unlisted model falls back to the cheapest of its family |
 | `YTBRAIN_EVAL_WORKERS` (8) · `YTBRAIN_EVAL_MAX_RPM` (60) · `YTBRAIN_EVAL_MAX_COST` (5) · `YTBRAIN_EVAL_TIMEOUT_S` (120) | Eval parallelism, the request-rate ceiling (the working rate halves on 429s and climbs back), the per-split USD spend cap, and how long one eval call may take before it's retried |
+| `YTBRAIN_TAG_POLICY` (`auto`) · `YTBRAIN_TAG_AUTO_SHARE` (`0.5`) | The tag Step: `auto` applies every run with no labelled set and applies `finance`/`investment` on a Document they cover by at least the share; `reviewed` waits for a passing `eval tags` and keeps the tags already applied |
 | `YTBRAIN_EMBED_MODEL` (`BAAI/bge-m3`) | Local embedding model for the Knowledge index; changing it rebuilds the index |
 | `YTBRAIN_RERANK_MODEL` (`BAAI/bge-reranker-v2-m3`) | Cross-encoder reranker for `search`; `none` disables |
 | `YTBRAIN_PACK_EMBED_MODEL` (`BAAI/bge-base-en-v1.5`) · `YTBRAIN_PACK_RERANK_MODEL` (`none`) | ONNX models for `pack build` (fastembed names); the pack records them, so its searches always use the same ones |
@@ -1358,7 +1370,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 456 tests (460 under `pytest tests`), no network
+for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 461 tests (465 under `pytest tests`), no network
 pytest tests/                                                                        # the same under pytest
 ```
 

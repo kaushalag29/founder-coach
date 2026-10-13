@@ -3,6 +3,21 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-13 (fully automatic tagging)
+
+- **`YTBRAIN_TAG_POLICY`, `auto` by default:** `ytbrain ops` now applies the tag Step's Domains every run with no
+  labelled set, so new YouTube, web and Book Sources reach the coaches by their content with no `domains:` line.
+  `reviewed` keeps the old gate (a passing `ytbrain eval tags` first).
+- **High-tier Domains from the content:** under `auto`, `finance` or `investment` is applied where it covers at least half
+  of a Document's Passages (`YTBRAIN_TAG_AUTO_SHARE`), counting only decided tags; weaker evidence stays a suggestion.
+  Each is recorded (`ytbrain domains why`) and counted in the ops summary; `ytbrain domains review --reject` undoes a
+  Source's, and a rejection always wins.
+- **Fix:** a `tag --gated` run that may not apply (policy `reviewed`) no longer marks the applied tags unapplied, which
+  made re-indexed Documents lose their Domains.
+- A bad policy or share stops the tag Step with the reason before anything is written. ADR-0017 amended.
+- 465 tests pass under `pytest tests` (5 new: the policy values, the apply decision, the high-tier rule, the ops
+  summary, and `ytbrain tag --gated` end to end on a real index).
+
 ## 2026-10-12 (second round: the coding and investor runs; plugins 0.1.4)
 
 - **Public builds for every Pack, switched by `builds`.** A Pack with `release` in its `builds` gets a public plugin in
