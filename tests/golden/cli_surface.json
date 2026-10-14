@@ -384,6 +384,17 @@
     ],
     "positionals": []
    },
+   "gaps": {
+    "handler": "cmd_gaps",
+    "options": [
+     "--days",
+     "--home",
+     "--json",
+     "--pack",
+     "--questions"
+    ],
+    "positionals": []
+   },
    "index": {
     "handler": "cmd_index",
     "options": [
@@ -465,6 +476,13 @@
     "options": [],
     "positionals": []
    },
+   "reselect-captions": {
+    "handler": "cmd_reselect_captions",
+    "options": [
+     "--dry-run"
+    ],
+    "positionals": []
+   },
    "run": {
     "handler": "cmd_run",
     "options": [
@@ -514,6 +532,7 @@
     "options": [
      "--backfill",
      "--force",
+     "--ignore-pause",
      "--limit",
      "--per-hour",
      "--reconcile",

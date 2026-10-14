@@ -36,9 +36,9 @@ from pathlib import Path
 from . import captions, fetch, pages, source_kinds
 from .config import (ACCEPT_MIN_RECORD_RATE, ACCEPT_MIN_SPAN_PASS_RATE,
                      ACCEPT_SAMPLE_SEED, EXTRACT_FAILURES, MANIFEST_DB, ROOT, METADATA, PAGES, RAW, REPORTS,
-                     MIN_TRANSCRIPT_WORDS, SCHEMA_VERSION, TRANSCRIPTS, YT_COOLDOWN_BASE_S, YT_COOLDOWN_MAX_S,
+                     MIN_TRANSCRIPT_WORDS, SCHEMA_VERSION, TRANSCRIPTS,
                      YT_BACKFILL_PER_HOUR, YT_BACKFILL_SLEEP_SUBTITLES, YT_ENUM_RETRIES,
-                     YT_ERROR_BACKOFF_S, YT_MAX_429_STREAK, YT_SLEEP_SUBTITLES, YT_VIDEO_RETRIES)
+                     YT_ERROR_BACKOFF_S, YT_SLEEP_SUBTITLES, YT_VIDEO_RETRIES)
 from .lock import LockBusy, exclusive
 from .manifest import Manifest, StageState
 
@@ -574,10 +574,10 @@ def cmd_discover(args) -> int:
 
 @dataclass
 class _SyncState:
-    """Shared across every video of one sync: YouTube throttles per IP, so the
-    429 streak and the stop decision span sources."""
-    streak_429: int = 0
+    """Shared across every video of one sync: YouTube throttles per IP, so one 429
+    stops YouTube for every source of the run."""
     throttled: bool = False
+    throttle_err: str = ""
     new: int = 0
     tally: dict = field(default_factory=lambda: defaultdict(int))
 
@@ -589,15 +589,12 @@ def _fetch_video(m: Manifest, row: dict, src: dict, is_fallback: bool, st: _Sync
     print(f"    {label} {row['doc_id']}  {title} ... ", end="")
     sys.stdout.flush()
 
-    # Retry THIS video with backoff before moving on. yt-dlp never
-    # retries a subtitle 429, and YouTube throttles per IP: a 429 gets
-    # an exponential cooldown (30, 60, 120, 240s), shared with the
-    # streak breaker below; other transient errors get 10, 20s.
+    # Transient errors retry THIS video after 10, 20s. An HTTP 429 is YouTube throttling
+    # this IP: asking again (this video or the next) only extends it, so the first one
+    # stops YouTube for the run and the video stays 'failed' for a later run.
     # Private/removed videos and "no captions" are final at once.
-    cooldown_after = 0
     for attempt in range(YT_VIDEO_RETRIES + 1):
         res = fetch.fetch_captions(row["doc_id"],
-                                   sub_langs=src.get("sub_langs", fetch.DEFAULT_SUB_LANGS),
                                    sleep=float(src.get("sleep_requests", 1.5)),
                                    sleep_subtitles=sub_sleep)
         ok = res["returncode"] == 0 and res["caption_path"]
@@ -616,20 +613,12 @@ def _fetch_video(m: Manifest, row: dict, src: dict, is_fallback: bool, st: _Sync
         else:
             status, err = "skipped", f"no captions ({res['caption_kind']})"
         if status != "failed":
-            st.streak_429 = 0
             break
-        rate_limited = "429" in (err or "")
-        if rate_limited:
-            st.streak_429 += 1
-            if st.streak_429 >= YT_MAX_429_STREAK:
-                st.throttled = True
-                break
-            wait = min(YT_COOLDOWN_BASE_S * 2 ** (st.streak_429 - 1), YT_COOLDOWN_MAX_S)
-        else:
-            wait = YT_ERROR_BACKOFF_S * 2 ** attempt
+        if "429" in (err or ""):
+            st.throttled, st.throttle_err = True, fetch.failure_reason(err)
+            break
+        wait = YT_ERROR_BACKOFF_S * 2 ** attempt
         if attempt == YT_VIDEO_RETRIES:
-            if rate_limited:        # still throttled: cool down before the NEXT video too
-                cooldown_after = wait
             break
         print(f"{fetch.failure_reason(err)} -- retry {attempt + 1}/{YT_VIDEO_RETRIES} "
               f"in {wait}s ... ", end="", flush=True)
@@ -660,11 +649,6 @@ def _fetch_video(m: Manifest, row: dict, src: dict, is_fallback: bool, st: _Sync
     sys.stdout.flush()
     st.tally[status if status != "skipped" or not err.startswith("unavailable") else "unavailable"] += 1
     st.new += 1
-
-    if cooldown_after and not st.throttled:
-        print(f"    rate limited -- cooling down {cooldown_after}s before the next video",
-              flush=True)
-        time.sleep(cooldown_after)
 
 
 def cmd_sync(args) -> int:
@@ -721,11 +705,23 @@ def cmd_sync(args) -> int:
 def _sync_youtube(m: Manifest, srcs: list[dict], args) -> dict:
     """The YouTube adapter's sync: enumerate playlists, fetch captions, then any video another
     Source found (a website embedding a talk) that has no caption fetch yet."""
+    from . import youtube_pause
     failed = skipped_known = 0
     st = _SyncState()
+    backfill = getattr(args, "backfill", False)
+    if not backfill and not getattr(args, "ignore_pause", False) and (p := youtube_pause.active()):
+        print(f"sync: YouTube paused {youtube_pause.describe(p)} after {p['reason']} -- skipping "
+              f"YouTube this run (websites and books still sync). `ytbrain sync --ignore-pause` "
+              f"tries now.", flush=True)
+        return {"code": 0, "paused": True}
+    if any("sub_langs" in s for s in srcs):
+        print("sync: `sub_langs` in sources.yaml is no longer used (ytbrain picks the caption track "
+              "itself); you can delete it", flush=True)
     _ytdlp_preflight()
-    if getattr(args, "backfill", False):
-        return {"code": _sync_backfill(m, srcs, st, args)}
+    if backfill:
+        code = _sync_backfill(m, srcs, st, args)
+        _settle_pause(st)
+        return {"code": code}
     sub_sleep = YT_SLEEP_SUBTITLES if getattr(args, "sleep_subtitles", None) is None \
         else args.sleep_subtitles
 
@@ -790,8 +786,9 @@ def _sync_youtube(m: Manifest, srcs: list[dict], args) -> dict:
                 print(f"    {head}: {fetched}/{to_fetch} fetched · {_dur(per)}/video · "
                       f"ETA {_dur(per * (to_fetch - fetched))}", flush=True)
             if st.throttled:
-                print(f"\nsync: {st.streak_429} rate-limit errors in a row -- YouTube is throttling "
-                      f"this IP. Stopping early; re-run later (failed videos are retried).")
+                print(f"\nsync: YouTube answered {st.throttle_err}: it is throttling this IP, and "
+                      f"more requests only extend that. Stopping YouTube for this run (the video "
+                      f"is retried later).")
                 break
 
         if args.reconcile:
@@ -812,11 +809,23 @@ def _sync_youtube(m: Manifest, srcs: list[dict], args) -> dict:
                 break
 
     print()
+    _settle_pause(st)
     t = st.tally
     print(f"sync: {st.new} attempted ({t['ok']} ok, {t['skipped']} no captions, "
           f"{t['unavailable']} unavailable, {t['failed']} failed -- retried next sync), "
           f"{skipped_known} already known, {failed} source(s) failed")
     return {"code": 1 if failed and not st.new else 0}
+
+
+def _settle_pause(st: _SyncState) -> None:
+    """A 429 pauses YouTube for later runs; captions fetched without one lift the pause."""
+    from . import youtube_pause
+    if st.throttled:
+        if p := youtube_pause.record(st.throttle_err):
+            print(f"sync: YouTube paused {youtube_pause.describe(p)}: scheduled runs leave it alone "
+                  f"until then; `ytbrain sync --ignore-pause` tries sooner.", flush=True)
+    elif st.tally["ok"] and youtube_pause.clear():
+        print("sync: captions came through, so the YouTube pause is lifted", flush=True)
 
 
 def _ytdlp_preflight() -> None:
@@ -860,8 +869,8 @@ def _sync_backfill(m: Manifest, srcs: list[dict], st: _SyncState, args) -> int:
         _fetch_video(m, row, src, bool(src.get("fallback")), st,
                      f"({i}/{len(rows)})", sub_sleep)
         if st.throttled:
-            print(f"\nsync --backfill: {st.streak_429} rate limits in a row -- stopping; "
-                  f"try again in a few hours (the rest stay queued).")
+            print(f"\nsync --backfill: YouTube answered {st.throttle_err} -- stopping; "
+                  f"the rest stay queued.")
             break
     t = st.tally
     print(f"\nsync --backfill: {st.new} retried ({t['ok']} ok, {t['skipped']} no captions, "
@@ -1042,6 +1051,46 @@ def _clean_one(m: Manifest, doc_id: str, doc) -> str:
     print(f"{sel['caption_kind']} · {len(utts)} utterances"
           + (" · transcript changed: re-extract queued" if changed else ""), flush=True)
     return "ok"
+
+
+def cmd_reselect_captions(args) -> int:
+    """Re-pick each cleaned talk's caption track by today's rule, from files on disk (no YouTube request).
+
+    `fetch.pick_track` changed on 2026-10-13: a human English track, else the auto `en-orig`, never the
+    plain auto `en` (a machine translation that rewrote what 20 speakers said). A talk whose picked
+    file is not the one its transcript was cleaned from goes back to clean; clean compares the new
+    transcript with the old one, so only a talk whose text changed is extracted, verified and
+    indexed again (`ytbrain ops` does that next). A talk whose picked file isn't on disk is left as
+    it is and listed: `ytbrain sync --force --source ID` fetches it.
+    """
+    m = Manifest(MANIFEST_DB)
+    rows = m.db.execute(
+        "SELECT d.doc_id, s.input_hash FROM documents d JOIN stage_state s ON s.doc_id=d.doc_id "
+        "AND s.stage='clean' AND s.status='ok' WHERE d.doc_type='youtube' AND d.tombstoned_at IS NULL "
+        "ORDER BY d.doc_id").fetchall()
+    changed, absent = [], []
+    for r in rows:
+        info = RAW / f"{r['doc_id']}.info.json"
+        sel = fetch.select_caption(r["doc_id"], info if info.exists() else None)
+        if not sel["caption_path"]:
+            absent.append(r["doc_id"])
+        elif fetch.file_hash(sel["caption_path"]) != r["input_hash"]:
+            changed.append((r["doc_id"], Path(sel["caption_path"]).name))
+    print(f"reselect-captions: {len(rows)} cleaned talk(s); {len(changed)} use a different caption file "
+          f"now, {len(rows) - len(changed) - len(absent)} unchanged"
+          + (f", {len(absent)} with the picked file missing on disk (left as they are)" if absent else ""))
+    for doc_id, name in changed:
+        print(f"  {doc_id}  -> {name}")
+    if absent:
+        print("  missing: " + " ".join(absent[:20]) + (" ..." if len(absent) > 20 else ""))
+    if args.dry_run or not changed:
+        if changed:
+            print("reselect-captions: dry run, nothing changed")
+        return 0
+    n = m.invalidate_docs("clean", [d for d, _ in changed], "caption track re-picked (reselect-captions)")
+    print(f"reselect-captions: {n} talk(s) sent back to clean; run `ytbrain ops ingest` (or clean, "
+          f"extract, verify, index): only a talk whose transcript changed is extracted again")
+    return 0
 
 
 def cmd_extract(args) -> int:
@@ -1902,6 +1951,18 @@ def _domains_tagging(args, reg) -> int:
         print("\n  The risk tier is your call (it decides when the coach must decline). Nothing was added.")
         return 0
     return 2
+
+
+def cmd_gaps(args) -> int:
+    """`gaps`: what the dogfooded coaches could not answer well, read (read-only) from the usage log in each
+    coach Project's store under the engine home. No coaching memory is read."""
+    from . import gaps as G
+    home = Path(args.home).expanduser() if args.home else G.engine_home()
+    days = args.days or None
+    projects = G.load(home, pack=args.pack, days=days)
+    rep = G.report(projects, home, days, questions=args.questions)
+    print(json.dumps(rep, indent=1) if args.json else G.render(rep, home), end="" if not args.json else "\n")
+    return 0
 
 
 def cmd_domains(args) -> int:
@@ -3168,7 +3229,9 @@ def main(argv=None) -> int:
             sp.add_argument("--per-hour", type=int, default=0,
                             help="--backfill pace (default 60 videos/hour)")
             sp.add_argument("--sleep-subtitles", type=float, default=None, metavar="SECONDS",
-                            help="pause before EACH subtitle file (default 10; --backfill 15)")
+                            help="pause before each subtitle file (default 10; --backfill 15)")
+            sp.add_argument("--ignore-pause", action="store_true",
+                            help="try YouTube now, even though a recent HTTP 429 paused it")
         if name == "run":
             sp.add_argument("--device", choices=["auto", "mps", "cpu", "cuda"],
                             help="PyTorch device for the index Step")
@@ -3176,6 +3239,8 @@ def main(argv=None) -> int:
                             help="parallel LLM calls in the extract stage (default: YTBRAIN_LLM_WORKERS or 1)")
     RETRY_HELP = "also retry talks parked after failing this Step repeatedly"
     add("clean", cmd_clean, "max videos to clean").add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
+    add("reselect-captions", cmd_reselect_captions).add_argument(
+        "--dry-run", action="store_true", help="list the talks it would send back to clean, change nothing")
     DOC_HELP = "only Documents whose id starts with PREFIX (repeatable); a Book's ISBN picks its Chapters"
     sp = add("extract", cmd_extract, "max videos to extract")
     sp.add_argument("--retry-failed", action="store_true", help=RETRY_HELP)
@@ -3397,6 +3462,16 @@ def main(argv=None) -> int:
     sp.add_argument("--no-notify", action="store_true", help="no macOS notifications (data/ops/last-run.md is "
                                                               "still written)")
     sp.set_defaults(func=cmd_ops)
+
+    sp = sub.add_parser("gaps", help="what the dogfooded coaches could not answer well (strong/partial/none searches "
+                                     "per coach and Domain), read from their local usage logs")
+    sp.add_argument("--pack", help="only this coach's Pack folder (founder, coding, investor)")
+    sp.add_argument("--days", type=int, default=30, help="look back this many days (default 30; 0 = all)")
+    sp.add_argument("--questions", type=int, default=15, metavar="N",
+                    help="list up to N weak questions per Project, when their text was recorded (default 15)")
+    sp.add_argument("--home", metavar="DIR", help="the engine home (default ~/.ytbrain, or YTBRAIN_HOME)")
+    sp.add_argument("--json", action="store_true", help="the report as JSON")
+    sp.set_defaults(func=cmd_gaps)
 
     sp = sub.add_parser("domains", help="the Library's Domains (domains.yaml): list, add one, or ignore a sorting folder")
     sp.set_defaults(func=cmd_domains, limit=0, workers=0, domains_cmd="list")

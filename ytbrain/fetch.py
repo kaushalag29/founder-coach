@@ -166,62 +166,105 @@ def failure_reason(stderr: str | None) -> str:
     return re.sub(r"^ERROR: (\[\w+\] \S+: )?", "", lines[-1])[:80] if lines else "unknown error"
 
 
-# Exact English tracks only. The old default `en.*` also matched YouTube's
-# machine-TRANSLATED tracks (en-en, en-tr-<id>, en-ar-<id> ...): extra requests
-# per video, redundant text, and a 429 on any one of them failed the whole video.
-DEFAULT_SUB_LANGS = "en,en-orig,en-US,en-GB"
+# --- which caption track: pick first, then fetch exactly one -----------------
+# Measured on this Library (2026-10-13, 740 talks with both files on disk): YouTube serves the plain
+# auto `en` track through its translation endpoint (`tlang`), even for English speech. That is the
+# request YouTube throttles with HTTP 429 (yt-dlp issue #13831), and on 20 of those talks it rewrote
+# what the speaker said. `en-orig` is the speech as recognised, and it exists only when the audio is
+# English (a French talk has `fr-orig`), so no language field or detector is needed: the uploader's
+# `language` was missing on 20 English talks and wrong on 2. A human English track wins over both.
+AUTO_TRACK = "en-orig"
 
 
-def fetch_captions(doc_id: str, sub_langs: str = DEFAULT_SUB_LANGS, sleep: float = 1.5,
+def is_english(code: str | None) -> bool:
+    """`en`, `en-US`, `en_GB`, `en-<track id>`: the primary subtag is exactly `en` (`enm`, Middle
+    English, is not English for us)."""
+    return bool(code) and re.split(r"[-_]", code.lower(), maxsplit=1)[0] == "en"
+
+
+def pick_track(info: dict) -> tuple[str, str] | None:
+    """(kind, lang) of the one caption track to use: a human English track (plain `en` first, then the
+    shortest code), else the auto `en-orig`, else None. Never a machine translation."""
+    human = sorted((k for k in (info.get("subtitles") or {}) if is_english(k)),
+                   key=lambda k: (k != "en", len(k), k))
+    if human:
+        return "human", human[0]
+    if AUTO_TRACK in (info.get("automatic_captions") or {}):
+        return "auto", AUTO_TRACK
+    return None
+
+
+def fetch_captions(doc_id: str, sleep: float = 1.5,
                    sleep_subtitles: float = YT_SLEEP_SUBTITLES) -> dict:
-    """Pull captions + info.json for one video. No video, no audio.
+    """Pull info.json, pick the track, then download only that track. No video, no audio.
 
-    Both --write-subs (human) and --write-auto-subs (machine) are requested in
-    one pass because yt-dlp has no flag expressing "prefer human, fall back to
-    auto" (open request: yt-dlp issue #9371). The preference is applied
-    afterwards by reading info.json - see `select_caption`.
+    Call 1 extracts the page and writes info.json, with no subtitle request. Call 2 downloads the
+    chosen track from that info.json (`--load-info-json`: no second page fetch). So a talk costs one
+    page fetch and at most one subtitle request, and a talk with no English track costs none. If
+    call 2 fails for a reason other than HTTP 429, or exits cleanly without writing the track (say, a
+    yt-dlp release that can't load the file), it is tried once more as a single call that extracts
+    again. A 429 is returned as it is: sync stops YouTube for the run rather than ask again.
     """
-    args = [
-        YTDLP, "--skip-download", "--no-warnings",
-        "--write-info-json", "--write-subs", "--write-auto-subs",
-        "--sub-langs", sub_langs, "--sub-format", SUB_FORMAT,
-        # No --download-archive: resume is the manifest's job. An archive hit
-        # makes yt-dlp exit 0 with no files, which would read as "no captions"
-        # and be settled for good. --no-continue: never append to a .part left
-        # by an interrupted run; always download the subtitle afresh.
-        "--no-continue",
-        "--sleep-requests", str(sleep), "--sleep-subtitles", str(sleep_subtitles),
-        *YTDLP_RETRY_ARGS, *ytdlp_common_args(),
-        "-o", str(RAW / "%(id)s.%(ext)s"),
-        f"https://www.youtube.com/watch?v={doc_id}",
-    ]
+    url = f"https://www.youtube.com/watch?v={doc_id}"
+    info_path = RAW / f"{doc_id}.info.json"
+    base = [YTDLP, "--skip-download", "--no-warnings",
+            # --no-continue: never append to a .part left by an interrupted run. No
+            # --download-archive: resume is the manifest's job (an archive hit exits 0 with no files).
+            "--no-continue", "--sleep-requests", str(sleep),
+            *YTDLP_RETRY_ARGS, *ytdlp_common_args(), "-o", str(RAW / "%(id)s.%(ext)s")]
+    proc = _call([*base, "--write-info-json", url])
+    pick = None
+    if proc.returncode == 0:
+        try:
+            pick = pick_track(json.loads(info_path.read_text()))
+        except (OSError, json.JSONDecodeError):
+            # yt-dlp said ok but left no readable info.json: not evidence of "no captions"
+            return _fetched(doc_id, proc, info_path, None, "missing_file")
+    if proc.returncode != 0 or pick is None:
+        return _fetched(doc_id, proc, info_path, None, "none")
+    kind, lang = pick
+    subs = ["--write-subs" if kind == "human" else "--write-auto-subs",
+            "--sub-langs", re.escape(lang), "--sub-format", SUB_FORMAT,
+            "--sleep-subtitles", str(sleep_subtitles)]
+    proc = _call([*base, "--load-info-json", str(info_path), *subs])
+    if (proc.returncode == 0 and _caption_file(doc_id, lang) is None) or (
+            proc.returncode != 0 and "429" not in (proc.stderr or "") and not permanent_failure(proc.stderr)):
+        proc = _call([*base, "--write-info-json", *subs, url])
+    return _fetched(doc_id, proc, info_path, pick, "missing_file")
+
+
+def _call(args: list[str]) -> subprocess.CompletedProcess:
     try:
-        proc = _run(args)
+        return _run(args)
     except subprocess.TimeoutExpired as e:
         # yt-dlp's own retry sleeps under throttling can outlast the timeout: treat it as a
         # transient failure (retried next sync), never as a crash of the whole sync
-        proc = subprocess.CompletedProcess(args, 124, "", f"ERROR: yt-dlp timed out after {e.timeout:.0f}s")
-    info_path = RAW / f"{doc_id}.info.json"
-    selection = select_caption(doc_id, info_path if info_path.exists() else None)
+        return subprocess.CompletedProcess(args, 124, "", f"ERROR: yt-dlp timed out after {e.timeout:.0f}s")
+
+
+def _fetched(doc_id: str, proc: subprocess.CompletedProcess, info_path: Path,
+             pick: tuple[str, str] | None, absent: str) -> dict:
+    """The result sync records. `absent` is the caption_kind when no file is on disk: "none" (no
+    English track: settled) or "missing_file" (a track was picked but not written: retried)."""
+    path = _caption_file(doc_id, pick[1]) if pick and proc.returncode == 0 else None
     return {
         "doc_id": doc_id,
         "returncode": proc.returncode,
-        "stderr_tail": proc.stderr[-500:] if proc.returncode else "",
+        "stderr_tail": (proc.stderr or "")[-500:] if proc.returncode else "",
         "info_path": str(info_path) if info_path.exists() else None,
-        **selection,
+        "caption_path": str(path) if path else None,
+        "caption_kind": pick[0] if path else absent,
+        "caption_lang": pick[1] if path else None,
     }
 
 
 def select_caption(doc_id: str, info_path: Path | str | None) -> dict:
-    """Choose the caption file, preferring a human track over a machine one.
+    """The caption file on disk for this Document, by the same rule sync fetched it with
+    (`pick_track`): a human English track, else the auto `en-orig`. Decided from info.json, never
+    from filenames (yt-dlp writes a human and an auto track of one language to the same name).
 
-    This CANNOT be done from filenames: yt-dlp writes both human and automatic
-    English tracks as `<id>.en.srt`, so a glob-and-sort picks arbitrarily. The
-    authoritative signal is info.json, where human tracks are listed under
-    `subtitles` and machine ones under `automatic_captions`; both keys can be
-    populated for the same video.
-
-    Returns {caption_path, caption_kind, caption_lang}.
+    Returns {caption_path, caption_kind, caption_lang}; caption_kind is "none" when the talk has no
+    English track and "missing_file" when its track is listed but the file is not on disk.
     """
     none_result = {"caption_path": None, "caption_kind": "none", "caption_lang": None}
     if not info_path or not Path(info_path).exists():
@@ -230,24 +273,15 @@ def select_caption(doc_id: str, info_path: Path | str | None) -> dict:
         info = json.loads(Path(info_path).read_text())
     except (json.JSONDecodeError, OSError):
         return none_result
-
-    for key, kind in (("subtitles", "human"), ("automatic_captions", "auto")):
-        langs = info.get(key) or {}
-        for lang in _english_langs(langs):
-            path = _caption_file(doc_id, lang)
-            if path:
-                return {"caption_path": str(path), "caption_kind": kind, "caption_lang": lang}
-    # The track is advertised but the file is absent (PO-token failures can
-    # produce this silently). Report it rather than pretending we have captions.
-    advertised = bool(_english_langs(info.get("subtitles") or {})
-                      or _english_langs(info.get("automatic_captions") or {}))
-    return {**none_result, "caption_kind": "missing_file" if advertised else "none"}
-
-
-def _english_langs(langs: dict) -> list[str]:
-    """English variants, plain `en` first so it wins over `en-US`/`en-orig`."""
-    found = [k for k in langs if k == "en" or k.startswith("en-") or k.startswith("en.")]
-    return sorted(found, key=lambda k: (k != "en", len(k), k))
+    pick = pick_track(info)
+    if pick is None:
+        return none_result
+    path = _caption_file(doc_id, pick[1])
+    if path is None:
+        # listed but absent (a PO-token failure or a dropped download can do this silently):
+        # report it rather than pretend the talk has no captions
+        return {**none_result, "caption_kind": "missing_file"}
+    return {"caption_path": str(path), "caption_kind": pick[0], "caption_lang": pick[1]}
 
 
 def _caption_file(doc_id: str, lang: str) -> Path | None:

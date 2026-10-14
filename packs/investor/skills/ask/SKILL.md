@@ -31,7 +31,7 @@ Follow the coaching contract of the coach skill throughout: every claim cited, n
 **<Part 2>**: …
 
 **Your policy:** what their own Investment Policy Statement says about it, or that it doesn't say yet.
-**Not covered here:** declined parts with the referral, and Gaps.
+**Not covered here:** only when a part was declined or the sources don't cover it: the declined parts with the referral, and the Gaps. Leave it out otherwise.
 **More of your questions:** only when step 3 held asks back.
 This is education, not advice on any security.
 ```

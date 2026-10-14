@@ -54,7 +54,7 @@ using Cowork instead: [Use the coach](#use-the-coach-claude-code-and-cowork).
 git clone git@github.com:kaushalag29/founder-coach.git && cd founder-coach
 uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e ".[serve,pack,dev,web]" "lancedb>=0.39.0"   # as CI; everything: ".[extract,index,graph,serve,asr,eval,pack,dev,pot,web]"
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
+for s in core eval pack coach projects invest plugin web books gaps; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # offline, a few minutes
 ```
 
 Building the corpus needs an LLM key and YouTube access ([Install from scratch](#install-from-scratch)).
@@ -171,9 +171,11 @@ were a provider stuck in a loop, now retried on a different provider (see
 `BAAI/bge-m3` runs on the Apple GPU (`mps`) at about 5 s per talk. The two local models
 (embedding + reranker) are ~2.3 GB each, downloaded once to `~/.cache/huggingface`.
 
-**YouTube** rate-limits anonymous caption downloads per IP. Our full sync lost about 50
-talks to HTTP 429. With Deno, `yt-dlp-ejs` and a PO-token server, `sync --backfill` could
-fetch some of them, but rapid restarts triggered 429s again.
+**YouTube** rate-limits anonymous caption downloads per IP. Until 2026-10-13 most of our
+429s came from our own requests: sync also asked for the plain auto `en` track, which YouTube
+serves through its translation endpoint (the one it throttles). Since then ytbrain reads each
+talk's info first and downloads one track, `en-orig` or a human English track, so a talk costs
+one page fetch and one subtitle request ([Caption tracks](#caption-tracks)).
 
 Prices and free-tier limits are as of September 2026 — check your provider.
 
@@ -183,8 +185,9 @@ Prices and free-tier limits are as of September 2026 — check your provider.
   git-ignored on purpose: use it as ingestion material, and publish only what you derive
   (summaries, taxonomy, advice) with links back to the original video. Respect the
   YouTube Terms of Service and the uploader's rights.
-- **Be gentle with YouTube.** ytbrain spaces requests (`sleep_requests`), backs off on
-  rate limits and stops when throttled. Don't lower those defaults to go faster.
+- **Be gentle with YouTube.** ytbrain spaces requests (`sleep_requests`), asks for one
+  caption track per talk, stops YouTube for the run at the first HTTP 429 and then leaves it
+  alone for a day (the YouTube pause). Don't lower those defaults to go faster.
 - **No IP rotation.** Rotating proxies to get around YouTube's rate limits is
   circumvention, which its terms prohibit. ytbrain only passes one proxy through
   (`YTBRAIN_YTDLP_PROXY`, e.g. a company network). The supported answer to 429s is
@@ -240,7 +243,7 @@ cp .env.example .env          # then fill in, see "Configure an LLM backend"
 
 # 6. Check it works
 ytbrain --help
-for s in core eval pack coach projects invest plugin web books; do python tests/test_$s.py || break; done   # no network needed
+for s in core eval pack coach projects invest plugin web books gaps; do python tests/test_$s.py || break; done   # no network needed
 ```
 
 Every new terminal needs `source .venv/bin/activate` before `ytbrain` is on your PATH.
@@ -565,8 +568,6 @@ with your own key.
 
 ```yaml
 defaults:                      # applied to every source unless the source overrides it
-  sub_langs: en,en-orig,en-US,en-GB   # exact English tracks (en.* also pulls machine translations)
-  sub_format: srt/best
   sleep_requests: 5            # seconds between yt-dlp requests; 5+ avoids most YouTube 429s
 sources:
 - id: startup_school_2026      # stable slug, unique
@@ -749,7 +750,7 @@ only the talks whose records changed.
 |---|---|---|
 | `ops [ingest\|eval\|plugin]` | The whole loop in one resumable, change-detecting command: ingest, then eval when the index changed, then the plugin when it passed; asks the plugin version, handles retries and stop reasons, notifies ([docs/ops.md](docs/ops.md)) | `--dry-run`, `--max-cost`, `--max-extract`, `--no-sync`, `--coach` (the coach eval, before a release), `--restart`, `--force`, `--version patch\|minor\|skip`, `--no-notify` |
 | `discover` | Build/extend `sources.yaml` | `--method ytdlp\|api`, `--channel` |
-| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--strict-domains` (exit 1 on a Book folder that is not a Domain), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S` |
+| `sync` | List playlists and download captions + `info.json` (no video); crawl websites | `--type website\|youtube\|book`, `--source ID`, `--limit N` (per Source), `--strict-domains` (exit 1 on a Book folder that is not a Domain), `--force` (re-fetch), `--reconcile` (mark removed videos), `--backfill` (slowly retry rate-limited videos only), `--per-hour N`, `--sleep-subtitles S`, `--ignore-pause` (try YouTube during the YouTube pause) |
 | `clean` | Caption file → deduplicated, ~10–25 s timestamped utterances; web page → numbered paragraphs | `--limit N`, `--retry-failed` |
 | `extract` | One LLM call per Document → structured record | `--limit N`, `--workers N`, `--retry-failed`, `--doc PREFIX` (e.g. a Book's ISBN) |
 | `verify` | Locate every evidence quote in the transcript; write pages | `--limit N`, `--retry-failed`, `--doc PREFIX` |
@@ -937,6 +938,7 @@ founder-coach restore [LABEL]                # restore a backup (default: newest
 founder-coach feedback list|export [--out D] # the Founder's Feedback; export writes only that, to send
 founder-coach usage summary|export|clear     # the local usage log (docs/usage-log.md); clear needs --yes
 founder-coach usage summary --days 30 --json # a window, as JSON; forget --no-backup also deletes the backups
+ytbrain gaps [--pack founder|coding|investor] [--days 30] [--json]   # strong/partial/none searches per coach and Domain, from the usage logs
 ```
 
 - **9 MCP tools, in this order:**
@@ -992,7 +994,7 @@ founder-coach usage summary --days 30 --json # a window, as JSON; forget --no-ba
 
 | Stage | Output |
 |---|---|
-| sync | `data/raw/<id>.info.json`, `data/raw/<id>.en.srt` (+ `en-orig` etc.) |
+| sync | `data/raw/<id>.info.json`, `data/raw/<id>.<track>.srt` (one track: `en-orig` or a human `en*`) |
 | clean | `data/transcripts/<id>.json` |
 | extract | `data/metadata/<id>.json` |
 | extract (failures) | `data/reports/extract-failures/<id>.json` — the call log of a video extract gave up on; removed once it succeeds |
@@ -1073,10 +1075,7 @@ YTBRAIN_LLM_MODEL=<model-a> ytbrain extract --limit 5 && ytbrain verify && ytbra
     5–8 requests, so this caps you at roughly 720 requests an hour, under the guest
     limit of about 1 000.
   - The subtitle pause (`YTBRAIN_YT_SLEEP_SUBTITLES`, default 10 s; `--sleep-subtitles`)
-    is an extra wait before each caption file. A video usually has two (`en` +
-    `en-orig`).
-  - yt-dlp issue #13831 reports 60 s ending auto-caption 429s, but without a JavaScript
-    runtime or PO tokens. With both, 10–15 s has been enough. Raise it if 429s come back.
+    is an extra wait before the caption file. A talk has one (see below).
 - **`ytbrain sync --backfill`** retries only videos whose caption fetch failed for a
   reason a retry can fix, such as HTTP 429.
   - It doesn't list playlists, pauses 15 s before each subtitle file, and paces itself
@@ -1085,14 +1084,42 @@ YTBRAIN_LLM_MODEL=<model-a> ytbrain extract --limit 5 && ytbrain verify && ytbra
     YouTube keeps refusing.
 - yt-dlp itself retries 5xx and connection errors, with exponential sleeps configured by
   ytbrain (`--retry-sleep http:exp=2:60`, `extractor:exp=5:120`).
-- yt-dlp does **not** retry a caption HTTP 429, so ytbrain does: cooldown 30 → 60 → 120 →
-  240 s and retry the same video (up to `YTBRAIN_YT_VIDEO_RETRIES`, default 2). Other
-  transient errors: 10 s, 20 s.
-- **5 rate limits in a row stop the sync** — the IP is throttled and more requests only
-  extend it. Wait an hour or two and run again.
+- **The first HTTP 429 stops YouTube for the run.** It means YouTube is throttling this IP, and
+  every further request (a retry, the next video) only extends that. The video stays *failed*
+  and is fetched by a later run. Other transient errors retry the same video after 10 s and
+  20 s (up to `YTBRAIN_YT_VIDEO_RETRIES`, default 2).
+- **The YouTube pause:** after a 429, later syncs (and `ytbrain ops`) skip YouTube for 24 h
+  (`YTBRAIN_YT_PAUSE_HOURS`; `0` turns it off), doubling if the first run after a pause gets
+  another 429, up to 7 days. Websites and Books still sync, and the ops summary says when
+  YouTube is tried again. A run that fetches captions without a 429 lifts it.
+  `ytbrain sync --ignore-pause` (or `--backfill`) tries now. The state is
+  `data/ops/youtube-pause.json`.
 - Private, removed and members-only videos are recorded as *unavailable* and never
   retried; videos without English captions as *no captions*.
 - Playlist listing is retried after 30 s and 60 s.
+
+#### Caption tracks
+
+Sync reads a talk's `info.json` first (no subtitle request), picks one track, then downloads
+only that one from the saved info (`yt-dlp --load-info-json`, no second page fetch):
+
+1. a human English track (`en` first, then `en-US`, `en-GB` …);
+2. else the auto `en-orig`: the speech as YouTube recognised it. It exists only when the audio
+   is English (a French talk has `fr-orig`), so ytbrain needs no language field or detector;
+3. else nothing: the talk is recorded as *no captions*, with no subtitle request made.
+
+ytbrain never asks for the plain auto `en` track. YouTube makes it with its translation
+endpoint, even from English speech: that request is the one it throttles (yt-dlp
+issue #13831), and on 20 of our 740 talks it rewrote what the speaker said ("the best tool that
+you've got" became "the best tool you have"). The uploader's `language` field isn't used: it
+was missing on 20 English talks and wrong on 2. If the saved info can't be loaded (say, after
+a yt-dlp update), the track is fetched once more with a single full call; a 429 is never
+retried. `sub_langs` and `sub_format` in `sources.yaml` are no longer read.
+
+Talks fetched before 2026-10-13 were cleaned from whichever file the old rule picked.
+`ytbrain reselect-captions --dry-run` lists the ones whose file the rule now changes, from
+files already on disk (no YouTube request); without `--dry-run` it sends them back to clean,
+and the next `ytbrain ops` re-extracts only those whose transcript changed.
 - **Proxy (optional):** `YTBRAIN_YTDLP_PROXY` is passed to yt-dlp's `--proxy`, for
   example behind a company network. ytbrain adds no IP rotation of its own. Rotating IPs
   to get around YouTube's rate limits is circumvention, which YouTube's terms prohibit.
@@ -1225,8 +1252,9 @@ All settings are environment variables (`.env` or shell). Defaults in parenthese
 | `YTBRAIN_LLM_PREFLIGHT_S` (20) | Timeout per try of the start-up "model responds?" check |
 | `YTBRAIN_SINGLE_CALL_MAX_TOKENS` (20000) | Transcripts larger than this are extracted in ~8k-token windows; raise it (e.g. 60000) for long-context hosted models |
 | `YTBRAIN_EXTRACT_VIDEO_RETRIES` (2) | Whole-video retries in extract |
-| `YTBRAIN_YT_VIDEO_RETRIES` (2) | Same-video retries in sync |
-| `YTBRAIN_YT_SLEEP_SUBTITLES` (10) | Seconds yt-dlp waits before each subtitle file (`--backfill` uses at least 15) |
+| `YTBRAIN_YT_VIDEO_RETRIES` (2) | Same-video retries in sync, for errors other than HTTP 429 |
+| `YTBRAIN_YT_PAUSE_HOURS` (24) | After an HTTP 429, how long later runs leave YouTube alone (doubles after a pause, up to 168; `0` = off) |
+| `YTBRAIN_YT_SLEEP_SUBTITLES` (10) | Seconds yt-dlp waits before the subtitle file (`--backfill` uses at least 15) |
 | `YTBRAIN_YTDLP_PROXY` (none) | Passed to yt-dlp `--proxy`; credentials are never printed |
 | `YTBRAIN_POT_PROVIDER_URL` (`http://127.0.0.1:4416`) | Where the optional bgutil PO-token server listens |
 | `YTBRAIN_POT_SCRIPT_HOME` (`~/bgutil-ytdlp-pot-provider/server`) | bgutil checkout for script mode (no server) |
@@ -1255,7 +1283,7 @@ length) are documented in `ytbrain/config.py`.
 | Symptom | Cause / fix |
 |---|---|
 | `ytbrain: command not found` | Activate the venv: `source .venv/bin/activate` |
-| `HTTP Error 429: Too Many Requests` in sync | YouTube is rate-limiting your IP. First fix any `WARNING` lines `sync` prints (missing yt-dlp-ejs, JavaScript runtime or PO-token server). Keep `sleep_requests` ≥ 5. If sync stops after 5 in a row, wait 1–2 h, then run `caffeinate -i ytbrain sync --backfill` |
+| `HTTP Error 429: Too Many Requests` in sync | YouTube is rate-limiting your IP: sync stops YouTube at the first one and pauses it for 24 h (the ops summary says until when). First fix any `WARNING` lines `sync` prints (missing yt-dlp-ejs or JavaScript runtime). Keep `sleep_requests` ≥ 5. After the pause, or with `ytbrain sync --ignore-pause`, `caffeinate -i ytbrain sync --backfill` retries the failed talks slowly |
 | `Sign in to confirm you're not a bot` / PO-token errors | YouTube anti-bot checks. `uv pip install -U yt-dlp`, run from a home connection; see the [yt-dlp wiki](https://github.com/yt-dlp/yt-dlp/wiki/Extractors) |
 | `UNAVAILABLE (private video)` | The playlist lists a private/removed video; nothing to do |
 | `Tunnel connection failed: 403` | You are behind a proxy/sandbox that blocks YouTube; run on your own machine |
@@ -1370,7 +1398,7 @@ Decisions worth knowing:
 ## Tests and CI
 
 ```bash
-for s in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 461 tests (465 under `pytest tests`), no network
+for s in core eval pack coach projects invest plugin web books gaps; do YTBRAIN_DOTENV=0 python tests/test_$s.py || break; done   # 472 tests (476 under `pytest tests`), no network
 pytest tests/                                                                        # the same under pytest
 ```
 
@@ -1385,6 +1413,7 @@ pytest tests/                                                                   
 | `test_plugin.py` | manifest, skills and their invocation, the assembler (template filling, atomic swap, `--check`), the product id living only in `product.toml`, releases (tags, version checks, renames) |
 | `test_books.py` | PDF Books on synthetic text and fixture PDFs only: probe, ligature repair, metadata, Chapters, ids and resume, private visibility, the sample sheet, folders found recursively |
 | `test_web.py` | website Sources against the acceptance criteria in docs/web-sources-plan.md: config, ids, scope and depth, robots.txt, page types, rendering, retries and host pausing, conditional re-checks, aliases, resume, articles through clean → extract → verify → items → pages, the CLI over a localhost server |
+| `test_gaps.py` | `ytbrain gaps`: strong/partial/none searches per level and Domain, question text listed only when recorded (else how to turn it on), a read that leaves the store byte-identical and touches only the usage table, the window and Pack filter, a store without a usage log, the command's text and JSON, and the per-Domain fields on a search's usage row |
 
 The tests use fakes (a hashing embedder, stubbed yt-dlp and LLM calls), so they need no keys,
 models or YouTube access, and they are hermetic: every suite sets `YTBRAIN_DOTENV=0` (your `.env`

@@ -472,7 +472,10 @@ def _usage_detail(tool: str, args: dict, sc: dict, text: bool) -> tuple[str, dic
              "query_chars": len(q), "top_k": args.get("top_k"),
              "filters": [f for f in ("kinds", "topics", "stage", "domains") if args.get(f)],
              "routing": sc.get("routing"), "domains_searched": sc.get("domains_searched"),
-             "coverage": sc.get("coverage")}
+             "coverage": sc.get("coverage"),
+             # which Domain was thin, and how soft the border was: what a Gap report groups by (no words)
+             "coverage_by_domain": sc.get("coverage_by_domain"), "basis": sc.get("coverage_basis"),
+             "stale": sc.get("stale_domains")}
         if text:
             d["query"] = q[:500]
         outcome = "empty" if not hits else "gap" if sc.get("gap_suspected") else "ok"

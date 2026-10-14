@@ -148,10 +148,17 @@ def test_human_captions_win_over_auto():
     assert sel["caption_kind"] == "human"
 
 
-def test_falls_back_to_auto_when_no_human_track():
+def test_falls_back_to_the_auto_en_orig_track_never_the_plain_auto_en():
+    """The plain auto `en` is a machine translation (it rewrote 20 talks); `en-orig` is the speech."""
     (RAW / "a1.en.srt").write_text(SRT)
-    p = _write_info("a1", {"subtitles": {}, "automatic_captions": {"en": [{}]}})
-    assert fetch.select_caption("a1", p)["caption_kind"] == "auto"
+    (RAW / "a1.en-orig.srt").write_text(SRT)
+    p = _write_info("a1", {"subtitles": {}, "automatic_captions": {"en": [{}], "en-orig": [{}]}})
+    sel = fetch.select_caption("a1", p)
+    assert (sel["caption_kind"], sel["caption_lang"]) == ("auto", "en-orig")
+    assert sel["caption_path"].endswith("a1.en-orig.srt")
+    (RAW / "a2.en.srt").write_text(SRT)                 # only the translated track: not English speech we can use
+    p = _write_info("a2", {"automatic_captions": {"en": [{}], "fr-orig": [{}]}})
+    assert fetch.select_caption("a2", p) == {"caption_path": None, "caption_kind": "none", "caption_lang": None}
 
 
 def test_advertised_but_missing_file_is_reported_not_silent():
@@ -159,8 +166,26 @@ def test_advertised_but_missing_file_is_reported_not_silent():
     assert fetch.select_caption("m1", p)["caption_kind"] == "missing_file"
 
 
-def test_plain_en_preferred_over_regional_variants():
-    assert fetch._english_langs({"en-US": [], "en": [], "en-orig": []})[0] == "en"
+def test_plain_en_preferred_over_regional_and_named_human_tracks():
+    assert fetch.pick_track({"subtitles": {"en-US": [], "en-TW7qhz_uLiI": [], "en": []}}) == ("human", "en")
+    assert fetch.pick_track({"subtitles": {"en-TW7qhz_uLiI": [], "en-US": []}}) == ("human", "en-US")
+
+
+def test_a_language_code_is_english_only_when_its_primary_subtag_is_en():
+    for code in ("en", "EN", "en-US", "en_GB", "en-orig", "en-TW7qhz_uLiI"):
+        assert fetch.is_english(code), code
+    for code in ("enm", "es", "fr-FR", "", None):
+        assert not fetch.is_english(code), code
+
+
+def test_the_track_is_picked_from_what_exists_never_a_translation_or_the_language_label():
+    pick = fetch.pick_track
+    assert pick({"subtitles": {"en": []}, "automatic_captions": {"en-orig": []}}) == ("human", "en")
+    assert pick({"automatic_captions": {"en-orig": [], "fr-FR-orig": [], "en": []}}) == ("auto", "en-orig")
+    assert pick({"language": "en-US", "automatic_captions": {"en": [], "en-en": [], "pt-orig": []}}) is None
+    assert pick({"language": "pt", "automatic_captions": {"en-orig": []}}) == ("auto", "en-orig")  # a wrong label
+    assert pick({"subtitles": {"fr": []}, "automatic_captions": {"fr-orig": []}}) is None
+    assert pick({}) is None
 
 
 def test_private_video_is_permanent_but_rate_limit_is_not():
@@ -233,12 +258,226 @@ def test_sync_backfill_retries_only_retryable_failures_slowly():
         cli.fetch.fetch_captions, cli.time.sleep, cli._enabled_sources, cli.SOURCES = orig
 
 
-def test_default_sub_langs_exclude_machine_translations():
-    import re
-    pats = fetch.DEFAULT_SUB_LANGS.split(",")
-    want = lambda k: any(re.fullmatch(p, k, re.I) for p in pats)
-    assert all(want(k) for k in ("en", "en-orig", "en-US", "en-GB"))
-    assert not any(want(k) for k in ("en-en", "en-tr-TW7qhz_uLiI", "en-en-US", "fr"))
+class _FakeYtdlp:
+    """Stands in for yt-dlp: call 1 writes info.json, a subtitle call writes the requested track, and
+    `answers` scripts each call's (returncode, stderr)."""
+
+    def __init__(self, doc_id, info, answers=()):
+        self.doc_id, self.info, self.answers, self.calls = doc_id, info, list(answers), []
+
+    def __call__(self, args, timeout=900):
+        import re
+        import subprocess
+        self.calls.append(args)
+        code, err = self.answers.pop(0) if self.answers else (0, "")
+        if code == 0:
+            if "--write-info-json" in args:
+                (RAW / f"{self.doc_id}.info.json").write_text(json.dumps(self.info))
+            if "--sub-langs" in args:
+                lang = re.sub(r"\\(.)", r"\1", args[args.index("--sub-langs") + 1])
+                (RAW / f"{self.doc_id}.{lang}.srt").write_text(SRT)
+        return subprocess.CompletedProcess(args, code, "", err)
+
+
+def test_fetch_reads_the_info_first_then_downloads_only_the_picked_track():
+    from unittest import mock
+    y = _FakeYtdlp("pf1", {"automatic_captions": {"en": [{}], "en-orig": [{}]}})
+    with mock.patch.object(fetch, "_run", y):
+        res = fetch.fetch_captions("pf1", sleep_subtitles=0)
+    first, second = y.calls
+    assert "--write-info-json" in first and "--sub-langs" not in first          # no subtitle request
+    assert not any(a.startswith("--write-") and "sub" in a for a in first)
+    assert "--load-info-json" in second and not any(a.startswith("https://") for a in second)   # no page fetch
+    assert second[second.index("--sub-langs") + 1] == "en\\-orig" and "--write-auto-subs" in second
+    assert "--write-subs" not in second
+    assert (res["returncode"], res["caption_kind"], res["caption_lang"]) == (0, "auto", "en-orig")
+    assert not (RAW / "pf1.en.srt").exists()                                     # the translation never asked for
+
+    y = _FakeYtdlp("pf2", {"subtitles": {"en-US": [{}]}, "automatic_captions": {"en-orig": [{}]}})
+    with mock.patch.object(fetch, "_run", y):
+        res = fetch.fetch_captions("pf2")
+    assert "--write-subs" in y.calls[1] and "--write-auto-subs" not in y.calls[1]
+    assert (res["caption_kind"], res["caption_lang"]) == ("human", "en-US")
+
+
+def test_a_talk_with_no_english_track_costs_one_request_and_settles_as_no_captions():
+    from unittest import mock
+    y = _FakeYtdlp("pf3", {"language": "fr", "automatic_captions": {"fr-orig": [{}], "en": [{}]}})
+    with mock.patch.object(fetch, "_run", y):
+        res = fetch.fetch_captions("pf3")
+    assert len(y.calls) == 1 and res["returncode"] == 0 and res["caption_kind"] == "none"
+
+
+def test_a_429_on_the_subtitle_is_returned_without_asking_again():
+    from unittest import mock
+    rl = "ERROR: Unable to download video subtitles for 'en-orig': HTTP Error 429: Too Many Requests"
+    y = _FakeYtdlp("pf4", {"automatic_captions": {"en-orig": [{}]}}, answers=[(0, ""), (1, rl)])
+    with mock.patch.object(fetch, "_run", y):
+        res = fetch.fetch_captions("pf4")
+    assert len(y.calls) == 2 and res["returncode"] == 1 and "429" in res["stderr_tail"]
+    assert res["caption_path"] is None
+
+
+def test_a_saved_info_that_yt_dlp_cannot_load_falls_back_to_one_full_call():
+    from unittest import mock
+    y = _FakeYtdlp("pf5", {"automatic_captions": {"en-orig": [{}]}},
+                   answers=[(0, ""), (1, "ERROR: unable to load info json: unsupported version")])
+    with mock.patch.object(fetch, "_run", y):
+        res = fetch.fetch_captions("pf5")
+    assert len(y.calls) == 3
+    third = y.calls[2]
+    assert "https://www.youtube.com/watch?v=pf5" in third and "--load-info-json" not in third
+    assert third[third.index("--sub-langs") + 1] == "en\\-orig"
+    assert (res["returncode"], res["caption_kind"]) == (0, "auto")
+
+
+def test_a_saved_info_load_that_writes_no_track_falls_back_too():
+    """yt-dlp exiting 0 without the file would otherwise leave every talk 'failed' for good."""
+    import subprocess
+    from unittest import mock
+    y = _FakeYtdlp("pf7", {"automatic_captions": {"en-orig": [{}]}})
+    def quiet_load(args, timeout=900):
+        if "--load-info-json" in args:
+            y.calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return y(args, timeout)
+    with mock.patch.object(fetch, "_run", quiet_load):
+        res = fetch.fetch_captions("pf7")
+    assert len(y.calls) == 3 and "--load-info-json" in y.calls[1] and "--load-info-json" not in y.calls[2]
+    assert (res["caption_kind"], res["caption_lang"]) == ("auto", "en-orig")
+
+
+def test_a_missing_info_after_a_clean_exit_is_retried_not_settled():
+    import subprocess
+    from unittest import mock
+    with mock.patch.object(fetch, "_run", lambda args, timeout=900: subprocess.CompletedProcess(args, 0, "", "")):
+        res = fetch.fetch_captions("pf6")
+    assert res["returncode"] == 0 and res["caption_kind"] == "missing_file"
+
+
+def test_youtube_pause_doubles_after_a_pause_caps_at_a_week_and_clears_on_success():
+    from datetime import datetime, timedelta
+    from unittest import mock
+    from ytbrain import youtube_pause as yp
+    yp.clear()
+    t0 = datetime(2026, 10, 13, 9, 0).astimezone()
+    try:
+        assert yp.active(t0) is None
+        assert yp.record("rate limited, HTTP 429", now=t0)["hours"] == 24
+        assert yp.active(t0 + timedelta(hours=23)) and not yp.active(t0 + timedelta(hours=25))
+        hours = [yp.record("429", now=t0)["hours"] for _ in range(4)]
+        assert hours == [48, 96, 168, 168]                     # doubles, capped at 7 days
+        assert "168h" in yp.describe(yp.active(t0))
+        assert yp.clear() and yp.active(t0) is None
+        assert yp.record("429", now=t0)["hours"] == 24         # a success started it over
+        yp.clear()
+        with mock.patch.object(yp, "YT_PAUSE_HOURS", 0):
+            assert yp.record("429", now=t0) is None and yp.active(t0) is None
+    finally:
+        yp.clear()
+
+
+def test_sync_stops_youtube_at_the_first_429_and_later_runs_wait_out_the_pause():
+    try:
+        from ytbrain import cli
+        from ytbrain.config import MANIFEST_DB
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    import io, contextlib, types
+    from unittest import mock
+    from ytbrain import youtube_pause as yp
+    yp.clear()
+    m = Manifest(MANIFEST_DB)
+    calls = []
+    rl = "ERROR: Unable to download video subtitles for 'en-orig': HTTP Error 429: Too Many Requests"
+    def answer(rc, err, kind):
+        def fake(doc_id, sleep=1.5, sleep_subtitles=0):
+            calls.append(doc_id)
+            return {"doc_id": doc_id, "returncode": rc, "stderr_tail": err, "info_path": None,
+                    "caption_path": str(cap) if kind == "auto" else None,
+                    "caption_kind": kind, "caption_lang": "en-orig" if kind == "auto" else None}
+        return fake
+    rows = [{"doc_id": d, "title": d, "duration_s": 60} for d in ("yp1", "yp2", "yp3")]
+    cap = RAW / "yp.en-orig.srt"
+    cap.write_text(SRT)
+    cfg = Path(tempfile.mkdtemp()) / "sources.yaml"
+    cfg.write_text("sources:\n- id: ypsrc\n  name: S\n  playlist_id: PLyp\n")
+    def run(**kw):
+        args = types.SimpleNamespace(backfill=False, limit=0, force=False, reconcile=False, **kw)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert cli.cmd_sync(args) == 0
+        return out.getvalue()
+    sleeps = []
+    with mock.patch.object(cli, "SOURCES", cfg), mock.patch.object(cli.time, "sleep", sleeps.append), \
+         mock.patch.object(cli.fetch, "enumerate_playlist", lambda pid, limit=None: rows):
+        try:
+            with mock.patch.object(cli.fetch, "fetch_captions", answer(1, rl, "missing_file")):
+                out = run()
+            assert calls == ["yp1"] and not sleeps                 # no retry, no cooldown, no next video
+            assert m.stage_status("yp1", "fetch") == "failed" and "yp2" not in m.stage_settled_ids("fetch")
+            assert "Stopping YouTube for this run" in out and yp.active()["hours"] == 24
+            with mock.patch.object(cli.fetch, "fetch_captions", answer(0, "", "auto")):
+                out = run()
+                assert calls == ["yp1"] and "YouTube paused until" in out      # the next run leaves it alone
+                out = run(ignore_pause=True)
+            assert calls[1:4] == ["yp1", "yp2", "yp3"] and yp.active() is None   # then any orphans
+            assert "pause is lifted" in out and m.stage_status("yp2", "fetch") == "ok"
+        finally:
+            yp.clear()
+
+
+def test_ops_summary_says_while_youtube_is_paused():
+    from ytbrain import youtube_pause as yp
+    from ytbrain.ops import Ops
+    yp.clear()
+    try:
+        assert Ops.youtube_note() == ""
+        yp.record("rate limited, HTTP 429")
+        note = Ops.youtube_note()
+        assert note.startswith("; YouTube paused until") and "--ignore-pause" in note
+    finally:
+        yp.clear()
+
+
+def test_reselect_captions_sends_back_only_talks_cleaned_from_a_different_file():
+    try:
+        from ytbrain import cli
+    except ImportError:
+        _skipped("optional dependency not installed")
+        return
+    import io, contextlib, types
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as d:
+        m = Manifest(Path(d) / "m.db")
+        spoken = SRT
+        rewritten = SRT.replace("so the first thing", "the first thing, then,")
+        cases = {   # doc: (info, files on disk, the file its transcript was cleaned from)
+            "rs1": ({"automatic_captions": {"en": [{}], "en-orig": [{}]}},
+                    {"en": rewritten, "en-orig": spoken}, "en"),          # cleaned from the rewrite
+            "rs2": ({"automatic_captions": {"en": [{}], "en-orig": [{}]}},
+                    {"en": spoken, "en-orig": spoken}, "en"),             # byte-identical: nothing to do
+            "rs3": ({"subtitles": {"en": [{}]}, "automatic_captions": {"en-orig": [{}]}},
+                    {"en": rewritten, "en-orig": spoken}, "en"),          # human track: stays
+            "rs4": ({"automatic_captions": {"en": [{}], "en-orig": [{}]}}, {"en": spoken}, "en"),  # en-orig absent
+        }
+        for doc, (info, files, used) in cases.items():
+            _write_info(doc, info)
+            for lang, text in files.items():
+                (RAW / f"{doc}.{lang}.srt").write_text(text)
+            m.upsert_document(doc, "s", title=doc)
+            m.mark(StageState(doc, "clean", "ok", input_hash=fetch.file_hash(RAW / f"{doc}.{used}.srt"),
+                              output_hash="x"))
+        with mock.patch.object(cli, "MANIFEST_DB", Path(d) / "m.db"):
+            for dry in (True, False):
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    assert cli.cmd_reselect_captions(types.SimpleNamespace(dry_run=dry)) == 0
+                text = out.getvalue()
+                assert "1 use a different caption file" in text and "rs1  -> rs1.en-orig.srt" in text
+                assert "1 with the picked file missing" in text and "rs4" in text
+                status = {doc: Manifest(Path(d) / "m.db").stage_status(doc, "clean") for doc in cases}
+                assert status == ({k: "ok" for k in cases} if dry else
+                                  {"rs1": "stale", "rs2": "ok", "rs3": "ok", "rs4": "ok"}), status
 
 
 def test_uploader_chapters_parsed_when_present():
@@ -1033,8 +1272,8 @@ def test_new_captions_send_the_talk_back_to_extract_and_one_bad_talk_does_not_st
     for d in ("cc1", "cc2"):
         m.upsert_document(d, "s", title=d, published_at="2024-01-01")
         m.mark(StageState(d, "fetch", "ok"))
-        (RAW / f"{d}.en.srt").write_text(srt(words))
-        (RAW / f"{d}.info.json").write_text(json.dumps({"automatic_captions": {"en": []}}))
+        (RAW / f"{d}.en-orig.srt").write_text(srt(words))
+        (RAW / f"{d}.info.json").write_text(json.dumps({"automatic_captions": {"en-orig": []}}))
     args = types.SimpleNamespace(limit=0, retry_failed=False)
     real = cli.captions.parse_srt
     def flaky(text, _real=real):
@@ -1046,8 +1285,8 @@ def test_new_captions_send_the_talk_back_to_extract_and_one_bad_talk_does_not_st
     for d in ("cc1", "cc2"):
         assert m.stage_status(d, "clean") == "ok"
         m.mark(StageState(d, "extract", "ok"))
-    (RAW / "cc1.en.srt").write_text(srt(words + " human captions now"))    # a re-fetch
-    (RAW / "cc2.en.srt").write_text(srt("BROKEN"))
+    (RAW / "cc1.en-orig.srt").write_text(srt(words + " human captions now"))    # a re-fetch
+    (RAW / "cc2.en-orig.srt").write_text(srt("BROKEN"))
     m.invalidate_docs("clean", ["cc1", "cc2"], "re-fetched")
     with mock.patch.object(cli.captions, "parse_srt", flaky), \
          contextlib.redirect_stdout(io.StringIO()) as out:

@@ -1,0 +1,224 @@
+"""`ytbrain gaps`: what the dogfooded coaches could not answer well, from their local usage logs.
+
+Every coach tool call leaves one row in the `usage` table of its Project's store
+(`~/.ytbrain/<pack>/projects/<id>/founder.db`; docs/usage-log.md). This reads those tables and nothing else:
+no goals, decisions or profile, and it never opens a store through the coach's own code (no migration, no
+backup, no write). A search is rated `strong`, `partial` or `none` (its coverage); the report counts them per
+coach and Domain, shows where the border between strong and partial sits in similarity, and, when the question
+text was recorded (`<PREFIX>USAGE_TEXT=1`, your own machine only), lists the questions behind the weak ones.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import statistics
+import tempfile
+import datetime as dt
+from dataclasses import dataclass, field
+from pathlib import Path
+
+LEVELS = ("strong", "partial", "none", "empty", "unrated")     # unrated: a search from before coverage was logged
+DB_NAME = "founder.db"
+
+
+def engine_home() -> Path:
+    return Path(os.environ.get("YTBRAIN_HOME") or "~/.ytbrain").expanduser()
+
+
+@dataclass
+class Project:
+    pack: str                     # founder, coding, investor
+    project_id: str
+    name: str
+    db: Path
+    rows: list[dict] = field(default_factory=list)
+    note: str = ""                # why it has no rows (no usage table, unreadable)
+
+
+def _product_id(home: Path, pack: str) -> str:
+    """The coach's product id for a Pack folder (its env prefix is this, upper-cased), from the registry
+    each coach writes when it starts; `<pack>-coach` if it never registered."""
+    try:
+        for f in (home / "installed").glob("*.json"):
+            d = json.loads(f.read_text())
+            if d.get("pack") == pack and d.get("product_id"):
+                return str(d["product_id"])
+    except (OSError, ValueError):
+        pass
+    return f"{pack}-coach"
+
+
+def env_prefix(home: Path, pack: str) -> str:
+    return _product_id(home, pack).upper().replace("-", "_") + "_"
+
+
+def discover(home: Path | None = None, pack: str | None = None) -> list[Project]:
+    """Every Project store under the engine home: `<home>/<pack>/projects/<id>/founder.db`."""
+    home = home or engine_home()
+    out: list[Project] = []
+    if not home.is_dir():
+        return out
+    for pdir in sorted(p for p in home.iterdir() if (p / "projects").is_dir()):
+        if pack and pdir.name != pack:
+            continue
+        for d in sorted(x for x in (pdir / "projects").iterdir() if (x / DB_NAME).is_file()):
+            name = d.name
+            try:
+                name = json.loads((d / "project.json").read_text()).get("name") or d.name
+            except (OSError, ValueError):
+                pass
+            out.append(Project(pack=pdir.name, project_id=d.name, name=str(name), db=d / DB_NAME))
+    return out
+
+
+def _read_usage(db: Path) -> tuple[list[dict], str]:
+    """The usage rows of one store. The store is in WAL mode and a running coach keeps its newest rows in the
+    -wal file, so the file and its -wal are copied to a temporary folder and read there: the original is never
+    opened, so nothing (not even a -shm file) appears next to it."""
+    tmp = tempfile.mkdtemp(prefix="ytbrain-gaps-")
+    try:
+        for suffix in ("", "-wal"):
+            src = Path(str(db) + suffix)
+            if src.exists():
+                shutil.copy2(src, Path(tmp) / (DB_NAME + suffix))
+        c = sqlite3.connect(Path(tmp) / DB_NAME, timeout=1)
+        try:
+            c.row_factory = sqlite3.Row
+            rows = [dict(r) for r in c.execute("SELECT at, run, tool, outcome, duration_ms, version, detail "
+                                               "FROM usage ORDER BY at, id")]
+            return rows, ""
+        finally:
+            c.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return [], "no usage log yet (the store predates it, or the coach has not run)"
+        return [], f"unreadable ({e})"
+    except (sqlite3.Error, OSError) as e:
+        return [], f"unreadable ({type(e).__name__})"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load(home: Path | None = None, pack: str | None = None, days: int | None = 30,
+         now: dt.datetime | None = None) -> list[Project]:
+    projects = discover(home, pack)
+    cutoff = None
+    if days is not None:
+        cutoff = ((now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=days)).isoformat(timespec="seconds")
+    for p in projects:
+        rows, p.note = _read_usage(p.db)
+        for r in rows:
+            try:
+                r["detail"] = json.loads(r.get("detail") or "{}")
+            except ValueError:
+                r["detail"] = {}
+        p.rows = [r for r in rows if cutoff is None or r["at"] >= cutoff]
+    return projects
+
+
+def level_of(row: dict) -> str:
+    """strong / partial / none / empty / unrated for one coach_search row."""
+    d = row["detail"]
+    if row["outcome"] == "empty":
+        return "empty"
+    if row["outcome"] == "gap":
+        return "none"
+    return d.get("coverage") if d.get("coverage") in ("strong", "partial", "none") else "unrated"
+
+
+def domain_levels(row: dict) -> dict[str, str]:
+    """Domain -> level for one search: its per-Domain coverage when logged, else the overall level for each
+    Domain it searched (rows from before the per-Domain field, so those are approximate)."""
+    d = row["detail"]
+    by = d.get("coverage_by_domain")
+    if isinstance(by, dict) and by:
+        return {str(k): str(v) for k, v in by.items()}
+    lv = level_of(row)
+    return {str(k): lv for k in (d.get("domains_searched") or [])} if lv in ("strong", "partial", "none") else {}
+
+
+def _sims(rows: list[dict]) -> dict | None:
+    xs = [r["detail"]["top_similarity"] for r in rows if isinstance(r["detail"].get("top_similarity"), (int, float))]
+    if not xs:
+        return None
+    return {"n": len(xs), "min": round(min(xs), 3), "median": round(statistics.median(xs), 3), "max": round(max(xs), 3)}
+
+
+def summarize(p: Project, questions: int = 15) -> dict:
+    searches = [r for r in p.rows if r["tool"] == "coach_search"]
+    by_level = {lv: sum(level_of(r) == lv for r in searches) for lv in LEVELS}
+    domains: dict[str, dict[str, int]] = {}
+    for r in searches:
+        for dom, lv in domain_levels(r).items():
+            domains.setdefault(dom, {"strong": 0, "partial": 0, "none": 0})
+            if lv in domains[dom]:
+                domains[dom][lv] += 1
+    weak = [r for r in searches if level_of(r) in ("partial", "none", "empty")]
+    with_text = [r for r in searches if r["detail"].get("query")]
+    weak_text = [r for r in weak if r["detail"].get("query")]
+    return {
+        "pack": p.pack, "project": p.name, "project_id": p.project_id, "note": p.note,
+        "calls": len(p.rows), "searches": len(searches), "first": p.rows[0]["at"] if p.rows else None,
+        "last": p.rows[-1]["at"] if p.rows else None, "levels": by_level,
+        "similarity": {lv: _sims([r for r in searches if level_of(r) == lv]) for lv in ("strong", "partial", "none")},
+        "domains": dict(sorted(domains.items())),
+        "errors": sum(r["outcome"] == "error" for r in p.rows),
+        "searches_with_text": len(with_text),
+        "weak_questions": [{"at": r["at"][:19], "level": level_of(r), "top_similarity": r["detail"].get("top_similarity"),
+                            "domains": sorted(domain_levels(r)) or r["detail"].get("domains_searched") or [],
+                            "query": r["detail"]["query"]}
+                           for r in reversed(weak_text)][:questions],
+    }
+
+
+def report(projects: list[Project], home: Path | None = None, days: int | None = 30, questions: int = 15) -> dict:
+    home = home or engine_home()
+    return {"home": str(home), "days": days, "projects": [summarize(p, questions) for p in projects]}
+
+
+def render(rep: dict, home: Path | None = None) -> str:
+    home = home or Path(rep["home"])
+    lines: list[str] = []
+    if not rep["projects"]:
+        return f"gaps: no coach Projects under {rep['home']} (use a coach in a Project first; `/setup` makes one)"
+    span = f"last {rep['days']} days" if rep["days"] else "all time"
+    for s in rep["projects"]:
+        lines.append(f"{s['pack']} coach · Project {s['project']} ({s['project_id']}) · {span}")
+        if s["note"]:
+            lines.append(f"  {s['note']}")
+            lines.append("")
+            continue
+        n, lv = s["searches"], s["levels"]
+        if not n:
+            lines.append(f"  {s['calls']} tool call(s), no searches in this window")
+            lines.append("")
+            continue
+        rated = n - lv["unrated"]                      # percentages are of the searches that carry a coverage level
+        pct = lambda k: f"{lv[k]} ({round(100 * lv[k] / rated)}%)" if rated else str(lv[k])    # noqa: E731
+        lines.append(f"  searches {n} ({rated} rated, {lv['unrated']} from before coverage was logged): strong "
+                     f"{pct('strong')} · partial {pct('partial')} · none {pct('none')} · empty {lv['empty']}   "
+                     f"({s['first'][:10]} to {s['last'][:10]})")
+        sim = s["similarity"]
+        bits = [f"{k} {v['min']}-{v['max']} (median {v['median']})" for k, v in sim.items() if v]
+        if bits:
+            lines.append("  top similarity: " + " · ".join(bits))
+        if s["domains"]:
+            lines.append("  by Domain (strong / partial / none):")
+            for dom, c in s["domains"].items():
+                lines.append(f"    {dom:14} {c['strong']:3} / {c['partial']:3} / {c['none']:3}")
+        if s["errors"]:
+            lines.append(f"  {s['errors']} tool error(s): `founder-coach usage summary` lists them")
+        weak = lv["partial"] + lv["none"] + lv["empty"]
+        if weak and not s["searches_with_text"]:
+            lines.append(f"  {weak} weak search(es) but no question text was recorded, so what was missing is unknown. "
+                         f"On this machine set {env_prefix(home, s['pack'])}USAGE_TEXT=1 for the {s['pack']} coach "
+                         f"(local only; the text never leaves your store).")
+        elif s["weak_questions"]:
+            lines.append(f"  weak searches (newest first, {len(s['weak_questions'])} of {weak}):")
+            for q in s["weak_questions"]:
+                sim_s = "" if q["top_similarity"] is None else f" sim {q['top_similarity']}"
+                lines.append(f"    {q['at']} {q['level']:7}{sim_s} [{', '.join(q['domains'])}] {q['query']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

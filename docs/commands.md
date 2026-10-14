@@ -16,7 +16,7 @@ ytbrain ops --dry-run       # what is due
 The whole system, end to end, cheapest level first: [docs/testing.md](docs/testing.md). The offline suites:
 
 ```bash
-for t in core eval pack coach projects invest plugin web books; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
+for t in core eval pack coach projects invest plugin web books gaps; do YTBRAIN_DOTENV=0 python tests/test_$t.py | tail -1; done
 ```
 
 ## Phase 1: corpus (sync → clean → extract → verify)
@@ -39,6 +39,7 @@ ytbrain tag                           # apply (ops runs `tag --gated`: only afte
 ytbrain domains why <doc>             # where a Document's Domains came from
 ytbrain domains review                # high-tier tags awaiting your yes (--accept SOURCE:DOMAIN)
 ytbrain domains propose               # content no Domain fits, grouped, checked against the list
+ytbrain gaps [--pack P] [--days 30] [--json]  # what the dogfooded coaches could not answer well (their usage logs)
 ytbrain upgrade --dry-run             # records a new extraction would make differently: how many, at what cost
                                       #   (coding and system-design chapters move to the subject-neutral prompt)
 ytbrain eval parity                   # the neutral prompt vs the startup one on ~30 startup talks (shadow, ~$0.10)

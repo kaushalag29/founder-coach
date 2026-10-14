@@ -29,7 +29,7 @@ When they want their portfolio checked, follow the review skill.
 
 ## Answer shape
 
-The answer, then its Citations, then what their own policy says, then Gaps. A Citation follows the claim: a book is author, book and PDF page, unlinked ("Benjamin Graham, *The Intelligent Investor*, PDF p. 88"); a page is its title and site, linked exactly as returned. No item_ids in what the Investor reads.
+The answer, then its Citations, then what their own policy says, then Gaps (only when there are any). A Citation follows the claim: a book is author, book and PDF page, unlinked ("Benjamin Graham, *The Intelligent Investor*, PDF p. 88"); a page is its title and site, linked exactly as returned. No item_ids in what the Investor reads.
 
 ## Gotchas
 

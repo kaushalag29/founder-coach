@@ -3,6 +3,42 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-14 (a gap report from the dogfooded coaches)
+
+- **`ytbrain gaps`** reads the usage log of every coach Project under `~/.ytbrain` (read-only, from a copy of the
+  store, usage table only) and reports, per coach and Domain, how many searches were strong, partial or none, where the
+  border between strong and partial sits in similarity, and, when the question text was recorded
+  (`<PREFIX>USAGE_TEXT=1`, your machine only), the questions behind the weak ones. `--pack`, `--days`, `--questions`,
+  `--json`.
+- **A search's usage row now carries the per-Domain coverage** (`coverage_by_domain`), its basis and the stale
+  Domains. Still no words. Rows from before this keep working: the report uses their overall level for each Domain
+  searched.
+- **The Gaps section only appears when there is a gap.** The ask, design-review and coach skills of all three Packs
+  now leave the line out when the sources answered everything, so a partial result no longer reads as a failure.
+- **Fix:** the coach skills say `coach_update`'s `note` is for Goals (and, in the founder Pack, Commitments) only;
+  a Decision is revised through `changes`.
+
+## 2026-10-13 (one caption track per talk; the YouTube pause)
+
+- **Sync picks the caption track first, then downloads only that one.** It reads the talk's `info.json` (no subtitle
+  request), picks a human English track, else the auto `en-orig`, else nothing, and fetches that track from the saved
+  info (`yt-dlp --load-info-json`, no second page fetch). It no longer asks for the plain auto `en`: YouTube makes it with
+  its translation endpoint, the request it throttles with HTTP 429 (yt-dlp issue #13831). Each talk now costs one page
+  fetch and at most one subtitle request (two before), and a talk with no English track costs none. If the saved info
+  can't be loaded, the track is fetched once with a single full call. `sub_langs` in `sources.yaml` is no longer read.
+- **Fix: 20 talks were indexed from a machine rewrite of the speech.** On those, YouTube's plain auto `en` reworded what
+  the speaker said ("the best tool that you've got to figure out" became "the best tool you have to find out"), and the
+  old rule preferred it. `ytbrain reselect-captions` (`--dry-run` to list) re-picks every cleaned talk's track from files
+  already on disk and sends back to clean only those whose file changes; the next `ytbrain ops` re-extracts only those
+  whose transcript changed. The other ~720 are byte-identical and untouched.
+- **The first HTTP 429 stops YouTube for the run, and later runs wait.** No retry of the video and no cooldown before the
+  next one (each only extended the throttle). Later syncs skip YouTube for 24 h (`YTBRAIN_YT_PAUSE_HOURS`), doubling if
+  the first run after a pause gets another 429, up to 7 days; websites and Books still sync; the ops summary says until
+  when; `ytbrain sync --ignore-pause` tries sooner. A run that fetches captions without a 429 lifts it.
+- The uploader's `language` field is not used to decide: in this Library it was missing on 20 English talks and wrong on 2.
+- 476 tests pass under `pytest tests` (11 new: the picker, the two-call fetch, the 429 and load-failure paths, the pause,
+  sync stopping at the first 429, the ops summary, `reselect-captions`).
+
 ## 2026-10-13 (fully automatic tagging)
 
 - **`YTBRAIN_TAG_POLICY`, `auto` by default:** `ytbrain ops` now applies the tag Step's Domains every run with no

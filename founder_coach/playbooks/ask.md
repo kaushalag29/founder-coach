@@ -26,7 +26,7 @@ Follow the coaching contract in the server instructions throughout: cite only re
 **<Part 2>**: …
 
 **Where sources disagree:** only if they do.
-**Gaps:** what the sources don't cover, and "general knowledge" for anything said without a Citation.
+**Gaps:** only when a part is missing from the sources, thinly covered, or said without a Citation: name the part and which of the three it is. Leave this line out when the sources answered everything.
 **More of your questions:** only when step 2 held asks back: "I also have N more of your questions (<a few words each>): shall I continue?"
 **For you:** one line applying it to the Founder's Stage and Goals.
 ```

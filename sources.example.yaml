@@ -14,8 +14,7 @@
 # nothing is re-fetched or re-extracted.
 # `enabled: false` on any entry stops fetching it (its Documents stay until `ytbrain drop --source ID`).
 defaults:                              # applied to every source unless it overrides them
-  sub_langs: en,en-orig,en-US,en-GB    # exact English tracks (en.* also pulls machine translations)
-  sub_format: srt/best
+  # no sub_langs: sync picks each talk's caption track itself (README: "Caption tracks")
   sleep_requests: 5                    # seconds between yt-dlp requests; >= 5 avoids most YouTube 429s
 sources:
 - id: how_to_start_a_startup_2014      # stable slug, unique

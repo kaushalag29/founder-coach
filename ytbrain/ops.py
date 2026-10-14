@@ -444,6 +444,18 @@ class Ops:
         return steps
 
     @staticmethod
+    def youtube_note() -> str:
+        """"; YouTube paused until ..." while a 429 pause is in force ("" otherwise): the summary says
+        why no new talks arrived, and when they will."""
+        try:
+            from . import youtube_pause
+            p = youtube_pause.active()
+            return (f"; YouTube paused {youtube_pause.describe(p)} after {p['reason']} "
+                    f"(`ytbrain sync --ignore-pause` tries sooner)") if p else ""
+        except Exception:                      # noqa: BLE001 -- a summary line never stops the run
+            return ""
+
+    @staticmethod
     def tag_note() -> str:
         """What this run's tag Step did, for the summary and data/ops/last-run.md ("" when nothing is recorded)."""
         try:
@@ -778,6 +790,7 @@ class Ops:
         if verdict in ("pass", "baseline") and ev.get("index") != self.index_fp():
             verdict += " (on an older index)"          # the plugin step skips: a pass on this index is still missing
         summary = (f"eval {verdict}; plugin {pl.get('version', '-')} ({pl.get('path', 'not built')})"
+                   + (self.youtube_note() if "ingest:sync" in cur["done"] else "")
                    + (self.tag_note() if "ingest:tag" in cur["done"] else "")
                    + coach_note
                    + f"; eval spend ${self.state['last_run']['spent']:.3f}")

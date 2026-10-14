@@ -28,7 +28,7 @@ Follow the coaching contract of the coach skill: restate before judging, cite on
 **Other concerns:** two or three, each with a Citation or marked "general knowledge".
 **What's good:** specific, only what the design earns.
 **Trade-offs:** what the alternative would cost.
-**Gaps:** what the sources don't cover.
+**Gaps:** only when the sources don't cover a part of the design; leave this line out otherwise.
 **Next step:** the one change or experiment that most reduces the biggest risk.
 ```
 

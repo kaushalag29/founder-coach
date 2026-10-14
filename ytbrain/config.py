@@ -155,17 +155,19 @@ RPM_CUT_COOLDOWN_S = 20.0
 RPM_RAISE_EVERY_S = 60.0
 RPM_RAISE_STEP = 0.10
 LLM_WORKERS = int(os.environ.get("YTBRAIN_LLM_WORKERS", "1"))   # default for `extract --workers`
-YT_COOLDOWN_BASE_S = 30              # YouTube 429s: 30, 60, 120, 240s pause before the next video
-YT_COOLDOWN_MAX_S = 600
-YT_MAX_429_STREAK = 5                # then stop the sync: the IP is throttled, more requests only extend it
-YT_VIDEO_RETRIES = int(os.environ.get("YTBRAIN_YT_VIDEO_RETRIES", "2"))  # same video, after the cooldown
+# YouTube's HTTP 429 is a throttle on this IP: every further request extends it. So the first 429
+# stops YouTube for the run (no retry), and later runs leave YouTube alone for YT_PAUSE_HOURS, doubling
+# on each 429 after a pause up to YT_PAUSE_MAX_HOURS; a run that fetches captions without one resets
+# it. Websites and Books still sync. `sync --ignore-pause` or `sync --backfill` tries YouTube now.
+# YTBRAIN_YT_PAUSE_HOURS=0 turns the pause off (a run still stops at its first 429).
+YT_PAUSE_HOURS = float(os.environ.get("YTBRAIN_YT_PAUSE_HOURS", "24"))
+YT_PAUSE_MAX_HOURS = 168
+YT_VIDEO_RETRIES = int(os.environ.get("YTBRAIN_YT_VIDEO_RETRIES", "2"))  # same video, other transient errors
 YT_ERROR_BACKOFF_S = 10              # other transient yt-dlp errors: 10, 20s before retrying the video
 YT_ENUM_RETRIES = 2                  # playlist listing: retried after 30, 60s
-# Pause before EACH subtitle file (a video usually has two: en + en-orig), on top of
-# sleep_requests between every request. yt-dlp issue #13831 reports 60s ending
-# auto-caption 429s, but that was without a JS runtime or PO tokens; with both,
-# shorter pauses are enough. `sync --backfill` retries rate-limited videos a bit
-# more cautiously, at most YT_BACKFILL_PER_HOUR. Raise these if 429s return.
+# Pause before the subtitle file (one per talk since the track is picked first: fetch.pick_track), on
+# top of sleep_requests between every request. `sync --backfill` retries rate-limited videos a bit
+# more cautiously, at most YT_BACKFILL_PER_HOUR.
 YT_SLEEP_SUBTITLES = float(os.environ.get("YTBRAIN_YT_SLEEP_SUBTITLES", "10"))
 YT_BACKFILL_SLEEP_SUBTITLES = 15
 YT_BACKFILL_PER_HOUR = 60            # YouTube allows guests ~300 videos/hour; stay well below

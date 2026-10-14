@@ -52,7 +52,7 @@ jobs:
       - name: Test suites (REQUIRE_ALL_TESTS turns a skip into a failure)
         run: |
           set -o pipefail
-          for suite in core eval pack coach projects invest plugin web books; do
+          for suite in core eval pack coach projects invest plugin web books gaps; do
             echo "::group::test_$suite"
             uv run --no-sync python tests/test_$suite.py 2>&1 | tee "$RUNNER_TEMP/test_$suite.log"
             echo "::endgroup::"
