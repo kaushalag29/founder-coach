@@ -3,6 +3,14 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-16 (coach eval: grading is part of each gate's cache key)
+
+- **A gate re-runs when how it is graded changes**, not only when the plugin does: its rubric (the Pack's or the
+  shared one), the two judges, the host's turn cap, the trial count, G2's support prompt and evidence limit, and the
+  source of the functions that run and decide its cases (`GRADERS` in `ytbrain/eval/coach.py`). Before, such a
+  change reused results graded the old way unless someone bumped `HARNESS` by hand (the 30 000-character G2 evidence
+  limit was caught that way in 0.1.7). Results cached before this change are taken over once under the new key.
+
 ## 2026-10-15 (plugin 0.1.7: whole-Library search, Search rounds, 10 hits)
 
 - **Searches cover the whole Library by default.** The skills of all three Packs stop passing `domains`; they pass it only

@@ -471,8 +471,9 @@ Claude plan by default**, set up to use as little of its limits as possible:
 - a case that errors (a turn cap, a host hiccup) is not cached and does not fail the gate by itself: when the rest pass,
   the gate is **incomplete** (exit 2) and re-running the same command retries only those cases; if the Claude login has
   expired the run stops at the first case and says to run `claude`, then `/login`;
-- the gates run before a release (`ytbrain ops plugin --coach`), not on every build; each is cached on what it reads, so
-  editing one skill re-runs only the gates that use it, and a version bump re-runs nothing;
+- the gates run before a release (`ytbrain ops plugin --coach`), not on every build; each is cached on what it reads and how it is
+  graded, so editing one skill (or a gate's rubric, judges or grading code) re-runs only the gates it touches, and a
+  version bump re-runs nothing;
 - `claude plugin eval` with `--runs 1 --ablation none` while iterating (3 runs, with the
   without-plugin comparison, before a release).
 
@@ -782,7 +783,7 @@ only the talks whose records changed.
 | `eval latency` | Search p95 the way the plugin runs it (its runtime, a Knowledge pack, ONNX models), on real Tuning questions after a warm-up; gate 1.5 s; writes data/eval/latency.json | `--pack PATH`, `--n`, `--no-rerank` |
 | `eval parity` | The subject-neutral extraction prompt against the startup one on ~30 startup talks (shadow extractions, the Library untouched): the neutral verifier pass rate within 2 points and at least 80 % of the Verified items; a pass makes new founder content use it | `--n`, `--max-cost` (default $1) |
 | `tag` | Tag Passages and items with Domains by what they say (ADR-0017): embedding scores, a cheap model for close calls only (cached), Document Domains by Passage share; nothing re-extracted or re-embedded | `--dry-run`, `--max-cost USD`, `--no-llm`, `--no-apply`, `--gated` |
-| `eval coach` | Gates G2, G4, G5, G6 on the real host: the local Claude Code on your plan (Haiku, token-saving). Each gate is cached on what it reads (runtime, pack content, its skills, its cases), so only gates whose inputs changed run; a failed G4-G6 case gets up to three runs and a majority decides; stops if the plugin is reassembled mid-run with a change the gate reads | `--gate`, `--limit`, `--model`, `--max-turns`, `--host claude\|openrouter`, `--max-cost`, `--plugin DIR` (default `dist/plugin`) |
+| `eval coach` | Gates G2, G4, G5, G6 on the real host: the local Claude Code on your plan (Haiku, token-saving). Each gate is cached on what it reads (runtime, pack content, its skills, its cases) and how it is graded (rubric, judges, turn cap, the grading code), so only gates whose inputs changed run; a failed G4-G6 case gets up to three runs and a majority decides; stops if the plugin is reassembled mid-run with a change the gate reads | `--gate`, `--limit`, `--model`, `--max-turns`, `--host claude\|openrouter`, `--max-cost`, `--plugin DIR` (default `dist/plugin`) |
 | `claude [--model M] [--openrouter] -- <args>` | The local Claude Code for plugin work, on your plan with Haiku | `--model`, `--openrouter` (before `--`) |
 
 `--limit` counts Documents per Step (for `sync`, per Source). A Document that fails a Step 3 runs in a row is parked;

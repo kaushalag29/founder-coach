@@ -21,7 +21,7 @@ than the host); the multi-week memory gate is graded on the Founder store's fina
 Stops at the first usage-limit refusal from the host (a Claude plan limit), since every later
 case would fail the same way. Resumable and cheap to repeat: each finished case is kept in data/eval/coach/
 under a key of what that gate depends on (`gate_inputs`: the runtime, the pack's content, the skills the gate
-uses, its cases), not the whole build. A new version number, a rebuilt pack with the same content, or an edit
+uses, its cases, and how they are graded: rubric, judges, turn cap, grading code), not the whole build. A new version number, a rebuilt pack with the same content, or an edit
 to a skill another gate uses changes nothing, so editing `check-in` re-runs G5 alone. A pass/fail case that
 fails is run again, up to TRIALS times, and passes on a majority, so one unlucky run of the host doesn't fail
 a gate while a real failure still does. Spend-capped like a build (judges only; `claude -p` runs on the
@@ -1103,11 +1103,12 @@ def pack_id(plugin: Path) -> str:
     return str(meta.get("content_sha256") or meta.get("sha256") or "none")
 
 
-def gate_inputs(plugin: Path, gate: str, cases: list[dict]) -> str:
+def gate_inputs(plugin: Path, gate: str, cases: list[dict], grading: str | None = None) -> str:
     """A short hash of everything a gate's results depend on: the runtime and hooks, the pack's content, the
-    full text of the skills in GATE_SKILLS[gate] (and only the description of the others), and the gate's
-    cases. BUILD_ID, version numbers, caches and the MCP prompt text of skills the gate doesn't use are left
-    out, so a rebuild that changes none of those reuses the gate's cached results."""
+    full text of the skills in GATE_SKILLS[gate] (and only the description of the others), the gate's
+    cases and, with `grading` (grading_inputs), how they are graded. BUILD_ID, version numbers, caches and the
+    MCP prompt text of skills the gate doesn't use are left out, so a rebuild that changes none of those reuses
+    the gate's cached results."""
     deps = set(gate_skills(gate))
     h = hashlib.sha256()
     files = sorted(p for p in plugin.rglob("*") if p.is_file())
@@ -1128,7 +1129,59 @@ def gate_inputs(plugin: Path, gate: str, cases: list[dict]) -> str:
         h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
     h.update(b"pack\0" + pack_id(plugin).encode())
     h.update(b"cases\0" + json.dumps(cases, sort_keys=True, ensure_ascii=False).encode())
+    if grading:
+        h.update(b"grading\0" + grading.encode())
     return h.hexdigest()[:12]
+
+
+# what grades each gate, besides its rubric and judges: the code that runs a case and decides it. A change to any of
+# these re-runs the gate by itself (no HARNESS bump to remember); HARNESS stays for a change of meaning no code shows.
+GRADERS = {"g2": ("grade_support", "citation_problems", "pages_returned", "Turn.evidence"),
+           "g4": ("_two_judges",),
+           "g5": ("_run_persona", "check_state", "before_yes_check", "_same", "_norm"),
+           "g6": ("_two_judges", "domain_parts"),
+           "g7": ("_run_projects", "check_projects", "turn_check", "_find_store", "_project_stores", "_same", "_norm"),
+           "g8": ("_two_judges", "security_calls")}
+COMMON_GRADERS = ("_run_case", "run_trials")
+
+
+def _source(name: str) -> str:
+    import inspect
+    obj = globals()
+    for part in name.split("."):
+        obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
+    return inspect.getsource(obj)
+
+
+def grading_inputs(gate: str, judges: list[str] | tuple[str, ...], max_turns: int) -> str:
+    """A hash of how a gate's cases are run and graded: the rubric (this Pack's, else the shared one) and, for G2,
+    the support prompt and how much evidence the judges see; the two judges; the host's turn cap; the trial count;
+    and the source of the functions in GRADERS. Part of gate_inputs, so changing any of them re-runs the gate."""
+    h = hashlib.sha256()
+    pack_rubric = PACK_RUBRICS.get(TARGET["pack"], {}).get(gate)
+    h.update(b"rubric\0" + (pack_rubric or RUBRICS.get(gate) or "").encode())
+    if gate == "g2":
+        h.update(f"support\0{SUPPORT_PROMPT}\0{VERIFY_HINT}\0evidence={EVIDENCE_CHARS}".encode())
+    h.update(f"judges\0{','.join(list(judges)[:2])}\0turns={max_turns}\0trials={TRIALS}".encode())
+    for name in (*GRADERS.get(gate, ()), *COMMON_GRADERS):
+        h.update(name.encode() + b"\0" + _source(name).encode())
+    return h.hexdigest()[:12]
+
+
+def adopt_legacy(gate: str, plugin: Path, cases: list[dict], label: str | None, key: str, say=print) -> bool:
+    """Results cached before grading was part of the key (`gate_inputs` without `grading`) are taken over once,
+    under the new key: they were graded by the code that is current when this first runs. Later grading changes
+    re-run the gate as usual."""
+    new = OUT / cache_name(gate, key, label)
+    old = OUT / cache_name(gate, gate_inputs(plugin, gate, cases), label)
+    if new.exists() or not old.exists() or old == new:
+        return False
+    old.rename(new)
+    errs = errors_name(old)
+    if errs.exists():
+        errs.rename(errors_name(new))
+    say(f"eval coach {gate}: took over the results cached before grading was part of their key")
+    return True
 
 
 def _add_tokens(into: dict, more: dict | None) -> None:
@@ -1271,7 +1324,9 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
             if not cases:
                 say(f"eval coach {gate}: no cases for the {TARGET['pack']} Pack yet; skipped")
                 continue
-            key = gate_inputs(plugin, gate, cases)
+            grading = grading_inputs(gate, env.judges, max_turns)
+            key = gate_inputs(plugin, gate, cases, grading)
+            adopt_legacy(gate, plugin, cases, label, key, say)
             cache = OUT / cache_name(gate, key, label)
             have = {}
             if cache.exists():
@@ -1286,9 +1341,9 @@ def run_gates(env, gates: list[str], plugin: Path, runner=None, limit: int | Non
                 + (f" · {workers} at a time" if workers > 1 else ""))
             started = time.time()
 
-            def stop_reason(gate=gate, cases=cases, key=key):     # why no further case should start
+            def stop_reason(gate=gate, cases=cases, key=key, grading=grading):     # why no further case should start
                 now_bid = build_id(plugin)
-                if now_bid != bid and gate_inputs(plugin, gate, cases) != key:
+                if now_bid != bid and gate_inputs(plugin, gate, cases, grading) != key:
                     # reassembled mid-run with a change this gate depends on: the rest would test something else
                     return ("rebuilt", f"eval coach: {plugin} was rebuilt during this run ({bid} -> {now_bid}); stopping "
                                        f"so results for the two builds don't mix. Re-run to test the new build.")

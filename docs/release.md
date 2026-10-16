@@ -79,7 +79,7 @@ git commit -am "Release 0.1.1" && git push      # the version bump in this repo
 - Without `--push` it prints the push command, so you can look at the commit first.
 - The coach eval is the release's quality gate, and the only time it runs: a day-to-day `ytbrain ops plugin`
   builds and validates without it. Each gate is cached on what it depends on (the runtime, the pack's content,
-  the skills it uses, its cases), so after editing one skill only the gates that read it run again, and a failed
+  the skills it uses, its cases, and how it is graded: rubric, judges, turn cap, grading code), so after editing one skill only the gates that read it run again, and a failed
   G4-G6 case is run up to three times and passes on a majority.
 
 ## What testers do

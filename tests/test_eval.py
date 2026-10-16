@@ -3023,6 +3023,50 @@ def test_asking_which_project_counts_without_a_question_mark_but_must_name_every
     assert C.MAX_TURNS == 16 and C.EVIDENCE_CHARS >= 90_000
 
 
+def test_how_a_gate_is_graded_is_part_of_its_cache_key_and_old_results_are_taken_over_once():
+    from ytbrain.eval import coach as C
+    judges, turns = ["j1", "j2"], 16
+    base = {g: C.grading_inputs(g, judges, turns) for g in C.GRADERS}
+    assert {g: C.grading_inputs(g, judges, turns) for g in C.GRADERS} == base, "stable"
+    assert C.grading_inputs("g4", ["j1", "j3"], turns) != base["g4"], "another judge"
+    assert C.grading_inputs("g5", judges, 12) != base["g5"], "another turn cap"
+    old_ev, old_rub, old_check = C.EVIDENCE_CHARS, dict(C.RUBRICS), C.turn_check
+    try:
+        C.EVIDENCE_CHARS = old_ev + 1
+        assert C.grading_inputs("g2", judges, turns) != base["g2"] and C.grading_inputs("g4", judges, turns) == base["g4"]
+        C.EVIDENCE_CHARS = old_ev
+        C.RUBRICS["g6"] = old_rub["g6"] + " Reworded."
+        if C.PACK_RUBRICS.get(C.TARGET["pack"], {}).get("g6") is None:
+            assert C.grading_inputs("g6", judges, turns) != base["g6"], "a reworded rubric"
+        C.RUBRICS.update(old_rub)
+
+        def turn_check(log, c):          # a different check: G7 re-runs, G4 doesn't
+            return {"ok": True}
+        C.turn_check = turn_check
+        assert C.grading_inputs("g7", judges, turns) != base["g7"] and C.grading_inputs("g4", judges, turns) == base["g4"]
+    finally:
+        C.EVIDENCE_CHARS, C.turn_check = old_ev, old_check
+        C.RUBRICS.clear()
+        C.RUBRICS.update(old_rub)
+    tmp = Path(tempfile.mkdtemp())
+    p = _fake_plugin(tmp)
+    cases = [{"id": "a", "prompt": "q"}]
+    old_out = C.OUT
+    C.OUT = tmp / "out"
+    C.OUT.mkdir()
+    try:
+        legacy = C.OUT / C.cache_name("g4", C.gate_inputs(p, "g4", cases), "haiku")
+        legacy.write_text('{"id": "a", "passed": true}\n')
+        key = C.gate_inputs(p, "g4", cases, base["g4"])
+        assert key != C.gate_inputs(p, "g4", cases)
+        said = []
+        assert C.adopt_legacy("g4", p, cases, "haiku", key, said.append)
+        assert (C.OUT / C.cache_name("g4", key, "haiku")).read_text().startswith('{"id": "a"') and not legacy.exists()
+        assert said and not C.adopt_legacy("g4", p, cases, "haiku", key, said.append), "only once"
+    finally:
+        C.OUT = old_out
+
+
 if __name__ == "__main__":                 # the CI per-suite run; pytest collects the same functions
     import inspect
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and inspect.isfunction(f)]
