@@ -2359,6 +2359,7 @@ def cmd_eval(args) -> int:
         if err:
             print(f"eval coach: {err}", file=sys.stderr)
             return 1
+        args.max_turns = args.max_turns or coach.MAX_TURNS     # 16 since 0.1.7 (up to 5 search rounds)
         host = None
         if args.host == "openrouter":
             try:
@@ -3410,7 +3411,7 @@ def main(argv=None) -> int:
     ec.add_argument("--model", default=None, metavar="MODEL",
                     help="claude-haiku-5-5 (default; YTBRAIN_COACH_MODEL changes it), sonnet, opus or 'default' (your Claude Code "
                          "default); with --host openrouter an OpenRouter id. Results are kept per model.")
-    ec.add_argument("--max-turns", type=int, default=12, help="agentic turns per host call (default 12)")
+    ec.add_argument("--max-turns", type=int, default=None, help="agentic turns per host call (default 16)")
     ec.add_argument("--workers", type=int, default=0,
                     help="cases at a time (default: YTBRAIN_COACH_WORKERS or 1; each is a `claude -p` on your plan)")
     ec.add_argument("--host", choices=["claude", "openrouter"], default="claude",

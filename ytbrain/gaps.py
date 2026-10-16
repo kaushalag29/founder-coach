@@ -21,6 +21,9 @@ from pathlib import Path
 
 LEVELS = ("strong", "partial", "none", "empty", "unrated")     # unrated: a search from before coverage was logged
 DB_NAME = "founder.db"
+ASK_GAP_S = 120          # searches of one session closer than this belong to one ask
+ROUND_GAP_S = 5          # ... and closer than this to one round (a round's searches go out together)
+SEARCH_GUARD = 12        # the skills' cap on searches per ask (0.1.7)
 
 
 def engine_home() -> Path:
@@ -128,15 +131,90 @@ def level_of(row: dict) -> str:
     return d.get("coverage") if d.get("coverage") in ("strong", "partial", "none") else "unrated"
 
 
-def domain_levels(row: dict) -> dict[str, str]:
-    """Domain -> level for one search: its per-Domain coverage when logged, else the overall level for each
-    Domain it searched (rows from before the per-Domain field, so those are approximate)."""
+class HitDomains:
+    """item_id -> Domains, read from the Knowledge pack a coach registered under <home>/installed/ (its pack_path),
+    opened read-only and immutable: a search that named no Domain is attributed to the Domain most of its logged
+    hits belong to."""
+
+    def __init__(self, pack_file: Path | None):
+        self.path = pack_file if pack_file and pack_file.is_file() else None
+        self._cache: dict[str, list[str]] = {}
+
+    @classmethod
+    def for_pack(cls, home: Path, pack: str) -> "HitDomains":
+        try:
+            for f in (home / "installed").glob("*.json"):
+                d = json.loads(f.read_text())
+                if d.get("pack") == pack and d.get("pack_path"):
+                    return cls(Path(d["pack_path"]) / "knowledge.sqlite")
+        except (OSError, ValueError):
+            pass
+        return cls(None)
+
+    def domains(self, item_ids: list[str]) -> list[list[str]]:
+        want = [i for i in item_ids if i not in self._cache]
+        if want and self.path:
+            try:
+                c = sqlite3.connect(f"file:{self.path}?mode=ro&immutable=1", uri=True)
+                try:
+                    q = f"SELECT item_id, domains FROM items WHERE item_id IN ({','.join('?' * len(want))})"
+                    for iid, doms in c.execute(q, want):
+                        self._cache[iid] = json.loads(doms or "[]")
+                finally:
+                    c.close()
+            except (sqlite3.Error, ValueError):
+                self.path = None                     # unreadable: stop trying, the report says how many were unknown
+        return [self._cache[i] for i in item_ids if i in self._cache]
+
+
+def domain_levels(row: dict, hits: HitDomains | None = None) -> dict[str, str]:
+    """Domain -> level for one search: its per-Domain coverage when logged; else the overall level for each
+    Domain it named; else (no Domain named: the whole Library) for the Domain most of its hits belong to.
+    The last two are approximate."""
     d = row["detail"]
     by = d.get("coverage_by_domain")
     if isinstance(by, dict) and by:
         return {str(k): str(v) for k, v in by.items()}
     lv = level_of(row)
-    return {str(k): lv for k in (d.get("domains_searched") or [])} if lv in ("strong", "partial", "none") else {}
+    if lv not in ("strong", "partial", "none"):
+        return {}
+    if d.get("domains_searched"):
+        return {str(k): lv for k in d["domains_searched"]}
+    if hits is None:
+        return {}
+    counts: dict[str, int] = {}
+    for doms in hits.domains([str(i) for i in (d.get("items") or [])]):
+        for dom in doms:
+            counts[dom] = counts.get(dom, 0) + 1
+    if not counts:
+        return {}
+    top = max(counts.values())
+    return {dom: lv for dom, n in counts.items() if n == top}
+
+
+def _ts(at: str) -> float:
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(at).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def asks_of(searches: list[dict]) -> list[list[list[dict]]]:
+    """Searches grouped into asks (same session, under ASK_GAP_S apart), each ask into rounds (under ROUND_GAP_S
+    apart). Timestamps only: an approximation the report labels as such."""
+    asks: list[list[list[dict]]] = []
+    prev = None
+    for r in sorted(searches, key=lambda r: (r.get("run") or "", r["at"])):
+        t = _ts(r["at"])
+        if prev is None or r.get("run") != prev[0] or t - prev[1] > ASK_GAP_S:
+            asks.append([[r]])
+        elif t - prev[1] > ROUND_GAP_S:
+            asks[-1].append([r])
+        else:
+            asks[-1][-1].append(r)
+        prev = (r.get("run"), t)
+    return asks
 
 
 def _sims(rows: list[dict]) -> dict | None:
@@ -146,15 +224,21 @@ def _sims(rows: list[dict]) -> dict | None:
     return {"n": len(xs), "min": round(min(xs), 3), "median": round(statistics.median(xs), 3), "max": round(max(xs), 3)}
 
 
-def summarize(p: Project, questions: int = 15) -> dict:
+def summarize(p: Project, questions: int = 15, hits: HitDomains | None = None) -> dict:
     searches = [r for r in p.rows if r["tool"] == "coach_search"]
     by_level = {lv: sum(level_of(r) == lv for r in searches) for lv in LEVELS}
     domains: dict[str, dict[str, int]] = {}
     for r in searches:
-        for dom, lv in domain_levels(r).items():
+        for dom, lv in domain_levels(r, hits).items():
             domains.setdefault(dom, {"strong": 0, "partial": 0, "none": 0})
             if lv in domains[dom]:
                 domains[dom][lv] += 1
+    by_hits = sum(1 for r in searches if not r["detail"].get("coverage_by_domain") and not r["detail"].get("domains_searched")
+                  and domain_levels(r, hits))
+    asks = asks_of(searches)
+    per_ask = [sum(len(rd) for rd in a) for a in asks]
+    rounds = [len(a) for a in asks]
+    routed = [r["detail"].get("routing") for r in searches if r["detail"].get("routing")]
     weak = [r for r in searches if level_of(r) in ("partial", "none", "empty")]
     with_text = [r for r in searches if r["detail"].get("query")]
     weak_text = [r for r in weak if r["detail"].get("query")]
@@ -163,11 +247,15 @@ def summarize(p: Project, questions: int = 15) -> dict:
         "calls": len(p.rows), "searches": len(searches), "first": p.rows[0]["at"] if p.rows else None,
         "last": p.rows[-1]["at"] if p.rows else None, "levels": by_level,
         "similarity": {lv: _sims([r for r in searches if level_of(r) == lv]) for lv in ("strong", "partial", "none")},
-        "domains": dict(sorted(domains.items())),
+        "domains": dict(sorted(domains.items())), "domains_from_hits": by_hits,
+        "asks": {"n": len(asks), "searches_avg": round(sum(per_ask) / len(asks), 1) if asks else None,
+                 "searches_max": max(per_ask, default=None), "rounds_avg": round(sum(rounds) / len(asks), 1) if asks else None,
+                 "rounds_max": max(rounds, default=None), "at_guard": sum(n >= SEARCH_GUARD for n in per_ask)},
+        "explicit_domains": {"n": sum(x == "explicit" for x in routed), "of": len(routed)},
         "errors": sum(r["outcome"] == "error" for r in p.rows),
         "searches_with_text": len(with_text),
         "weak_questions": [{"at": r["at"][:19], "level": level_of(r), "top_similarity": r["detail"].get("top_similarity"),
-                            "domains": sorted(domain_levels(r)) or r["detail"].get("domains_searched") or [],
+                            "domains": sorted(domain_levels(r, hits)) or r["detail"].get("domains_searched") or [],
                             "query": r["detail"]["query"]}
                            for r in reversed(weak_text)][:questions],
     }
@@ -175,7 +263,8 @@ def summarize(p: Project, questions: int = 15) -> dict:
 
 def report(projects: list[Project], home: Path | None = None, days: int | None = 30, questions: int = 15) -> dict:
     home = home or engine_home()
-    return {"home": str(home), "days": days, "projects": [summarize(p, questions) for p in projects]}
+    return {"home": str(home), "days": days,
+            "projects": [summarize(p, questions, HitDomains.for_pack(home, p.pack)) for p in projects]}
 
 
 def render(rep: dict, home: Path | None = None) -> str:
@@ -204,8 +293,19 @@ def render(rep: dict, home: Path | None = None) -> str:
         bits = [f"{k} {v['min']}-{v['max']} (median {v['median']})" for k, v in sim.items() if v]
         if bits:
             lines.append("  top similarity: " + " · ".join(bits))
+        a = s["asks"]
+        if a["n"]:
+            lines.append(f"  asks (grouped by time, approximate) {a['n']}: searches per ask {a['searches_avg']} (max "
+                         f"{a['searches_max']}), rounds per ask {a['rounds_avg']} (max {a['rounds_max']}); "
+                         f"{a['at_guard']} at the {SEARCH_GUARD}-search guard")
+        e = s["explicit_domains"]
+        if e["of"]:
+            lines.append(f"  Domains named by the host in {e['n']} of {e['of']} searches "
+                         f"({round(100 * e['n'] / e['of'])}%); the rest searched the whole Library")
         if s["domains"]:
-            lines.append("  by Domain (strong / partial / none):")
+            note = (f", {s['domains_from_hits']} search(es) attributed by their hits' Domain"
+                    if s["domains_from_hits"] else "")
+            lines.append(f"  by Domain (strong / partial / none){note}:")
             for dom, c in s["domains"].items():
                 lines.append(f"    {dom:14} {c['strong']:3} / {c['partial']:3} / {c['none']:3}")
         if s["errors"]:

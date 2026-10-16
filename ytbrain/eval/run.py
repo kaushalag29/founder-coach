@@ -49,6 +49,12 @@ CONFIGS = {
     # lower nDCG@10 overall or for any source kind's questions
     "full-route": {"rerank": True, "stage_boost": False, "route": True},
     "pack-route": {"rerank": False, "stage_boost": False, "backend": "pack", "route": True},
+    # diagnostics, never shipped: a hard filter chosen perfectly for each question, the best case for filtering
+    # instead of routing. `domains`: the seed Document's Domains (any of them, as a host naming several would);
+    # `topic`: the question's own topic labels. Compared with pack-no-rerank, they say whether a hard filter could
+    # ever beat searching the whole Library (docs/library-and-packs-plan.md, decision #20 amendment, 0.1.7)
+    "pack-oracle-domains": {"rerank": False, "stage_boost": False, "backend": "pack", "oracle": "domains"},
+    "pack-oracle-topic": {"rerank": False, "stage_boost": False, "backend": "pack", "oracle": "topic"},
 }
 PACK_KINDS = ["advice", "takeaway", "summary", "fact", "rule"]
 # below this share of judged top-10 Moments, a comparison says more about the pool than the
@@ -92,14 +98,21 @@ def run_config(store, embed, reranker, queries: list[dict], config: str) -> dict
     """{qid: {"moments": [...], "talks": [...], "scores": [...]}} for one configuration."""
     cfg = CONFIGS[config]
     out = {}
+    domains_of = None
+    if cfg.get("oracle") == "domains":
+        from .route import doc_domains
+        domains_of = doc_domains(store)
+    unfiltered = 0
     started = time.time()
     every = max(1, min(25, len(queries) // 10 or 1))
     print(f"eval run: searching {len(queries)} questions with config {config} ...", flush=True)
     for i, q in enumerate(queries, 1):
         stage = (q.get("stage") or [None])[0] if cfg["stage_boost"] else None
+        flt = oracle_filter(cfg, q, domains_of)
+        unfiltered += bool(cfg.get("oracle")) and not flt
         res = search(store, embed, q["text"], stage=stage, top_k=RESULT_DEPTH, kinds=cfg.get("kinds"),
                      reranker=reranker if cfg["rerank"] else None, route=bool(cfg.get("route")),
-                     diversity=POLICIES[cfg.get("diversity", "default")])
+                     diversity=POLICIES[cfg.get("diversity", "default")], **flt)
         moments = results_to_moments(res)
         best: dict[str, float] = {}
         for r in res:                              # a Moment's score = its best item's score
@@ -112,8 +125,27 @@ def run_config(store, embed, reranker, queries: list[dict], config: str) -> dict
             per = (time.time() - started) / i
             print(f"    search: {i}/{len(queries)}, {per:.1f}s/question, "
                   f"ETA {per * (len(queries) - i) / 60:.1f} min", flush=True)
+    if unfiltered:
+        print(f"eval run: {unfiltered} question(s) had no {cfg['oracle']} label to filter on and searched the whole "
+              f"Library", flush=True)
     print("eval run: scoring (bootstrap intervals, 10 000 resamples per metric) ...", flush=True)
     return out
+
+
+def oracle_filter(cfg: dict, q: dict, domains_of: dict | None) -> dict:
+    """The hard filter an oracle config applies to one question: {"domains": [...]} from its seed Document,
+    {"topics": [...]} from its own labels, or {} (no label: the whole Library, as without a filter)."""
+    kind = cfg.get("oracle")
+    if kind == "topic":
+        topics = [t for t in (q.get("topic") or []) if t]
+        return {"topics": topics} if topics else {}
+    if kind == "domains":
+        seed = (q.get("creation") or {}).get("seed_moment")
+        if not seed or not domains_of:
+            return {}
+        doms = sorted(domains_of.get(parse_moment_id(seed)[0]) or ())
+        return {"domains": doms} if doms else {}
+    return {}
 
 
 def doc_qrels(qrels: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:

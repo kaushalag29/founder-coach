@@ -114,6 +114,17 @@ def _reword_schema(obj):
 # how long a search waits for loading models before answering with keyword matches: loading
 # downloaded models takes seconds, a first-time download takes minutes (then keywords it is)
 SEARCH_WAIT_S = float(product.env("SEARCH_WAIT_S", "20"))
+
+
+def _default_top_k() -> int:
+    """Hits per search when the host doesn't say: 10 (0.1.7; 5 before), <PREFIX>TOP_K to change, 1-15."""
+    try:
+        return max(1, min(15, int(product.env("TOP_K", "10"))))
+    except ValueError:
+        return 10
+
+
+DEFAULT_TOP_K = _default_top_k()
 DEFAULT_GAP_SIMILARITY = 0.60       # provisional (phase3-plan §11.10) until M2c calibrates it
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -469,7 +480,7 @@ def _usage_detail(tool: str, args: dict, sc: dict, text: bool) -> tuple[str, dic
         hits = sc.get("hits") or []
         d = {"mode": sc.get("mode"), "hits": len(hits), "items": [h.get("item_id") for h in hits[:5]],
              "stage": sc.get("stage_used"), "top_similarity": sc.get("top_similarity"),
-             "query_chars": len(q), "top_k": args.get("top_k"),
+             "query_chars": len(q), "top_k": args.get("top_k") or DEFAULT_TOP_K,
              "filters": [f for f in ("kinds", "topics", "stage", "domains") if args.get(f)],
              "routing": sc.get("routing"), "domains_searched": sc.get("domains_searched"),
              "coverage": sc.get("coverage"),
@@ -870,9 +881,10 @@ def create_server(pack: str | Path | None = None, home: str | Path | None = None
         kinds: Annotated[list[KindName] | None, Field(description="restrict to these item kinds")] = None,
         topics: Annotated[list[str] | None, Field(description="restrict to talks in these topics")] = None,
         domains: Annotated[list[str] | None, Field(
-            description="restrict to these Domains (startup, leadership, ...); several = any of them. "
-                        "Leave out to search all; coach_corpus_status lists the Domains this pack covers")] = None,
-        top_k: Annotated[int, Field(ge=1, le=15)] = 5,
+            description="restrict to these Domains (startup, leadership, ...); several = any of them. Leave it "
+                        "out (the default) to search the whole Library; pass it only when the person asks to "
+                        "restrict the search to certain subjects. coach_corpus_status lists the Domains")] = None,
+        top_k: Annotated[int, Field(ge=1, le=15)] = DEFAULT_TOP_K,
         response_format: Format = "concise",
     ) -> Annotated[CallToolResult, SearchOut]:
         """Search Verified advice, takeaways, facts, rules and summaries from YC talks. Each hit has an item_id
@@ -1394,9 +1406,10 @@ def _library(st: State) -> dict | None:
         return None
     return {"domains": [{"name": d, "items": counts.get(d, 0), **{k: v for k, v in (info.get(d) or {}).items() if v}}
                         for d in sorted(names, key=lambda n: (-counts.get(n, 0), n))],
-            "use": "pass `domains` to coach_search with the Domains a question touches (several allowed); leave it "
-                   "out to search all. A Domain with items: 0 has no material: say that Gap instead of answering "
-                   "it from another Domain. Act on `coverage` in every search result (see the ask skill)."}
+            "use": "leave `domains` out of coach_search: every search covers the whole Library. Pass `domains` "
+                   "only when the person restricts the search to certain subjects (\"only my finance books\"). "
+                   "A Domain with items: 0 has no material: say that Gap instead of answering it from another "
+                   "Domain. Act on `coverage` in every search result (see the ask skill)."}
 
 
 def st_common_fields() -> tuple[str, ...]:

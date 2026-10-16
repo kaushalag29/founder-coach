@@ -13,10 +13,10 @@ Follow the coaching contract of the coach skill: show the exact text, save only 
 ## Checklist
 
 1. **Context.** `coach_get_context` (unless already called): the active Project, and recent Decisions this one may replace or contradict (say so if it does).
-2. **Gather** from the conversation, asking only for what is missing, one question at a time: the context (the problem and the forces: scale, SLOs, constraints), the options considered, the choice, and its consequences (what gets easier, what gets harder, what to watch). Use the Engineer's words.
-3. **Support it.** One `coach_search` for the chosen approach's main trade-off (`domains` `system-design` or `coding`). Add Citations only from hits that support the reasoning; with none, the record says it rests on the team's judgment.
+2. **Gather** from the conversation, in the Engineer's words: the context (the problem and the forces: scale, SLOs, constraints), the options considered, the choice, and its consequences (what gets easier, what gets harder, what to watch). The choice and its reason are enough to record: when the Engineer has given them and asks to record the decision, draft the record now (step 4) and offer to add options or consequences in the same reply, never as a question to answer before the draft.
+3. **Support it.** One `coach_search` for the chosen approach's main trade-off (leave `domains` out: both Domains are searched). Add Citations only from hits that support the reasoning; with none, the record says it rests on the team's judgment.
 4. **Show the record** under the Project's name: the decision in one line, the reasoning in a few lines, Citations, and a revisit date when the Engineer gives one ("when we pass 10k rps", "2027-03-01").
-5. **Save on a yes** with `coach_record` kind `decision` (`text`, `reasoning`, `citations`, `revisit_on` as YYYY-MM-DD if dated) and the Project id as `project`.
+5. **Save on a yes** to the record you showed (a yes to the draft is approval; a decision the Engineer dictated and asked you to record, shown back in their words, needs only that yes) with `coach_record` kind `decision` (`text`, `reasoning`, `citations`, `revisit_on` as YYYY-MM-DD if dated) and the Project id as `project`.
 6. **Offer the ADR file**, once: "Also write it as an ADR in the repo?" On a yes, find where ADRs live (the profile's `workspace` `adrs`, else `docs/adr/` or `doc/adr/` if it exists, else ask), take the next free number, and show the exact file (name and full text) in the format below. Write it only after a second yes, and only with the host's file tool. Never overwrite an existing file.
 
 ## ADR format

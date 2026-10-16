@@ -534,10 +534,11 @@ only once the tagger passes its gate on your labels: `ytbrain domains sample` (s
 fill the `label` column, `ytbrain eval tags --items … --documents …` (precision >= 90 %, recall >= 85 %, no high-tier
 label missed; `--tune --save` picks the thresholds); until then a run keeps the tags already applied. A bad value in
 either setting stops the tag Step with the reason and changes nothing. A Document may belong to several Domains, and
-`coach_search` takes several (`domains: ["startup", "leadership"]`) when a question spans them. The coach learns the Domains from `coach_get_context` and passes the ones a
-question touches; an automatic router exists too but is off until you have measured it on your corpus:
-`ytbrain eval route` (accuracy on single and composed questions), `ytbrain eval run --config pack-route
---compare pack-no-rerank` (no nDCG loss), then `ytbrain pack build --route`. Adding a Domain is one entry in `domains.yaml` and its books or Sources.
+`coach_search` takes several (`domains: ["startup", "leadership"]`), but since 0.1.7 the coach leaves them out and
+searches the whole Library unless you restrict it ("only my finance books"): even a perfectly chosen Domain filter ranked
+worse offline (`ytbrain eval run --config pack-oracle-domains --compare pack-no-rerank`). An automatic router exists
+but is off; measure it on your corpus with `ytbrain eval route` and `ytbrain eval run --config pack-route --compare
+pack-no-rerank` before `ytbrain pack build --route`. Adding a Domain is one entry in `domains.yaml` and its books or Sources.
 
 **Coverage.** Every `coach_search` answer says `coverage`: `strong` (answer with Citations), `partial` (answer what is
 covered and say what is not) or `none` (state a Gap; the coach goes to the web only when the Domain's `web_policy`
@@ -980,7 +981,8 @@ ytbrain gaps [--pack founder|coding|investor] [--days 30] [--json]   # strong/pa
 - **Settings** (the prefix follows the product id): `FOUNDER_COACH_HOME`, `FOUNDER_COACH_PACK`,
   `FOUNDER_COACH_MODELS`, `FOUNDER_COACH_RERANK` (`0`/`1`, default: what the pack says),
   `FOUNDER_COACH_GAP_SIMILARITY` (provisional 0.60), `FOUNDER_COACH_SEARCH_WAIT_S` (how long the
-  first search waits for loading models, default 20), `FOUNDER_COACH_LOG` (log level, stderr),
+  first search waits for loading models, default 20), `FOUNDER_COACH_TOP_K` (hits per search when the host
+  doesn't say, default 10, 1-15), `FOUNDER_COACH_LOG` (log level, stderr),
   `FOUNDER_COACH_WARMUP=0` (don't load models; tests), `FOUNDER_COACH_USAGE` (`0` turns the usage
   log off), `FOUNDER_COACH_USAGE_TEXT` (`1` also logs search text), `FOUNDER_COACH_USAGE_DAYS`
   (retention, default 90). The pack is looked for in `--pack`, `$FOUNDER_COACH_PACK`, the plugin's

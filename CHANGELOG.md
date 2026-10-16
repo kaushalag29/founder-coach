@@ -3,6 +3,22 @@
 User-visible changes, newest first. Dates are when the change landed; plugin releases are
 tagged `founder-coach--v<version>` in the marketplace repo ([docs/release.md](docs/release.md)).
 
+## 2026-10-15 (plugin 0.1.7: whole-Library search, Search rounds, 10 hits)
+
+- **Searches cover the whole Library by default.** The skills of all three Packs stop passing `domains`; they pass it only
+  when the person restricts the search ("only my finance books"). Measured offline against searching everything (all 344
+  questions, founder private pack): even a perfect Domain filter ranks worse (nDCG@10 -0.023), a perfect topic filter much
+  worse (-0.089), and the router ties on judged results (-0.013 overall, +0.001 judged-only), so it stays off. Two new
+  diagnostic eval configs make that comparison repeatable: `--config pack-oracle-domains` and `pack-oracle-topic`.
+- **Search rounds.** A part whose coverage isn't `strong` is searched again with a rewritten query, up to 5 rounds and 12
+  searches per question; a part stops at `strong` or after two rewrites in a row that don't beat its best similarity
+  (before: one follow-up).
+- **10 hits per search** (was 5; max 15). `FOUNDER_COACH_TOP_K` (and the other coaches' prefixes) sets the default; the
+  usage log records the effective value.
+- **`ytbrain gaps`** shows asks and rounds per ask, the share of searches whose Domains the host named, and attributes a
+  search that named no Domain to its hits' Domain using the installed pack.
+- The coach eval allows 16 host turns per case (was 12) so a 5-round answer isn't cut off.
+
 ## 2026-10-14 (a gap report from the dogfooded coaches)
 
 - **`ytbrain gaps`** reads the usage log of every coach Project under `~/.ytbrain` (read-only, from a copy of the

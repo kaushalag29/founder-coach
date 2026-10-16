@@ -91,7 +91,8 @@ def test_g3_reading_never_changes_the_store_and_never_touches_coaching_memory():
     assert (db.read_bytes(), sorted(x.name for x in db.parent.iterdir())) == before
     import re
     tables = set(re.findall(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+(\w+)", Path(G.__file__).read_text()))
-    assert tables == {"usage"}, f"gaps.py must read only the usage table, not {tables - {'usage'}}"
+    # the store's usage table, and the Knowledge pack's items (no coaching memory lives there)
+    assert tables == {"usage", "items"}, f"gaps.py must read only usage (store) and items (pack), not {tables}"
 
 
 def test_g4_window_pack_filter_and_missing_logs():
@@ -139,6 +140,79 @@ def test_g6_a_search_row_carries_the_per_domain_coverage_and_no_words():
     assert d["coverage_by_domain"] == {"startup": "strong", "gtm": "partial"} and d["basis"] == "provisional"
     assert d["stale"] == ["gtm"] and "query" not in d and "secret" not in json.dumps(d)
     assert _usage_detail("coach_search", {"query": "q"}, sc, True)[1]["query"] == "q"
+
+
+def test_g7_hits_per_search_default_to_ten_and_the_setting_is_clamped():
+    from founder_coach import product
+    from founder_coach import server as S
+    name = product.env_name("TOP_K")
+    old = os.environ.get(name)
+    try:
+        for value, want in ((None, 10), ("8", 8), ("30", 15), ("0", 1), ("ten", 10)):
+            os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
+            assert S._default_top_k() == want, (value, want)
+    finally:
+        os.environ.pop(name, None) if old is None else os.environ.__setitem__(name, old)
+    sc = {"hits": [{"item_id": "tkw:A:01"}], "coverage": "strong"}
+    assert S._usage_detail("coach_search", {"query": "q"}, sc, False)[1]["top_k"] == S.DEFAULT_TOP_K
+    assert S._usage_detail("coach_search", {"query": "q", "top_k": 3}, sc, False)[1]["top_k"] == 3
+
+
+def test_g8_searches_group_into_asks_and_rounds_by_session_and_time():
+    home = _home()
+    d = home / "founder" / "projects" / "p"
+    clock = Clock("2026-10-14T09:00:00+00:00")
+    st = FounderStore(d, clock=clock)
+    try:
+        def log(run, secs, cov="partial"):
+            clock.advance(seconds=secs)
+            st.log_usage("coach_search", "ok", 10, run=run, version="0.1.7",
+                         detail={"hits": 5, "coverage": cov, "routing": "none"})
+        log("r1", 0)
+        log("r1", 1)            # same round
+        log("r1", 20)           # round 2
+        log("r1", 400)          # a new ask
+        log("r2", 1)            # another session: a new ask
+    finally:
+        st.close()
+    (p,) = G.load(home, days=None, now=NOW)
+    asks = G.asks_of([r for r in p.rows if r["tool"] == "coach_search"])
+    assert [len(a) for a in asks] == [2, 1, 1] and [sum(len(x) for x in a) for a in asks] == [3, 1, 1]
+    s = G.summarize(p)
+    assert s["asks"] == {"n": 3, "searches_avg": 1.7, "searches_max": 3, "rounds_avg": 1.3, "rounds_max": 2, "at_guard": 0}
+    assert s["explicit_domains"] == {"n": 0, "of": 5}
+
+
+def test_g9_a_search_that_named_no_domain_is_attributed_to_its_hits_domain_from_the_installed_pack():
+    import sqlite3
+    home = _home()
+    pack = home / "packdir"
+    pack.mkdir()
+    c = sqlite3.connect(pack / "knowledge.sqlite")
+    c.execute("CREATE TABLE items (item_id TEXT, domains TEXT)")
+    c.executemany("INSERT INTO items VALUES (?, ?)", [("a", '["startup"]'), ("b", '["finance"]'), ("c", '["finance","startup"]'),
+                                                      ("d", '["finance"]')])
+    c.commit()
+    c.close()
+    (home / "installed").mkdir()
+    (home / "installed" / "founder-coach.json").write_text(json.dumps({"product_id": "founder-coach", "pack": "founder",
+                                                                       "pack_path": str(pack)}))
+    _project(home, "founder", "p", "P", [
+        {"mode": "semantic", "hits": 5, "coverage": "partial", "top_similarity": 0.7, "items": ["a", "b", "d"], "routing": "none"},
+        {"mode": "semantic", "hits": 5, "coverage": "strong", "top_similarity": 0.77, "items": ["a", "c"], "routing": "none"},
+        _search("strong", 0.78, ["gtm"], by={"gtm": "strong"}),
+    ])
+    rep = G.report(G.load(home, days=None, now=NOW), home, None)
+    (s,) = rep["projects"]
+    assert s["domains"]["finance"] == {"strong": 0, "partial": 1, "none": 0}          # 2 of 3 hits are finance
+    assert s["domains"]["startup"] == {"strong": 1, "partial": 0, "none": 0}          # a: startup, c: finance+startup -> startup
+    assert s["domains"]["finance"]["strong"] == 0 and s["domains"]["gtm"]["strong"] == 1
+    assert s["domains_from_hits"] == 2
+    assert "attributed by their hits' Domain" in G.render(rep, home)
+    # without a registered pack the same searches simply have no Domain
+    (home / "installed" / "founder-coach.json").unlink()
+    (s2,) = G.report(G.load(home, days=None, now=NOW), home, None)["projects"]
+    assert s2["domains_from_hits"] == 0 and "finance" not in s2["domains"]
 
 
 if __name__ == "__main__":

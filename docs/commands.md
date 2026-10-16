@@ -40,6 +40,7 @@ ytbrain domains why <doc>             # where a Document's Domains came from
 ytbrain domains review                # high-tier tags awaiting your yes (--accept SOURCE:DOMAIN)
 ytbrain domains propose               # content no Domain fits, grouped, checked against the list
 ytbrain gaps [--pack P] [--days 30] [--json]  # what the dogfooded coaches could not answer well (their usage logs)
+ytbrain eval run --config pack-oracle-domains|pack-oracle-topic --compare pack-no-rerank   # a perfect hard filter vs the whole Library
 ytbrain upgrade --dry-run             # records a new extraction would make differently: how many, at what cost
                                       #   (coding and system-design chapters move to the subject-neutral prompt)
 ytbrain eval parity                   # the neutral prompt vs the startup one on ~30 startup talks (shadow, ~$0.10)

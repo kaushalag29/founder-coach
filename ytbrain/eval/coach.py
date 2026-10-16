@@ -89,12 +89,14 @@ def host_env(name: str) -> str:
     return TARGET["prefix"] + name
 GATES = {"g2": 0.90, "g4": 0.80, "g5": 1.0, "g6": 1.0, "g7": 1.0, "g8": 1.0}
 CLAUDE_TIMEOUT_S = 600
-MAX_TURNS = 12                     # agentic turns per `claude -p` call: a looping case stops, not the plan
+MAX_TURNS = 16                     # agentic turns per `claude -p` call: a looping case stops, not the plan (0.1.7: up to 5 search rounds)
 HAIKU = "claude-haiku-5-5"        # pinned, so the default never drifts when the "haiku" alias moves
 DEFAULT_MODEL = os.environ.get("YTBRAIN_COACH_MODEL") or HAIKU   # cheapest on Pro limits; --model sonnet for a sign-off
-EVIDENCE_CHARS = 30_000
+EVIDENCE_CHARS = 90_000           # what the judges see of the coach's search and read results (30 000 until 0.1.7:
+                                  # 10 hits x several Search rounds overflowed it, so cited hits went unseen)
 # part of each gate's results cache key: bump a gate when a change invalidates its earlier results
-HARNESS = {"g2": "h6", "g4": "h4", "g5": "h6", "g6": "h5", "g7": "h2", "g8": "h2"}   # h+1: the host no longer loads the user's own coaches
+HARNESS = {"g2": "h7", "g4": "h4", "g5": "h6", "g6": "h5", "g7": "h3", "g8": "h2"}   # h+1: the host no longer loads the user's own coaches;
+# g2 h7: judge evidence 90 000 chars; g7 h3: "asks which Project" accepts a question without a question mark
 # the skills whose full text a gate's cases use; every other skill counts only by its description (frontmatter),
 # which the host always sees
 GATE_SKILLS = {"g2": ("ask", "coach"), "g4": ("coach",), "g5": ("coach", "setup", "weekly-focus", "check-in", "ask"),
@@ -987,7 +989,8 @@ def turn_check(log: list[dict], c: dict) -> dict:
         bad.append(f"saved: {', '.join(e['writes'])}")
     if c.get("asks_project"):
         names = [n.lower() for n in c.get("names", [])]
-        if "?" not in text or not all(n in text for n in names):
+        asks = "?" in text or "which" in text          # "I need to know which one: A or B." asks too
+        if not asks or not all(n in text for n in names):
             bad.append("doesn't ask which Project (naming " + ", ".join(c.get("names", [])) + ")")
         if any(w.lower() in text for w in c.get("not_mentions", [])):
             bad.append("showed a Project's memory before it was chosen")

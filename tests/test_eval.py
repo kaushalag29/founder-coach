@@ -2828,12 +2828,36 @@ def test_a_profile_check_can_ask_for_words_the_value_contains_and_a_project_is_f
     assert C._find_store(stores, "sear") is None and C._find_store(stores, "") is None
 
 
-if __name__ == "__main__":
-    import inspect
-    fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and inspect.isfunction(f)]
-    for f in fns:
-        f()
-    print(f"{len(fns)}/{len(fns)} passed")
+def test_oracle_configs_filter_each_question_by_its_own_labels_and_never_ship():
+    """The two diagnostic configs (0.1.7): a hard filter chosen perfectly per question, to compare filtering
+    with routing on the same eval. A question with no label searches the whole Library, as without a filter."""
+    from ytbrain.eval import run as R
+    for name in ("pack-oracle-domains", "pack-oracle-topic"):
+        cfg = R.CONFIGS[name]
+        assert cfg["backend"] == "pack" and not cfg["rerank"] and not cfg.get("route")
+        assert R.gate_for(name) == R.PACK_GATE
+    doms = {"docA": frozenset({"finance", "startup"})}
+    q = {"_id": "q1", "text": "when to raise a seed round", "topic": ["fundraising"],
+         "creation": {"seed_moment": "docA_00660"}}
+    assert R.oracle_filter(R.CONFIGS["pack-oracle-domains"], q, doms) == {"domains": ["finance", "startup"]}
+    assert R.oracle_filter(R.CONFIGS["pack-oracle-topic"], q, doms) == {"topics": ["fundraising"]}
+    assert R.oracle_filter(R.CONFIGS["pack-no-rerank"], q, doms) == {}
+    unknown = {**q, "topic": [], "creation": {"seed_moment": "docZ_00060"}}
+    assert R.oracle_filter(R.CONFIGS["pack-oracle-domains"], unknown, doms) == {}
+    assert R.oracle_filter(R.CONFIGS["pack-oracle-topic"], unknown, doms) == {}
+    # run_config hands the filter to search, and only to the question it belongs to
+    seen = []
+
+    def fake_search(store, embed, text, **kw):
+        seen.append((text, kw.get("domains"), kw.get("topics")))
+        return []
+    old = R.search
+    R.search = fake_search
+    try:
+        R.run_config(None, None, None, [q, {**unknown, "_id": "q2", "text": "other"}], "pack-oracle-topic")
+    finally:
+        R.search = old
+    assert seen == [("when to raise a seed round", None, ["fundraising"]), ("other", None, None)]
 
 
 def test_a_current_build_still_runs_every_packs_coach_gates_and_the_choice_check(tmp_path):
@@ -2987,3 +3011,24 @@ def test_the_plugin_choice_gate_runs_prompts_in_parallel_with_the_same_results()
             C.OUT = old
         assert results["s"][3] == 1 and 2 <= results["p"][3] <= 4
         assert results["s"][:3] == results["p"][:3] and results["p"][0]["passed"] and results["p"][1] == 0
+
+
+def test_asking_which_project_counts_without_a_question_mark_but_must_name_every_project():
+    from ytbrain.eval import coach as C
+    check = {"turn": 1, "asks_project": True, "names": ["Retirement", "College"], "not_mentions": ["60%"]}
+    said = [{"coach": "You have two goals, so I need to know which one this is about: **Retirement 2055** or **College 2040**."}]
+    assert C.turn_check(said, check)["ok"]
+    assert not C.turn_check([{"coach": "Which one: Retirement 2055?"}], check)["ok"], "every Project named"
+    assert not C.turn_check([{"coach": "Your bond target is 60% for Retirement and College."}], check)["ok"]
+    assert C.MAX_TURNS == 16 and C.EVIDENCE_CHARS >= 90_000
+
+
+if __name__ == "__main__":                 # the CI per-suite run; pytest collects the same functions
+    import inspect
+    fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and inspect.isfunction(f)]
+    for f in fns:
+        if "tmp_path" in inspect.signature(f).parameters:
+            f(tmp_path=Path(tempfile.mkdtemp(prefix="eval-test-")))
+        else:
+            f()
+    print(f"{len(fns)}/{len(fns)} passed")

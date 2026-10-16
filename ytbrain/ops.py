@@ -157,7 +157,7 @@ class Ops:
     @staticmethod
     def plugin_fp(index: str) -> str:
         parts = [index]
-        for base in ("plugin", "founder_coach"):
+        for base in ("plugin", "founder_coach", "packs"):     # packs/: every other Pack's skills and pack.toml
             for p in sorted((CODE / base).rglob("*")):
                 if p.is_file() and "__pycache__" not in p.parts and not p.name.startswith("."):
                     parts.append(f"{p.relative_to(CODE)}:{hashlib.sha256(p.read_bytes()).hexdigest()}")

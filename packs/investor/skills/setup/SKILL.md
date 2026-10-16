@@ -11,7 +11,7 @@ Follow the coaching contract of the coach skill: their rules in their words, sav
 ## Checklist
 
 1. **Context and the line.** `coach_get_context`. If a policy exists, show it and ask what to change. Say once, plainly: this coach educates and holds them to their own rules; it is not a registered adviser and never recommends a security.
-2. **The goal.** What is this money for, and when (`goal`, `horizon` as a year)? If no Project is active, or this is another goal, call `coach_project` action `create` with the goal's name ("Retirement 2055") first. One goal per Project; a second goal is a second Project, even if the accounts overlap.
+2. **The goal.** What is this money for, and when (`goal`, `horizon` as a year)? If no Project is active, or this is another goal, call `coach_project` action `create` with the goal's name first, exactly as the Investor wrote it ("Retirement 2055", not a description such as "retirement in 2055"), and use that same name when you tell them what was saved. One goal per Project; a second goal is a second Project, even if the accounts overlap.
 3. **Interview,** one question at a time, their words:
    - how large a fall they could live through without selling (`risk_tolerance`), and money they may need from it, and when (`liquidity`);
    - their own constraints (`constraints`): what they won't hold, limits they must keep. No tax advice: if a question turns on tax, point them to a tax professional;
